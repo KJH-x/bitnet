@@ -70,3 +70,7 @@ python scripts/release-manifest.py --spec release-assets.json --version 0.1.0 --
 WSL Ubuntu 24.04 amd64 已构建整个工作区 release，生成并签名 core/gui DEB 和个人 tar.gz。两平台构建源码指纹均为 `aec928fcb7bcd8e8e7a874bdcb76552c1e84392ecaf77077dcdbf374f205a90c`。只读解出 MSI、ZIP、DEB、tar 中的程序、许可文本、离线服务缓存，与 release 目标逐字节比对通过；DEB 中程序为 root:root/0755、许可与模板为 root:root/0644。Windows 的依赖声明收录 277 个包、198 份独立原文；Linux 收录 342 个包、242 份独立原文（含静态 OpenSSL），均启用严格检查且无缺失项。更新清单和源码归档脚本另行验证，不代表已发布公网。
 
 仍须在可销毁环境验证首次安装、取消 UAC、离线启用、修复、升级、保留数据卸载、服务身份 DPAPI 跨重启、恢复动作、Linux 249 DynamicUser 凭据交付、i386运行、macOS Keychain/launchd/签名，以及无校园认证副作用的长时间稳定性。已有构建产物不代表这些用例已通过。
+
+### 本轮源码指纹修正
+
+初次构建记录 `aec928fc…` 共 54 文件，其中误含忽略目录内 4 个未参与正式构建的 GUI 预览文件。最终源码归档仅含实际 50 个应用输入，规范化指纹为 `f7a7043c82b3f1f6626b549979bda70e7d717674e40dcce9741ff1344aeca0e8`。指纹脚本已排除临时目录并固定跨系统排序，新增 3 项回归测试通过。原构建元数据保留，完整逐文件哈希、排除理由与包哈希映射见 [来源记录](build-source-provenance.json)。本轮只修正打包工具与证据口径，未改应用源码、二进制或安装包字节；不以改写历史指纹替代重新构建。

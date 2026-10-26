@@ -1,0 +1,388 @@
+{
+  "legacy_fingerprint": {
+    "algorithm": "sha256",
+    "source_sha256": "aec928fcb7bcd8e8e7a874bdcb76552c1e84392ecaf77077dcdbf374f205a90c",
+    "files": 54
+  },
+  "explanation": "The initial fingerprint included four ignored GUI preview fixture files. They were not Cargo workspace members or formal dependencies. This record preserves their hashes without distributing unused fixtures. The actual application source was not changed by the fingerprint correction.",
+  "ordered_inputs": [
+    {
+      "path": ".cargo/config.toml",
+      "sha256": "758bf999d0083c3132193ea8d42b02db14b105558ca300eeee6990354b96990d",
+      "bytes": 99,
+      "archived_source": true
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "1eed7567881e39cd0aa3c5289fdd63e34a1e5ee7d3745666e2e66cbbaca702d6",
+      "bytes": 143272,
+      "archived_source": true
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "715f7d5b98062bac712d4bbd47936f9cb7d6e77635f2ff1d09d63a2e754c68ea",
+      "bytes": 1158,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-cli/Cargo.toml",
+      "sha256": "ddeb1ad1179a180262510e0b5b0bc9c2e58e30226b66d2ceccc715c39f14fe96",
+      "bytes": 424,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-cli/src/main.rs",
+      "sha256": "af0f499306d28bc9c90b82172a31a30eb9f6d5123d97b463e041de3434574953",
+      "bytes": 25474,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-core/Cargo.toml",
+      "sha256": "07d3a4df5508d76d6adc84812bad6e24b5aa6d43349fff55c97714e18f5d064b",
+      "bytes": 225,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-core/src/lib.rs",
+      "sha256": "608530c316b6b74fe557b8cfb13f2a15446721b5ee2cf13fab625bf8661ad39a",
+      "bytes": 17975,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gateway/Cargo.toml",
+      "sha256": "555520ffa30101736720a60f3df58d7f57382a12cdd5d9a5ebd8e0ea9e64b6c7",
+      "bytes": 694,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gateway/NOTICE",
+      "sha256": "2fae58fe8513109da4ecbd269942d9adc777f6a98b8b665d2b8cd3d26648b163",
+      "bytes": 1337,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gateway/README.md",
+      "sha256": "d8894f1cfc982e0ae4f993887a42c7954885658d9158b3a4988b2204eb8c8e7c",
+      "bytes": 3376,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gateway/src/binding.rs",
+      "sha256": "4aacfae01e89a9e52e246033b4335d6bde000ef644ea90b5f10ed6d7cba23d9e",
+      "bytes": 3955,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gateway/src/crypto.rs",
+      "sha256": "e9771922dfcf3b217a172e9e8c295248ebe1d80ab4cb7231f3186f1e7a911475",
+      "bytes": 5355,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gateway/src/lib.rs",
+      "sha256": "aa9a34d250e6519fb4c4fd64de708e20464fa672535d93c0922619786afddc25",
+      "bytes": 22527,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gateway/tests/gateway.rs",
+      "sha256": "629a908907702cc9fe4d47f4966057130f597613e46510830d20faccbf934dfa",
+      "bytes": 21132,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gui/.gitignore",
+      "sha256": "3cc0a0c622293c9ae41d04d6b66be375dfbe82ca1a00ffda5ddcabc53b49de48",
+      "bytes": 9,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gui/.local/preview/Cargo.lock",
+      "sha256": "e63032897ae5e238a9722abe3921204d7d206380e99b9018655fd2118a8f90ce",
+      "bytes": 77293,
+      "archived_source": false
+    },
+    {
+      "path": "crates/bitnet-gui/.local/preview/Cargo.toml",
+      "sha256": "e7dba06a11195f4d945c265e133188921fc2d283edc60cb4e8e4524bd7b220dd",
+      "bytes": 407,
+      "archived_source": false
+    },
+    {
+      "path": "crates/bitnet-gui/.local/preview/sdk/Cargo.toml",
+      "sha256": "f866f36fddb7936bb217eb82194d853ccab590a80b0b7857bd6e829aee2d70d9",
+      "bytes": 153,
+      "archived_source": false
+    },
+    {
+      "path": "crates/bitnet-gui/.local/preview/sdk/src/lib.rs",
+      "sha256": "f482ea79a7cffe6171929ee496632821fae55481c005e70e296ec474772b1c03",
+      "bytes": 1666,
+      "archived_source": false
+    },
+    {
+      "path": "crates/bitnet-gui/Cargo.toml",
+      "sha256": "1dd943148a71df92e01826ce0cf2ab95e958e8045c2a7b69bb7e4f6ac8d12790",
+      "bytes": 939,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gui/src/main.rs",
+      "sha256": "f28c470b0013dca6298ee8169194be08c00556e7f56db862568cb5635ae7e9a1",
+      "bytes": 52180,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gui/src/notifications.rs",
+      "sha256": "3af6bbff3321d9b9782c2d3b5aa927a53c53cafe25864f06de0a5768e1b63b31",
+      "bytes": 8104,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gui/src/tray.rs",
+      "sha256": "b8513f2de591db42cde3f97aa64ec236b5c97008b412f2f815750e2b2c20738a",
+      "bytes": 6429,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-gui/src/views.rs",
+      "sha256": "9eb7a97fe98b523ac6bd57f19187ec84988ed3264942030036e7f83dc1b01c76",
+      "bytes": 63430,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/Cargo.toml",
+      "sha256": "30d60cec4e68c1e272f94d3cc7be5cc5a648c87734b2bf2008e85c3dffb3b9b5",
+      "bytes": 573,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/README.md",
+      "sha256": "bfc4bf16d416fc72da838d0345ad710b44badf111a4945bd26945b8c69b843ad",
+      "bytes": 4659,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/bin/bitkeychain.rs",
+      "sha256": "be30d3b67100217ad62464a905be25528c543ff1879fa73b2013ebf1c3fa9489",
+      "bytes": 333,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/credentials.rs",
+      "sha256": "6176cc784d2ce15d3324dec4d2400d8185b5767f7b29b7eacd5deb66c237973e",
+      "bytes": 13661,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/keychain.rs",
+      "sha256": "1ccffd8042fab23f1dbd04ff901bcc86c4761760af7e598789e13773c56b05f0",
+      "bytes": 3689,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/keychain_broker.rs",
+      "sha256": "f2bf8ebc339271b990283497241feead2881884a079c1f7c538dcc6e8fac2c01",
+      "bytes": 4390,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/lib.rs",
+      "sha256": "9362cf5dd14df9aa80cf2123f235586e10b312e7096b4c1048ec42b24e97ef2d",
+      "bytes": 4878,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/network.rs",
+      "sha256": "faa9edb3b43597c4ba90592e24820f8b65c0dfcdb98144ab7af3db7e2a62656c",
+      "bytes": 2828,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/network_macos.rs",
+      "sha256": "a69d429da4e187dda72de7e6b47f129c2929c2ba1e2a15fa7aed8f5586212972",
+      "bytes": 7735,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/network_unix.rs",
+      "sha256": "a510eae8efedfec0a7616601511bf4601ea6e939051baf83188fb40a4e0e4f4c",
+      "bytes": 12330,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/network_windows.rs",
+      "sha256": "47cc63928dd62914b3b8a8b80fe0e731a4d81ab026c6088c577605d51e080018",
+      "bytes": 9064,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/secure_fs.rs",
+      "sha256": "cb3c7fac7e8b8b71b80288c8bb8d803772e8fc3a5bd7a72cb9564080305a66f2",
+      "bytes": 3598,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/service.rs",
+      "sha256": "28bc318006bd4aba43574dbdf1f3d1d81182d9459cfd9e91e23e208c7a2ccba3",
+      "bytes": 6297,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/service_windows.rs",
+      "sha256": "09347eea8b7d4d7fd4f733bfe2b25058795e5d8fbc2e19a70e588185fad71d29",
+      "bytes": 7041,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-platform/src/windows.rs",
+      "sha256": "3d1532ae30445007dfd611689adc0d9c603eef63997ffb5741cc8d1ee79eff7c",
+      "bytes": 9199,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/Cargo.toml",
+      "sha256": "c33caa413e0701916aa93f237a59c742df7358469fbe71e1dcf82e54c7ab4bb9",
+      "bytes": 1130,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/bin/bitmaint.rs",
+      "sha256": "0f35d6a698e17e42112fa553dedfcb1473d259ea5d5e4c7c31c9f52f8ac57c05",
+      "bytes": 5503,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/client.rs",
+      "sha256": "5fae9e3b85d9db17a8d8684406bf59fa70ee9d8e48d85cf598d4232e3fff0680",
+      "bytes": 7711,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/controller.rs",
+      "sha256": "67878ab46d0aa3a8e2dcc11eab2ad80255dc4c7735b009c252494c2cebbb58b0",
+      "bytes": 6947,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/engine.rs",
+      "sha256": "1821cdaae4d9bb3d604929456c10dc0fa1fb9614bada4051f3a574540c38c2f8",
+      "bytes": 75394,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/history.rs",
+      "sha256": "b370f02a64b5c3d68131ba6995943f196b82f7faf2c239a6b58f37dfefee2697",
+      "bytes": 5104,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/ipc.rs",
+      "sha256": "0acd9c69def083fc957f908e8f0558915c6b77ddf5b5296368b10ad508af3e70",
+      "bytes": 21300,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/lib.rs",
+      "sha256": "5e810fb391c54804fbfda78e99254ec31c1772abc52bc6fb808e95a496d433f9",
+      "bytes": 155,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/main.rs",
+      "sha256": "40bd6b0ceffe171141279757e9646607890ea600907d35550cfef824913ed4a5",
+      "bytes": 4083,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/maintenance.rs",
+      "sha256": "00811620bb70d4ac1902aa506604e602db20af058b331a83673e181677b0d6ff",
+      "bytes": 76089,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/os_log.rs",
+      "sha256": "14106072fb1ec2bacc468ef1c7a3ef34f357e0b126c3b845e2b5e1d1b676510b",
+      "bytes": 1896,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/persistence.rs",
+      "sha256": "31b54a14e7f4779852f2e46d6a28bcbe93cccdfa46d86d1a54692ce4e14f9125",
+      "bytes": 3692,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/update_cache.rs",
+      "sha256": "bc57a8b75958029d160c99bfa2b5856a7000a9a8b3aedbb3cb5d25eea512affb",
+      "bytes": 27963,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/update_policy.rs",
+      "sha256": "c7fbd985ded3aa0b350ad8c201bff3355fb1f7c00c91da190b764bac4c9ea6a8",
+      "bytes": 7121,
+      "archived_source": true
+    },
+    {
+      "path": "crates/bitnet-runtime/src/updates.rs",
+      "sha256": "6704d70bece297fd7134efcc5fa663f96dd191505a1d61db3b79512e5d8f351d",
+      "bytes": 38934,
+      "archived_source": true
+    }
+  ],
+  "normalized_application_source": {
+    "algorithm": "sha256",
+    "source_sha256": "f7a7043c82b3f1f6626b549979bda70e7d717674e40dcce9741ff1344aeca0e8",
+    "files": 50
+  },
+  "independent_validation": [
+    "Six formal Cargo workspace members; no dependency manifest under the ignored preview directory.",
+    "Windows and Linux release dependency records contain no preview path.",
+    "No build script or include macro references the preview files.",
+    "All 50 archived application inputs match the original per-file build receipt."
+  ],
+  "excluded_inputs": [
+    "crates/bitnet-gui/.local/preview/Cargo.lock",
+    "crates/bitnet-gui/.local/preview/Cargo.toml",
+    "crates/bitnet-gui/.local/preview/sdk/Cargo.toml",
+    "crates/bitnet-gui/.local/preview/sdk/src/lib.rs"
+  ],
+  "delivered_package_hashes": [
+    {
+      "path": "dist\\windows-x64\\BitNet-0.1.0-windows-x64.zip",
+      "bytes": 7705459,
+      "sha256": "8c140fe4d940f065f0fc8591e85ac101a3347a6f9d3db4f3b99cf71d8d18993d"
+    },
+    {
+      "path": "dist\\windows-x64\\BitNetSetup-0.1.0-windows-x64.exe",
+      "bytes": 6279888,
+      "sha256": "74af301f6d728d86dfb7b59519a5326eb56ab6a1bb36d088f2f0cd221fb9690d"
+    },
+    {
+      "path": "dist\\windows-x64\\Client.msi",
+      "bytes": 6172672,
+      "sha256": "f5aefbfd158342de9b39845f91ed43d84a2fa33188a4627ca11599b32b2da8c5"
+    },
+    {
+      "path": "dist\\windows-x64\\Service.msi",
+      "bytes": 1912832,
+      "sha256": "bdbdbc1eaea6c7fe86a17297e0826c0d9ba58fff606bc94ac7aaad3e5540dd8c"
+    },
+    {
+      "path": "dist\\linux-amd64\\bitnet-core_0.1.0_amd64.deb",
+      "bytes": 11848792,
+      "sha256": "77ef0bf180bedfe9f82ac95dd648b59167085b4574687938c148d414c45b725a"
+    },
+    {
+      "path": "dist\\linux-amd64\\bitnet-gui_0.1.0_amd64.deb",
+      "bytes": 5478242,
+      "sha256": "3bd6bff3eb6d3d9d78bd5839c397a8b57265465327a43d20787882b00e420396"
+    },
+    {
+      "path": "dist\\linux-amd64\\bitnet-user-0.1.0-linux-amd64.tar.gz",
+      "bytes": 14477617,
+      "sha256": "1d32402c009390d1bf1a8c040b2c2e7cf7890fa5b7e60b82a438183daa56b457"
+    }
+  ]
+}

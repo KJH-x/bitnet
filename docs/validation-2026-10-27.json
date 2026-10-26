@@ -3,8 +3,8 @@
   "release_status": "local development acceptance build; not publicly deployed",
   "app_source": {
     "algorithm": "sha256",
-    "digest": "aec928fcb7bcd8e8e7a874bdcb76552c1e84392ecaf77077dcdbf374f205a90c",
-    "files": 54
+    "digest": "f7a7043c82b3f1f6626b549979bda70e7d717674e40dcce9741ff1344aeca0e8",
+    "files": 50
   },
   "windows_release_tests": {
     "core": 4,
@@ -100,5 +100,15 @@
     "cross-user and pre-login acceptance",
     "14-day soak",
     "production feed/key/domain binding"
-  ]
+  ],
+  "legacy_build_fingerprint": {
+    "algorithm": "sha256",
+    "digest": "aec928fcb7bcd8e8e7a874bdcb76552c1e84392ecaf77077dcdbf374f205a90c",
+    "files": 54
+  },
+  "fingerprint_correction": "Original build metadata is preserved. The initial fingerprint included four unused ignored preview files; docs/build-source-provenance.json maps all original inputs to the normalized 50-file source archive. No application source or delivered binary/package bytes changed.",
+  "source_fingerprint_regression_tests": {
+    "total": 3,
+    "passed": true
+  }
 }
