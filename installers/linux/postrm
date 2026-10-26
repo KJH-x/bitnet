@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+# Account data and its master key deliberately survive remove and purge. Explicit bitmaint --purge owns deletion.
+if [ -d /run/systemd/system ]; then systemctl daemon-reload || true; fi

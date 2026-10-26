@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+# Runs only when the user explicitly installs the PKG with Installer authorization.
+if ! /usr/bin/dscl . -read /Users/_bitnet >/dev/null 2>&1; then
+    candidate=499
+    while /usr/bin/dscl . -search /Users UniqueID "$candidate" | /usr/bin/grep -q . || /usr/bin/dscl . -search /Groups PrimaryGroupID "$candidate" | /usr/bin/grep -q .; do
+        candidate=$((candidate - 1)); test "$candidate" -ge 400
+    done
+    /usr/bin/dscl . -create /Groups/_bitnet PrimaryGroupID "$candidate"
+    /usr/bin/dscl . -create /Users/_bitnet
+    /usr/bin/dscl . -create /Users/_bitnet UniqueID "$candidate"
+    /usr/bin/dscl . -create /Users/_bitnet PrimaryGroupID "$candidate"
+    /usr/bin/dscl . -create /Users/_bitnet UserShell /usr/bin/false
+    /usr/bin/dscl . -create /Users/_bitnet NFSHomeDirectory /var/empty
+    /usr/bin/dscl . -create /Users/_bitnet RealName 'BitNet background service'
+    /usr/bin/dscl . -create /Users/_bitnet IsHidden 1
+    /usr/bin/dscl . -create /Users/_bitnet AuthenticationAuthority ';DisabledUser;'
+fi
+# Reject a pre-existing interactive identity with this reserved name.
+test "$(/usr/bin/dscl . -read /Users/_bitnet UserShell | /usr/bin/awk '{print $2}')" = /usr/bin/false
+uid=$(/usr/bin/id -u _bitnet); test "$uid" -ne 0
+for path in '/Library/Application Support/BitNet' /var/run/bitnet; do
+    test ! -L "$path"
+done
+/bin/mkdir -p '/Library/Application Support/BitNet' /var/run/bitnet
+/usr/sbin/chown _bitnet:_bitnet '/Library/Application Support/BitNet' /var/run/bitnet
+/bin/chmod 0700 '/Library/Application Support/BitNet'
+/bin/chmod 0755 /var/run/bitnet
+for label in top.nsapi.bitnet top.nsapi.bitnet.keychain; do
+    /bin/launchctl bootout "system/$label" >/dev/null 2>&1 || true
+    /usr/sbin/chown root:wheel "/Library/LaunchDaemons/$label.plist"
+    /bin/chmod 0644 "/Library/LaunchDaemons/$label.plist"
+done
+/bin/launchctl bootstrap system /Library/LaunchDaemons/top.nsapi.bitnet.keychain.plist
+/bin/launchctl bootstrap system /Library/LaunchDaemons/top.nsapi.bitnet.plist

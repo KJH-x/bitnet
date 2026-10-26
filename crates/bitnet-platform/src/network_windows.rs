@@ -1,0 +1,279 @@
+use super::*;
+pub(super) fn polling_only(_: &ChangeGuard) -> bool {
+    false
+}
+use crate::{error, windows::wide_string};
+use bitnet_core::ErrorCode;
+use std::{
+    ffi::{c_void, CStr},
+    ptr,
+};
+use windows_sys::Win32::{
+    Foundation::HANDLE,
+    NetworkManagement::{IpHelper::*, Ndis::*},
+    Networking::WinSock::*,
+};
+
+unsafe fn ipv4(address: *const SOCKADDR) -> Option<Ipv4Addr> {
+    if address.is_null() || (*address).sa_family != AF_INET {
+        return None;
+    }
+    Some(Ipv4Addr::from(
+        (*address.cast::<SOCKADDR_IN>())
+            .sin_addr
+            .S_un
+            .S_addr
+            .to_ne_bytes(),
+    ))
+}
+
+pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
+    unsafe {
+        let mut size = 16 * 1024u32;
+        let mut storage = Vec::<u64>::new();
+        let flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
+        let mut code = 111;
+        for _ in 0..3 {
+            if size > 16 * 1024 * 1024 {
+                return Err(error(
+                    ErrorCode::Network,
+                    "Adapter snapshot exceeds safety limit",
+                ));
+            }
+            storage.resize((size as usize).div_ceil(8), 0);
+            code = GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                flags,
+                ptr::null(),
+                storage.as_mut_ptr().cast(),
+                &mut size,
+            );
+            if code != 111 {
+                break;
+            }
+        }
+        if code != 0 {
+            return Err(error(
+                ErrorCode::Network,
+                "Native network interface enumeration failed",
+            ));
+        }
+        let mut out = Vec::new();
+        let mut row = storage.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        while !row.is_null() {
+            let a = &*row;
+            let name = wide_string(a.FriendlyName);
+            let description = wide_string(a.Description);
+            let id = if a.AdapterName.is_null() {
+                format!("luid-{}", a.Luid.Value)
+            } else {
+                CStr::from_ptr(a.AdapterName.cast())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let mut ips = Vec::new();
+            let mut unicast = a.FirstUnicastAddress;
+            while !unicast.is_null() {
+                let u = &*unicast;
+                if let Some(ip) = ipv4(u.Address.lpSockaddr) {
+                    ips.push(ip);
+                }
+                unicast = u.Next;
+            }
+            let mut gateway = None;
+            let mut g = a.FirstGatewayAddress;
+            while !g.is_null() {
+                gateway = ipv4((*g).Address.lpSockaddr);
+                if gateway.is_some() {
+                    break;
+                }
+                g = (*g).Next;
+            }
+            let wireless = a.IfType == IF_TYPE_IEEE80211;
+            let ssid = if wireless { wifi_ssid(&a.Luid) } else { None };
+            out.push(NetworkInterface {
+                id,
+                name,
+                index: a.Anonymous1.Anonymous.IfIndex,
+                ipv4: ips,
+                gateway,
+                up: a.OperStatus == IfOperStatusUp,
+                wireless,
+                ssid,
+                virtual_adapter: matches!(
+                    a.IfType,
+                    IF_TYPE_TUNNEL | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_PPP
+                ) || super::is_tunnel(&description),
+            });
+            row = a.Next;
+        }
+        out.sort_by_key(|a| a.index);
+        Ok(out)
+    }
+}
+
+// Resolve WLAN dynamically so Server/Core installations without Wireless LAN do not fail to load.
+unsafe fn wifi_ssid(luid: &NET_LUID_LH) -> Option<String> {
+    use windows_sys::Win32::{
+        Foundation::{FreeLibrary, HMODULE},
+        NetworkManagement::WiFi::{
+            wlan_intf_opcode_current_connection, WLAN_CONNECTION_ATTRIBUTES,
+        },
+        System::LibraryLoader::*,
+    };
+    let dll = crate::windows::wide("wlanapi.dll");
+    let library = LoadLibraryExW(dll.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if library.is_null() {
+        return None;
+    }
+    struct Library(HMODULE);
+    impl Drop for Library {
+        fn drop(&mut self) {
+            unsafe {
+                FreeLibrary(self.0);
+            }
+        }
+    }
+    let _library = Library(library);
+    type Open = unsafe extern "system" fn(u32, *const c_void, *mut u32, *mut HANDLE) -> u32;
+    type Query = unsafe extern "system" fn(
+        HANDLE,
+        *const windows_sys::core::GUID,
+        i32,
+        *const c_void,
+        *mut u32,
+        *mut *mut c_void,
+        *mut i32,
+    ) -> u32;
+    type Close = unsafe extern "system" fn(HANDLE, *const c_void) -> u32;
+    type Free = unsafe extern "system" fn(*const c_void);
+    let open: Open =
+        std::mem::transmute(GetProcAddress(library, c"WlanOpenHandle".as_ptr().cast())?);
+    let query: Query = std::mem::transmute(GetProcAddress(
+        library,
+        c"WlanQueryInterface".as_ptr().cast(),
+    )?);
+    let close: Close =
+        std::mem::transmute(GetProcAddress(library, c"WlanCloseHandle".as_ptr().cast())?);
+    let free: Free =
+        std::mem::transmute(GetProcAddress(library, c"WlanFreeMemory".as_ptr().cast())?);
+    let (mut version, mut handle) = (0, ptr::null_mut());
+    if open(2, ptr::null(), &mut version, &mut handle) != 0 {
+        return None;
+    }
+    let mut guid = std::mem::zeroed();
+    if ConvertInterfaceLuidToGuid(luid, &mut guid) != 0 {
+        close(handle, ptr::null());
+        return None;
+    }
+    let (mut size, mut data, mut kind) = (0, ptr::null_mut(), 0);
+    let code = query(
+        handle,
+        &guid,
+        wlan_intf_opcode_current_connection,
+        ptr::null(),
+        &mut size,
+        &mut data,
+        &mut kind,
+    );
+    let result = if code == 0
+        && !data.is_null()
+        && size as usize >= std::mem::size_of::<WLAN_CONNECTION_ATTRIBUTES>()
+    {
+        let ssid = &(*data.cast::<WLAN_CONNECTION_ATTRIBUTES>())
+            .wlanAssociationAttributes
+            .dot11Ssid;
+        let bytes = &ssid.ucSSID[..(ssid.uSSIDLength as usize).min(ssid.ucSSID.len())];
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    } else {
+        None
+    };
+    if !data.is_null() {
+        free(data);
+    }
+    close(handle, ptr::null());
+    result
+}
+pub(super) fn preferred_binding(target: Ipv4Addr) -> Result<Option<NetworkBinding>, AppError> {
+    unsafe {
+        let mut destination: SOCKADDR_INET = std::mem::zeroed();
+        destination.Ipv4.sin_family = AF_INET;
+        destination.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(target.octets());
+        let mut route: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+        let mut source: SOCKADDR_INET = std::mem::zeroed();
+        if GetBestRoute2(
+            ptr::null(),
+            0,
+            ptr::null(),
+            &destination,
+            0,
+            &mut route,
+            &mut source,
+        ) != 0
+        {
+            return Ok(None);
+        }
+        let Some(source_ip) = ipv4((&source as *const SOCKADDR_INET).cast()) else {
+            return Ok(None);
+        };
+        let Some(interface) = interfaces()?.into_iter().find(|a| {
+            a.index == route.InterfaceIndex
+                && a.up
+                && !a.virtual_adapter
+                && a.ipv4.contains(&source_ip)
+        }) else {
+            return Ok(None);
+        };
+        if source_ip.is_unspecified() || source_ip.is_loopback() || source_ip.is_link_local() {
+            return Ok(None);
+        }
+        Ok(Some(NetworkBinding {
+            interface_id: interface.id,
+            interface_index: interface.index,
+            source_ip,
+        }))
+    }
+}
+
+pub(super) struct ChangeGuard {
+    handle: HANDLE,
+    sender: *mut watch::Sender<u64>,
+}
+// The registration API serializes cancellation with completion of callbacks.
+unsafe impl Send for ChangeGuard {}
+unsafe impl Sync for ChangeGuard {}
+unsafe extern "system" fn changed(
+    context: *const c_void,
+    _: *const MIB_IPINTERFACE_ROW,
+    _: MIB_NOTIFICATION_TYPE,
+) {
+    if !context.is_null() {
+        let tx = &*context.cast::<watch::Sender<u64>>();
+        tx.send_modify(|g| *g = g.wrapping_add(1));
+    }
+}
+pub(super) fn subscribe(sender: watch::Sender<u64>) -> Result<ChangeGuard, AppError> {
+    let sender = Box::into_raw(Box::new(sender));
+    let mut handle = ptr::null_mut();
+    let code = unsafe {
+        NotifyIpInterfaceChange(AF_UNSPEC, Some(changed), sender.cast(), false, &mut handle)
+    };
+    if code != 0 {
+        unsafe {
+            drop(Box::from_raw(sender));
+        }
+        return Err(error(
+            ErrorCode::Network,
+            "Native network change registration failed; use polling",
+        ));
+    }
+    Ok(ChangeGuard { handle, sender })
+}
+impl Drop for ChangeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CancelMibChangeNotify2(self.handle);
+            drop(Box::from_raw(self.sender));
+        }
+    }
+}

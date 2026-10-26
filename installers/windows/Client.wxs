@@ -1,0 +1,42 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="BitNet Client" Manufacturer="BitNet contributors" Version="$(var.Version)" ProductCode="$(var.ClientProductCode)" UpgradeCode="{81E2553E-095D-49AF-A95A-B0FD47A3E61E}" Scope="perUser" InstallerVersion="500" Compressed="yes" Language="1033">
+    <MajorUpgrade AllowDowngrades="yes" Schedule="afterInstallInitialize" />
+    <Upgrade Id="{81E2553E-095D-49AF-A95A-B0FD47A3E61E}"><UpgradeVersion Minimum="$(var.Version)" IncludeMinimum="no" OnlyDetect="yes" Property="BITNET_NEWER_PRODUCT_FOUND" /></Upgrade>
+    <Property Id="BITNET_ALLOW_DOWNGRADE" Secure="yes" />
+    <Launch Condition="NOT BITNET_NEWER_PRODUCT_FOUND OR BITNET_ALLOW_DOWNGRADE = &quot;1&quot;" Message="A newer BitNet Client is installed. Use the explicit verified rollback action to downgrade." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <Binary Id="UninstallActions" SourceFile="$(var.UninstallActions)" />
+    <CustomAction Id="RemoveUserStartup" BinaryRef="UninstallActions" DllEntry="RemoveStartup" Execute="deferred" Impersonate="yes" Return="ignore" />
+    <InstallExecuteSequence><Custom Action="RemoveUserStartup" Before="RemoveFiles" Condition="REMOVE = &quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" /></InstallExecuteSequence>
+    <StandardDirectory Id="LocalAppDataFolder"><Directory Id="ProgramsFolder" Name="Programs"><Directory Id="ClientDir" Name="BitNet">
+      <Component Id="ClientGui" Guid="*"><File Id="GuiExe" Source="$(var.Stage)\bitnet-gui.exe" KeyPath="yes" /></Component>
+      <Component Id="ClientCli" Guid="*"><File Source="$(var.Stage)\bitctl.exe" KeyPath="yes" /></Component>
+      <Component Id="UserEngine" Guid="*"><File Source="$(var.Stage)\bitengine.exe" KeyPath="yes" /></Component>
+      <Component Id="ClientMaintenance" Guid="*"><File Source="$(var.Stage)\bitmaint.exe" KeyPath="yes" /></Component>
+      <Directory Id="ClientLicenses" Name="licenses">
+        <Component Id="ClientProjectLicense" Guid="*"><File Source="$(var.ProjectLicense)" Name="LICENSE" KeyPath="yes" /></Component>
+        <Component Id="ClientGatewayNotice" Guid="*"><File Source="$(var.GatewayNotice)" Name="GATEWAY-NOTICE.txt" KeyPath="yes" /></Component>
+        <Component Id="ClientThirdPartyNotices" Guid="*"><File Source="$(var.ThirdPartyNotices)" Name="THIRD-PARTY-NOTICES.txt" KeyPath="yes" /></Component>
+        <Component Id="ClientThirdPartyMetadata" Guid="*"><File Source="$(var.ThirdPartyMetadata)" Name="THIRD-PARTY-NOTICES.json" KeyPath="yes" /></Component>
+      </Directory>
+      <Directory Id="OfflinePackages" Name="packages">
+        <Component Id="OfflineService" Guid="*"><File Source="$(var.ServiceMsi)" Name="Service.msi" KeyPath="yes" /></Component>
+        <Component Id="OfflineSignature" Guid="*"><File Source="$(var.ServiceSignature)" Name="Service.msi.minisig" KeyPath="yes" /></Component>
+      </Directory>
+    </Directory></Directory></StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder"><Directory Id="BitNetMenu" Name="BitNet">
+      <Component Id="UserShortcuts" Guid="*">
+        <Shortcut Id="StartMenu" Name="BitNet" Target="[#GuiExe]" WorkingDirectory="ClientDir"><ShortcutProperty Key="System.AppUserModel.ID" Value="top.nsapi.bitnet.gui" /></Shortcut>
+        <RegistryValue Root="HKCU" Key="Software\BitNet" Name="ClientInstallDir" Type="string" Value="[ClientDir]" KeyPath="yes" />
+        <RemoveFolder Id="RemoveBitNetMenu" On="uninstall" />
+      </Component>
+      <Component Id="UserNotificationIdentity" Guid="*">
+        <RegistryValue Root="HKCU" Key="Software\Classes\AppUserModelId\top.nsapi.bitnet.gui" Name="DisplayName" Type="string" Value="BitNet" KeyPath="yes" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\AppUserModelId\top.nsapi.bitnet.gui" Name="ShowInSettings" Type="integer" Value="1" />
+      </Component>
+    </Directory></StandardDirectory>
+    <Feature Id="Client" Title="BitNet desktop and command line" Level="1">
+      <ComponentRef Id="ClientGui"/><ComponentRef Id="ClientCli"/><ComponentRef Id="UserEngine"/><ComponentRef Id="ClientMaintenance"/><ComponentRef Id="ClientProjectLicense"/><ComponentRef Id="ClientGatewayNotice"/><ComponentRef Id="ClientThirdPartyNotices"/><ComponentRef Id="ClientThirdPartyMetadata"/><ComponentRef Id="OfflineService"/><ComponentRef Id="OfflineSignature"/><ComponentRef Id="UserShortcuts"/><ComponentRef Id="UserNotificationIdentity"/>
+    </Feature>
+  </Package>
+</Wix>

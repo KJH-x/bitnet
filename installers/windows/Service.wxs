@@ -1,0 +1,33 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="BitNet Background Service" Manufacturer="BitNet contributors" Version="$(var.Version)" ProductCode="$(var.ServiceProductCode)" UpgradeCode="{7FBA8135-7341-4F91-A39E-615190032EA2}" Scope="perMachine" InstallerVersion="500" Compressed="yes" Language="1033">
+    <MajorUpgrade AllowDowngrades="yes" Schedule="afterInstallInitialize" />
+    <Upgrade Id="{7FBA8135-7341-4F91-A39E-615190032EA2}"><UpgradeVersion Minimum="$(var.Version)" IncludeMinimum="no" OnlyDetect="yes" Property="BITNET_NEWER_PRODUCT_FOUND" /></Upgrade>
+    <Property Id="BITNET_ALLOW_DOWNGRADE" Secure="yes" />
+    <Launch Condition="NOT BITNET_NEWER_PRODUCT_FOUND OR BITNET_ALLOW_DOWNGRADE = &quot;1&quot;" Message="A newer BitNet service is installed. Use the explicit verified rollback action to downgrade." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <StandardDirectory Id="$(var.ProgramFilesId)"><Directory Id="ServiceDir" Name="BitNet Service">
+      <Component Id="SystemEngine" Guid="*">
+        <File Id="SystemEngineExe" Source="$(var.Stage)\bitengine.exe" KeyPath="yes" />
+        <ServiceInstall Id="BitNetInstall" Name="BitNet" DisplayName="BitNet campus connection manager" Description="Campus authentication independent of desktop login." Type="ownProcess" Start="auto" ErrorControl="normal" Account="NT SERVICE\BitNet" Arguments="--service" Vital="yes">
+          <ServiceConfigFailureActions OnInstall="yes" OnReinstall="yes" ResetPeriod="86400">
+            <Failure Action="restart" Delay="5000"/><Failure Action="restart" Delay="10000"/><Failure Action="restart" Delay="30000"/>
+          </ServiceConfigFailureActions>
+        </ServiceInstall>
+        <ServiceControl Id="BitNetControl" Name="BitNet" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+      <Component Id="SystemMaintenance" Guid="*"><File Source="$(var.Stage)\bitmaint.exe" KeyPath="yes" /></Component>
+      <Directory Id="ServiceLicenses" Name="licenses">
+        <Component Id="ServiceProjectLicense" Guid="*"><File Source="$(var.ProjectLicense)" Name="LICENSE" KeyPath="yes" /></Component>
+        <Component Id="ServiceGatewayNotice" Guid="*"><File Source="$(var.GatewayNotice)" Name="GATEWAY-NOTICE.txt" KeyPath="yes" /></Component>
+        <Component Id="ServiceThirdPartyNotices" Guid="*"><File Source="$(var.ThirdPartyNotices)" Name="THIRD-PARTY-NOTICES.txt" KeyPath="yes" /></Component>
+        <Component Id="ServiceThirdPartyMetadata" Guid="*"><File Source="$(var.ThirdPartyMetadata)" Name="THIRD-PARTY-NOTICES.json" KeyPath="yes" /></Component>
+      </Directory>
+    </Directory></StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder"><Directory Id="SystemData" Name="BitNet">
+      <Component Id="PreservedServiceData" Guid="{5FB62CF5-9311-47AE-8A3E-A2A779C814AE}" Permanent="yes">
+        <CreateFolder><PermissionEx Id="PrivateServiceData" Sddl="$(var.ServiceDataSddl)" /></CreateFolder>
+      </Component>
+    </Directory></StandardDirectory>
+    <Feature Id="Service" Title="Unattended authentication" Level="1"><ComponentRef Id="SystemEngine"/><ComponentRef Id="SystemMaintenance"/><ComponentRef Id="ServiceProjectLicense"/><ComponentRef Id="ServiceGatewayNotice"/><ComponentRef Id="ServiceThirdPartyNotices"/><ComponentRef Id="ServiceThirdPartyMetadata"/><ComponentRef Id="PreservedServiceData"/></Feature>
+  </Package>
+</Wix>

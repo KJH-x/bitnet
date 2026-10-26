@@ -1,0 +1,15 @@
+/target/
+/dist/
+/build/
+/.local/
+*.log
+*.pdb
+*.key
+*.p12
+*.pfx
+*.minisign.key
+*.sqlite*
+*.secret
+/.env
+__pycache__/
+*.pyc

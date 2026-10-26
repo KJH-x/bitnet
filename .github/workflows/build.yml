@@ -1,0 +1,108 @@
+name: Build and package
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, target: x86_64-pc-windows-msvc }
+          - { arch: x86, target: i686-pc-windows-msvc }
+          - { arch: arm64, target: aarch64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+      - if: matrix.arch == 'x64'
+        run: cargo test --workspace
+      - run: ./scripts/bootstrap-tools.ps1
+      - run: ./scripts/build-wix-source.ps1 -PlatformToolset v143
+      - run: ./scripts/package-windows.ps1 -Arch ${{ matrix.arch }} -Development
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}-development
+          path: dist/windows-${{ matrix.arch }}/
+  linux:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, arch: amd64 }
+          - { runner: ubuntu-22.04-arm, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libx11-dev libxkbcommon-dev libwayland-dev libfontconfig1-dev minisign
+      - run: sh scripts/prepare-signing.sh --development && cat .local/release-keys/public.env >> "$GITHUB_ENV"
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: python3 scripts/fingerprint-source.py --write .local/build-source-before.json
+      - run: cargo build --release --workspace --bins
+      - run: python3 scripts/fingerprint-source.py --check .local/build-source-before.json --write target/release/bitnet-build-source.json
+      - run: DEVELOPMENT=1 ARCH=${{ matrix.arch }} sh scripts/package-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}-development
+          path: dist/linux-${{ matrix.arch }}/
+  linux-i386:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build on Debian 12 i386 baseline
+        run: |
+          docker run --rm --platform linux/386 -v "$PWD:/work" -w /work i386/debian:12 sh -ec '
+            apt-get update
+            apt-get install -y curl ca-certificates build-essential pkg-config libssl-dev libx11-dev libxkbcommon-dev libwayland-dev libfontconfig1-dev minisign python3
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+            sh /tmp/rustup.sh -y --profile minimal --component rustfmt --component clippy
+            . /root/.cargo/env
+            sh scripts/prepare-signing.sh --development
+            set -a; . .local/release-keys/public.env; set +a
+            cargo fmt --all -- --check
+            cargo clippy --workspace --all-targets -- -D warnings
+            cargo test --workspace
+            python3 scripts/fingerprint-source.py --write .local/build-source-before.json
+            cargo build --release --workspace --bins
+            python3 scripts/fingerprint-source.py --check .local/build-source-before.json --write target/release/bitnet-build-source.json
+            DEVELOPMENT=1 ARCH=i386 sh scripts/package-linux.sh'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-i386-development
+          path: dist/linux-i386/
+  macos:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15-intel, arch: x86_64 }
+          - { runner: macos-15, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: brew install minisign
+      - run: sh scripts/prepare-signing.sh --development && cat .local/release-keys/public.env >> "$GITHUB_ENV"
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: python3 scripts/fingerprint-source.py --write .local/build-source-before.json
+      - run: cargo build --release --workspace --bins
+      - run: python3 scripts/fingerprint-source.py --check .local/build-source-before.json --write target/release/bitnet-build-source.json
+      - run: DEVELOPMENT=1 ARCH=${{ matrix.arch }} sh scripts/package-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-development
+          path: dist/macos-${{ matrix.arch }}/

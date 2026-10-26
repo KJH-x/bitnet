@@ -1,0 +1,149 @@
+//! A closed maintenance action CLI; never accepts a command, path, URL or secret.
+use bitnet_core::{AppError, ErrorCode, Scope};
+use bitnet_runtime::maintenance::{self, MaintenanceAction};
+fn arguments() -> Result<(Scope, MaintenanceAction, bool, bool), AppError> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    parse_arguments(&args)
+}
+fn parse_arguments(args: &[String]) -> Result<(Scope, MaintenanceAction, bool, bool), AppError> {
+    let mut scope = Scope::User;
+    let mut action = None;
+    let mut interactive = false;
+    let mut elevated = false;
+    let mut purge = false;
+    let mut seen = std::collections::HashSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        if !seen.insert(args[index].as_str()) {
+            return Err(AppError::new(
+                ErrorCode::InvalidInput,
+                "Duplicate maintenance argument",
+            ));
+        }
+        match args[index].as_str() {
+            "--scope" => {
+                index += 1;
+                scope = match args.get(index).map(String::as_str) {
+                    Some("user") => Scope::User,
+                    Some("system") => Scope::System,
+                    _ => {
+                        return Err(AppError::new(
+                            ErrorCode::InvalidInput,
+                            "Expected --scope user|system",
+                        ))
+                    }
+                };
+            }
+            "--action" => {
+                index += 1;
+                action = args.get(index).cloned();
+            }
+            "--interactive" => interactive = true,
+            "--elevated" => elevated = true,
+            "--purge" => purge = true,
+            _ => {
+                return Err(AppError::new(
+                    ErrorCode::InvalidInput,
+                    "Unknown maintenance argument",
+                ))
+            }
+        }
+        index += 1;
+    }
+    let action = maintenance::parse_action(
+        &action.ok_or_else(|| {
+            AppError::new(ErrorCode::InvalidInput, "Maintenance --action is required")
+        })?,
+        purge,
+    )?;
+    if elevated && interactive {
+        return Err(AppError::new(
+            ErrorCode::InvalidInput,
+            "Authorized helpers cannot request another interactive authorization",
+        ));
+    }
+    if elevated && !bitnet_platform::service::is_admin() {
+        return Err(AppError::new(
+            ErrorCode::PermissionDenied,
+            "Elevated maintenance requires a real administrator token",
+        ));
+    }
+    Ok((scope, action, interactive, elevated))
+}
+fn main() {
+    if std::env::args().len() == 2
+        && std::env::args()
+            .nth(1)
+            .is_some_and(|a| a == "--help" || a == "-h")
+    {
+        println!("BitNet maintenance\nUsage: bitmaint --scope user|system --action ACTION [--interactive] [--purge]\nActions: service-install, service-start, service-stop, service-remove, repair,\n         check-update, install-update, rollback-update, autostart-on, autostart-off,\n         gui-autostart-on, gui-autostart-off\n--purge is valid only with service-remove. Noninteractive operations never elevate.");
+        return;
+    }
+    let outcome = (|| {
+        let (scope, action, interactive, elevated) = arguments()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCode::Internal,
+                    "Could not initialize maintenance runtime",
+                )
+            })?;
+        if elevated {
+            runtime.block_on(maintenance::execute_elevated(scope, action))
+        } else {
+            runtime.block_on(maintenance::execute(scope, action, interactive))
+        }
+    })();
+    match outcome {
+        Ok(result) => {
+            println!(
+                "{}",
+                serde_json::json!({"ok":true,"message":result.message,"details":result.details})
+            );
+            if result
+                .details
+                .get("reboot_required")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                std::process::exit(3010);
+            }
+        }
+        Err(error) => {
+            eprintln!("{}", serde_json::json!({"ok":false,"error":error}));
+            std::process::exit(error.code.exit_code());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn parse(args: &[&str]) -> Result<(Scope, MaintenanceAction, bool, bool), AppError> {
+        parse_arguments(&args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>())
+    }
+    #[test]
+    fn malformed_and_ambiguous_flags_are_rejected_without_os_actions() {
+        assert!(parse(&["--action", "check-update", "--scope", "user"]).is_ok());
+        for args in [
+            vec!["--action", "service-start", "--purge"],
+            vec!["--action", "check-update", "--action", "service-start"],
+            vec![
+                "--scope",
+                "system",
+                "--scope",
+                "user",
+                "--action",
+                "check-update",
+            ],
+            vec!["--action", "service-start;whoami"],
+            vec!["--action", "check-update", "--url", "https://example.test"],
+            vec!["--action", "check-update", "--interactive", "--elevated"],
+            vec!["--action"],
+        ] {
+            assert!(parse(&args).is_err());
+        }
+    }
+}

@@ -1,0 +1,31 @@
+[Unit]
+Description=BitNet campus connection manager
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/bitengine --service
+DynamicUser=yes
+StateDirectory=bitnet
+StateDirectoryMode=0700
+RuntimeDirectory=bitnet
+RuntimeDirectoryMode=0755
+LoadCredential=masterkey:/etc/bitnet/masterkey
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+WatchdogSec=60s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

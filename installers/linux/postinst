@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = configure ]; then
+    install -d -m 0700 -o root -g root /etc/bitnet
+    if [ -L /etc/bitnet/masterkey ]; then echo 'Refusing symlink masterkey' >&2; exit 1; fi
+    if [ ! -e /etc/bitnet/masterkey ]; then
+        umask 077
+        key_tmp=$(mktemp /etc/bitnet/.masterkey.XXXXXXXX)
+        trap 'rm -f "$key_tmp"' EXIT HUP INT TERM
+        dd if=/dev/urandom of="$key_tmp" bs=32 count=1 status=none
+        chmod 0600 "$key_tmp"
+        # Hard-link publication never overwrites a concurrently provisioned key.
+        ln "$key_tmp" /etc/bitnet/masterkey || test -f /etc/bitnet/masterkey
+        rm -f "$key_tmp"
+        trap - EXIT HUP INT TERM
+    fi
+    test "$(wc -c < /etc/bitnet/masterkey)" -eq 32
+    chown root:root /etc/bitnet/masterkey
+    chmod 0600 /etc/bitnet/masterkey
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        systemctl enable bitnet.service
+        systemctl restart bitnet.service
+    fi
+fi

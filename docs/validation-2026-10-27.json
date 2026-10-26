@@ -1,0 +1,104 @@
+{
+  "recorded_at": "2026-10-27T03:17:50+08:00",
+  "release_status": "local development acceptance build; not publicly deployed",
+  "app_source": {
+    "algorithm": "sha256",
+    "digest": "aec928fcb7bcd8e8e7a874bdcb76552c1e84392ecaf77077dcdbf374f205a90c",
+    "files": 54
+  },
+  "windows_release_tests": {
+    "core": 4,
+    "gateway": 25,
+    "platform": 8,
+    "gui": 13,
+    "runtime": 48,
+    "entrypoints": 2,
+    "total": 100,
+    "passed": true
+  },
+  "windows_release_cli_ipc_e2e": {
+    "groups": 10,
+    "passed": true,
+    "mode": "isolated simulation",
+    "report": ".local/e2e/20261027-030635-9782f6b54c/report.json"
+  },
+  "engine_sample": {
+    "mode": "release_simulation_idle",
+    "seconds": 600.0017876001075,
+    "samples": 300,
+    "cpu_percent_one_core": 0.023437430172078843,
+    "peak_rss_mib": 11.9921875,
+    "median_rss_mib": 11.94140625,
+    "target_rss_mib": 30,
+    "target_cpu_percent": 0.1,
+    "meets_sample_targets": true,
+    "real_network": false,
+    "gui_included": false,
+    "executable": "bitengine.exe (final Windows x64 release)",
+    "engine_sha256": "25da79410054534d2fd9bb90becece2f0c333acc2e842f489ab026e9a49504c5",
+    "platform": "nt"
+  },
+  "gui_read_only_check": {
+    "local_date": "2026-10-27",
+    "timezone": "Asia/Shanghai",
+    "after_local_03_00": true,
+    "pages": 7,
+    "final_release_rechecked": true,
+    "sha256": "f919f392929d4db8b05926ad3199f680b30541d68a6d1262b0c22ac3fe735189"
+  },
+  "package_audit": {
+    "source_sha256": "aec928fcb7bcd8e8e7a874bdcb76552c1e84392ecaf77077dcdbf374f205a90c",
+    "windows_msi_payloads_match_release": true,
+    "windows_portable_payload_matches_release": true,
+    "linux_deb_payloads_match_release": true,
+    "linux_tar_payload_matches_release": true,
+    "installation_performed": false,
+    "assets": [
+      {
+        "path": "dist\\windows-x64\\BitNet-0.1.0-windows-x64.zip",
+        "bytes": 7705459,
+        "sha256": "8c140fe4d940f065f0fc8591e85ac101a3347a6f9d3db4f3b99cf71d8d18993d"
+      },
+      {
+        "path": "dist\\windows-x64\\BitNetSetup-0.1.0-windows-x64.exe",
+        "bytes": 6279888,
+        "sha256": "74af301f6d728d86dfb7b59519a5326eb56ab6a1bb36d088f2f0cd221fb9690d"
+      },
+      {
+        "path": "dist\\windows-x64\\Client.msi",
+        "bytes": 6172672,
+        "sha256": "f5aefbfd158342de9b39845f91ed43d84a2fa33188a4627ca11599b32b2da8c5"
+      },
+      {
+        "path": "dist\\windows-x64\\Service.msi",
+        "bytes": 1912832,
+        "sha256": "bdbdbc1eaea6c7fe86a17297e0826c0d9ba58fff606bc94ac7aaad3e5540dd8c"
+      },
+      {
+        "path": "dist\\linux-amd64\\bitnet-core_0.1.0_amd64.deb",
+        "bytes": 11848792,
+        "sha256": "77ef0bf180bedfe9f82ac95dd648b59167085b4574687938c148d414c45b725a"
+      },
+      {
+        "path": "dist\\linux-amd64\\bitnet-gui_0.1.0_amd64.deb",
+        "bytes": 5478242,
+        "sha256": "3bd6bff3eb6d3d9d78bd5839c397a8b57265465327a43d20787882b00e420396"
+      },
+      {
+        "path": "dist\\linux-amd64\\bitnet-user-0.1.0-linux-amd64.tar.gz",
+        "bytes": 14477617,
+        "sha256": "1d32402c009390d1bf1a8c040b2c2e7cf7890fa5b7e60b82a438183daa56b457"
+      }
+    ]
+  },
+  "signature_status": "All seven assets use a local development Minisign key; no operating-system signing reputation is claimed.",
+  "linux_build_host": "Ubuntu 24.04 amd64 in WSL; not proof of Ubuntu 22.04 compatibility",
+  "excluded_acceptance": [
+    "live campus authentication/logout",
+    "host installation/service/startup changes",
+    "all-platform native installation",
+    "cross-user and pre-login acceptance",
+    "14-day soak",
+    "production feed/key/domain binding"
+  ]
+}

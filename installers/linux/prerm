@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl stop bitnet.service || true
+    systemctl disable bitnet.service || true
+fi

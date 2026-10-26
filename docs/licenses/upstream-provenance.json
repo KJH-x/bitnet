@@ -1,0 +1,38 @@
+[
+  {
+    "name": "clipboard-win",
+    "version": "5.4.3",
+    "repository": "https://github.com/DoumanAsh/clipboard-win",
+    "commit": "ed27008ae5d1f10cfbb266de039f0fb35fd05a56",
+    "url": "https://raw.githubusercontent.com/DoumanAsh/clipboard-win/ed27008ae5d1f10cfbb266de039f0fb35fd05a56/LICENSE",
+    "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+    "file": "clipboard-win-5.4.3-ed27008ae5d1-LICENSE.txt"
+  },
+  {
+    "name": "iced_tiny_skia",
+    "version": "0.14.1",
+    "repository": "https://github.com/iced-rs/iced",
+    "commit": "0ecf60664df7b8ac7d7aef5f7279d5323027f693",
+    "url": "https://raw.githubusercontent.com/iced-rs/iced/0ecf60664df7b8ac7d7aef5f7279d5323027f693/LICENSE",
+    "sha256": "fc9086ba4eba4b77e4c603906362742bc3715ffa2c7810c6074fe7780d3a0398",
+    "file": "iced_tiny_skia-0.14.1-0ecf60664df7-LICENSE.txt"
+  },
+  {
+    "name": "iced_widget",
+    "version": "0.14.2",
+    "repository": "https://github.com/iced-rs/iced",
+    "commit": "54abf81d13fec06d4d9ac754b03ce2c3313e8a1f",
+    "url": "https://raw.githubusercontent.com/iced-rs/iced/54abf81d13fec06d4d9ac754b03ce2c3313e8a1f/LICENSE",
+    "sha256": "fc9086ba4eba4b77e4c603906362742bc3715ffa2c7810c6074fe7780d3a0398",
+    "file": "iced_widget-0.14.2-54abf81d13fe-LICENSE.txt"
+  },
+  {
+    "name": "iced_winit",
+    "version": "0.14.1",
+    "repository": "https://github.com/iced-rs/iced",
+    "commit": "38237dd294da3256c2ac4d3f8288fc73956c91e0",
+    "url": "https://raw.githubusercontent.com/iced-rs/iced/38237dd294da3256c2ac4d3f8288fc73956c91e0/LICENSE",
+    "sha256": "fc9086ba4eba4b77e4c603906362742bc3715ffa2c7810c6074fe7780d3a0398",
+    "file": "iced_winit-0.14.1-38237dd294da-LICENSE.txt"
+  }
+]

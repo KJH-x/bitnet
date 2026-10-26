@@ -1,0 +1,20 @@
+[package]
+name = "bitnet-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bitctl"
+path = "src/main.rs"
+
+[dependencies]
+bitnet-core.workspace = true
+bitnet-platform.workspace = true
+bitnet-runtime.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+zeroize.workspace = true
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"

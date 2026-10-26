@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=BitNet
+Comment=BIT campus network connection manager
+Exec=bitnet-gui
+Terminal=false
+Categories=Network;Utility;
+StartupNotify=true
