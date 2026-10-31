@@ -206,7 +206,7 @@ impl App {
                         .unwrap_or_else(|| "—".into())
                 ),
                 pair(
-                    self.t("已用流量", "Data usage"),
+                    self.t("网关统计流量", "Gateway data usage"),
                     snapshot
                         .session
                         .bytes_used
@@ -214,7 +214,7 @@ impl App {
                         .unwrap_or_else(|| "—".into())
                 ),
                 pair(
-                    self.t("在线时长", "Online duration"),
+                    self.t("网关累计在线时长", "Gateway accumulated online time"),
                     snapshot
                         .session
                         .online_seconds
@@ -229,6 +229,10 @@ impl App {
                         .map(|value| format!("¥ {value:.2}"))
                         .unwrap_or_else(|| "—".into())
                 ),
+                text(self.t(
+                    "流量和时长的统计周期由校方网关定义，不代表本次连续会话。",
+                    "The campus gateway defines the accounting period; these totals are not the duration or usage of this connection.",
+                )).size(12),
                 row![
                     button(self.t("登录", "Connect")).on_press_maybe(
                         (!self.busy && !snapshot.accounts.is_empty())
@@ -1021,9 +1025,9 @@ impl App {
         if let Some(snapshot) = &self.snapshot {
             content = content.push(card(
                 column![
-                    text(self.t("当前会话", "Current session")).size(21),
+                    text(self.t("校方网关统计", "Campus gateway totals")).size(21),
                     pair(
-                        self.t("在线时长", "Online duration"),
+                        self.t("网关累计在线时长", "Gateway accumulated online time"),
                         snapshot
                             .session
                             .online_seconds
@@ -1031,13 +1035,17 @@ impl App {
                             .unwrap_or_else(|| "—".into())
                     ),
                     pair(
-                        self.t("数据用量", "Data usage"),
+                        self.t("网关统计流量", "Gateway data usage"),
                         snapshot
                             .session
                             .bytes_used
                             .map(format_bytes)
                             .unwrap_or_else(|| "—".into())
                     ),
+                    text(self.t(
+                        "统计周期和计费口径以校方网关为准，不代表本次连续会话。",
+                        "The gateway defines the accounting period and billing rules; these are not totals for this connection.",
+                    )).size(12),
                     pair(
                         self.t("网络变化代次", "Network generation"),
                         snapshot.network_generation

@@ -8,6 +8,8 @@ Export GatewayClient::new(GatewayConfig) -> Result<Self, GatewayError>.
 Async methods: status(&self, Option<&NetworkBinding>) -> Result<GatewaySession, GatewayError>; login(&self, username: &str, password: &str, Option<&NetworkBinding>) -> Result<GatewaySession, GatewayError>; logout(&self, username: &str, Option<&NetworkBinding>) -> Result<GatewaySession, GatewayError>.
 GatewayError must map to AppError via into_app_error(). Never expose request URLs/material. Allow unbound connections ONLY to literal loopback fixtures. Authentication otherwise requires binding. Endpoint custom configuration is administrator controlled in service mode.
 
+`GatewaySession.bytes_used` maps to gateway `sum_bytes` (bytes), `online_seconds` maps to `sum_seconds` (seconds), and `balance` keeps the gateway `user_balance` value without a scale conversion. These are gateway accounting totals, not measurements for the current connection. The gateway defines the period; do not infer a monthly period or continuous-session duration. Local observed-online statistics are separate. The current online mapping was checked read-only against BIT on 2026-10-31; this does not validate login/logout or offline variants.
+
 ## Platform crate
 
 Export paths(scope: Scope) -> Result<AppPaths, AppError>, AppPaths { data_dir: PathBuf, config_file: PathBuf, credentials_file: PathBuf, history_file: PathBuf, log_dir: PathBuf }.

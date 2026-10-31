@@ -1,0 +1,287 @@
+{
+  "date": "2026-10-31",
+  "timezone": "Asia/Shanghai",
+  "observed_from": "2026-10-31T15:16:21+08:00",
+  "observed_until": "2026-10-31T15:35:04+08:00",
+  "scope": "Authorized read-only observation of the existing online session on one Windows host behind an upstream router.",
+  "authentication_mutations": {
+    "login": 0,
+    "logout": 0,
+    "challenge": 0,
+    "runtime_started": false,
+    "account_store_accessed": false,
+    "network_configuration_changed": false
+  },
+  "gateway_get_requests": {
+    "status": 3,
+    "static_portal_documents": 5
+  },
+  "formal_rust_checks": {
+    "live_status_success": true,
+    "loopback_status_path_exact": true,
+    "preferred_binding_matches_interface": true,
+    "replay_matches_original_fields": true
+  },
+  "field_checks": {
+    "error": {
+      "original_well_typed": true,
+      "matches": true
+    },
+    "online_ip": {
+      "original_well_typed": true,
+      "matches": true
+    },
+    "sum_bytes": {
+      "original_well_typed": true,
+      "matches": true
+    },
+    "sum_seconds": {
+      "original_well_typed": true,
+      "matches": true
+    },
+    "user_balance": {
+      "original_well_typed": true,
+      "matches": true
+    },
+    "user_name": {
+      "original_well_typed": true,
+      "matches": true
+    }
+  },
+  "raw_field_types": {
+    "ServerFlag": "int",
+    "add_time": "int",
+    "all_bytes": "int",
+    "bytes_in": "int",
+    "bytes_out": "int",
+    "checkout_date": "int",
+    "domain": "str",
+    "error": "str",
+    "group_id": "str",
+    "keepalive_time": "int",
+    "online_ip": "str",
+    "products_name": "str",
+    "real_name": "str",
+    "remain_bytes": "int",
+    "remain_seconds": "int",
+    "sum_bytes": "int",
+    "sum_seconds": "int",
+    "sysver": "str",
+    "user_balance": "int",
+    "user_charge": "int",
+    "user_mac": "str",
+    "user_name": "str",
+    "wallet_balance": "int"
+  },
+  "os_reference_checks": {
+    "os_interface_snapshot_unchanged": true,
+    "os_gateway_route_unchanged": true,
+    "rust_interface_matches_os_route": true,
+    "rust_source_matches_os_route": true
+  },
+  "final_session_checks": {
+    "online_before": true,
+    "online_after": true,
+    "same_gateway_account": true,
+    "same_gateway_ip": true,
+    "gateway_add_time_unchanged": true,
+    "traffic_nondecreasing": true,
+    "duration_nondecreasing": true,
+    "rust_live_account_matches_reference": true,
+    "rust_live_ip_matches_reference": true
+  },
+  "reference_health": {
+    "internet": true,
+    "dns": true,
+    "ipv6": "unknown",
+    "full_engine_scheduler_tested": false
+  },
+  "official_portal_mapping": {
+    "bytes": "sum_bytes; base 1024",
+    "duration": "sum_seconds; seconds",
+    "balance": "user_balance; no scaling; two decimals",
+    "accounting_period": "not established"
+  },
+  "local_regression": {
+    "read_only_tool_synthetic_tests": 4,
+    "gui_tests": 13,
+    "strict_clippy_passed": true,
+    "format_check_passed": true
+  },
+  "privacy": "Raw identity, IP, MAC, names and usage values are kept only in the ignored private evidence directory; no raw responses are included in public artifacts.",
+  "private_evidence_hashes": [
+    {
+      "private_file": "rad_user_info.jsonp",
+      "bytes": 558,
+      "sha256": "efd3912d5e9e25b325ae7deddff75b6b7ffc32cfd65bf6f18f3bae8febc18c93"
+    },
+    {
+      "private_file": "rad_user_info-after.jsonp",
+      "bytes": 559,
+      "sha256": "b8bf69c804d097443210f06f95d69f6db8e142543a80442e6c1e317664cef7d6"
+    },
+    {
+      "private_file": "report-rust.json",
+      "bytes": 4577,
+      "sha256": "40db8a39b3c67e4c900b5df39b558adffc21abd0e777bde6396b066fac600801"
+    },
+    {
+      "private_file": "jquery.srun.portal.js",
+      "bytes": 39674,
+      "sha256": "4577f49ff45354ec2a97e9fea1ca0d124c1ca32542bd8a2a1c8cb91b0ecfce75"
+    },
+    {
+      "private_file": "main.js",
+      "bytes": 51460,
+      "sha256": "581cd1116472868dbdc117acb0e961b1a09fc016599d1323606383e4e9a9d51a"
+    },
+    {
+      "private_file": "health-reference.json",
+      "bytes": 700,
+      "sha256": "ef0d13796923e86fa4449332033c734104abea44fadfcc61e29d315976ebe8a8"
+    },
+    {
+      "private_file": "ipv6-reference.json",
+      "bytes": 496,
+      "sha256": "395bc0940138f9697df7d85a3bdf4608a48a2a3fa18e3cd4d48d70246d7a8f43"
+    },
+    {
+      "private_file": "os-comparison-private.json",
+      "bytes": 173,
+      "sha256": "c03ce29882cc972270a5c11a9090d54baae52c3d60c2efb33e393548c3c841b3"
+    }
+  ],
+  "limitations": [
+    "Current authenticated online state only; offline variants untested.",
+    "No login, logout, credential rejection, reconnect, failure recovery or alternate campus path was tested.",
+    "Health checks are independent references using the product policy, not a full engine run.",
+    "IPv6 unknown means no usable target address was obtained in this reference probe.",
+    "No native installation or cross-platform acceptance is implied."
+  ],
+  "release_rebuild": {
+    "source": {
+      "algorithm": "sha256",
+      "source_sha256": "1a96595e474537cb5bd4f4c41686ed94f27236e2f5a4de3956c8fa7db34844ec",
+      "files": 50
+    },
+    "application_change": "GUI wording now identifies gateway accounting totals; no login/logout/automatic-authentication code changed.",
+    "backend_cli_maintenance_binaries_unchanged_on_both_platforms": true,
+    "binaries": [
+      {
+        "platform": "windows",
+        "name": "bitengine",
+        "bytes": 3208704,
+        "sha256": "25da79410054534d2fd9bb90becece2f0c333acc2e842f489ab026e9a49504c5",
+        "old_sha256": "25da79410054534d2fd9bb90becece2f0c333acc2e842f489ab026e9a49504c5",
+        "old_bytes": 3208704,
+        "unchanged": true
+      },
+      {
+        "platform": "windows",
+        "name": "bitctl",
+        "bytes": 2129920,
+        "sha256": "7149a653cbef620cfcf506b1a439b44b1586bda9d63651f09b9ecb04a18b4ab0",
+        "old_sha256": "7149a653cbef620cfcf506b1a439b44b1586bda9d63651f09b9ecb04a18b4ab0",
+        "old_bytes": 2129920,
+        "unchanged": true
+      },
+      {
+        "platform": "windows",
+        "name": "bitmaint",
+        "bytes": 1707520,
+        "sha256": "39dbbac61008f797e92b696ccff09eecc3cb46d2b2d7cd56a9a68be303f8c945",
+        "old_sha256": "39dbbac61008f797e92b696ccff09eecc3cb46d2b2d7cd56a9a68be303f8c945",
+        "old_bytes": 1707520,
+        "unchanged": true
+      },
+      {
+        "platform": "windows",
+        "name": "bitnet-gui",
+        "bytes": 4871680,
+        "sha256": "2181fba56a462acb3fa68535414c9f7ede2bc3b39701c3a61545a77773b07a8f",
+        "old_sha256": "f919f392929d4db8b05926ad3199f680b30541d68a6d1262b0c22ac3fe735189",
+        "old_bytes": 4870656,
+        "unchanged": false
+      },
+      {
+        "platform": "linux",
+        "name": "bitengine",
+        "bytes": 8610200,
+        "sha256": "6ab1892bf2b302334272591583c621af7dc5e71d3e067960e5281927991ec105",
+        "old_sha256": "6ab1892bf2b302334272591583c621af7dc5e71d3e067960e5281927991ec105",
+        "old_bytes": 8610200,
+        "unchanged": true
+      },
+      {
+        "platform": "linux",
+        "name": "bitctl",
+        "bytes": 7689000,
+        "sha256": "59c8ff56ccae7246a91bd643587c035b5e3d400ac55fa5a0dfec605aafcd31bf",
+        "old_sha256": "59c8ff56ccae7246a91bd643587c035b5e3d400ac55fa5a0dfec605aafcd31bf",
+        "old_bytes": 7689000,
+        "unchanged": true
+      },
+      {
+        "platform": "linux",
+        "name": "bitmaint",
+        "bytes": 6839400,
+        "sha256": "6fce78a2e4c36f57d9bfaa5fbc5b381e90f1bb943f98f48cf6183cde83c5903f",
+        "old_sha256": "6fce78a2e4c36f57d9bfaa5fbc5b381e90f1bb943f98f48cf6183cde83c5903f",
+        "old_bytes": 6839400,
+        "unchanged": true
+      },
+      {
+        "platform": "linux",
+        "name": "bitnet-gui",
+        "bytes": 13835888,
+        "sha256": "49d9846b09f776756630795466bb74c729e7c68d9eb8c68f827863386ffa0ec8",
+        "old_sha256": "4f6f671c8ef908ee184b86e5b1907669a80689de3639053774dfc53d44029f68",
+        "old_bytes": 13831792,
+        "unchanged": false
+      }
+    ],
+    "assets": [
+      {
+        "path": "dist/windows-x64/BitNet-0.1.0-windows-x64.zip",
+        "bytes": 7705818,
+        "sha256": "7cafcd17a0dcae6cf5a425d166dbf31f2b54be6c8f0b6589e412dc16ea6ff47e"
+      },
+      {
+        "path": "dist/windows-x64/BitNetSetup-0.1.0-windows-x64.exe",
+        "bytes": 6285959,
+        "sha256": "f485e576e1f3bb49ee74183f86ee52edc066d8393a64f32a6f009b9952c5e135"
+      },
+      {
+        "path": "dist/windows-x64/Client.msi",
+        "bytes": 6180864,
+        "sha256": "f0a13af52949c20a4cb4ba59b91c1004425c22b4d8ffac0d84ca79091b223fe8"
+      },
+      {
+        "path": "dist/windows-x64/Service.msi",
+        "bytes": 1912832,
+        "sha256": "fc7d66ef47f74cb3a0b32a2f3bda632d1145f8cdb6e3ddd5453313e9ef5b4c2b"
+      },
+      {
+        "path": "dist/linux-amd64/bitnet-core_0.1.0_amd64.deb",
+        "bytes": 11848792,
+        "sha256": "77ef0bf180bedfe9f82ac95dd648b59167085b4574687938c148d414c45b725a"
+      },
+      {
+        "path": "dist/linux-amd64/bitnet-gui_0.1.0_amd64.deb",
+        "bytes": 5478388,
+        "sha256": "fff45ece46ae3612152ed18e6e2dd09a6a0b99f1fa2fc32fd68a8396434e8183"
+      },
+      {
+        "path": "dist/linux-amd64/bitnet-user-0.1.0-linux-amd64.tar.gz",
+        "bytes": 14477888,
+        "sha256": "e377009ceeae509d3dd4ae45cd5704c5730e88aeec57d97a9df379ffdbb07c09"
+      }
+    ],
+    "payloads_match_release": true,
+    "static_crt_imports_checked": true,
+    "signing": "Local development Minisign key; no public deployment or operating-system signing reputation.",
+    "native_installation_performed": false,
+    "linux_build_baseline": "Ubuntu 24.04 amd64 in WSL; Ubuntu 22.04 compatibility not established",
+    "previous_delivery_archive": "dist/archive/20261027/"
+  }
+}

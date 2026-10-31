@@ -1,0 +1,16 @@
+[package]
+name = "bitnet-read-only-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+# Deliberately excluded from the production workspace and automatic CI.
+[workspace]
+
+[dependencies]
+bitnet-core = { path = "../../crates/bitnet-core" }
+bitnet-gateway = { path = "../../crates/bitnet-gateway" }
+bitnet-platform = { path = "../../crates/bitnet-platform" }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "macros", "signal"] }
+serde_json = "1"
