@@ -15,6 +15,9 @@ use std::{
 };
 use tokio::sync::{mpsc, watch};
 
+const SYSTEM_AUTHENTICATION_MESSAGE: &str = "BIT-mobile 由系统认证，无需校园门户登录或注销";
+const VERIFICATION_STEP_TIMEOUT_SECS: u64 = 4;
+
 enum Vault {
     Real(CredentialStore),
     Simulation,
@@ -38,6 +41,7 @@ pub struct Engine {
     recovery_started: Option<std::time::Instant>,
     stable_checks: u32,
     online_window: Option<(std::time::Instant, std::time::Instant)>,
+    network_changes: Option<watch::Receiver<u64>>,
 }
 
 impl Engine {
@@ -63,6 +67,8 @@ impl Engine {
         let mut snapshot = Snapshot::new(scope);
         snapshot.settings = settings;
         snapshot.service = bitnet_platform::service::status();
+        snapshot.capabilities.push("enable_automatic".into());
+        snapshot.capabilities.push("verify_account".into());
         let (vault, accounts) = if simulation {
             snapshot.capabilities.push("simulation".into());
             (
@@ -121,6 +127,7 @@ impl Engine {
             recovery_started: None,
             stable_checks: 0,
             online_window: None,
+            network_changes: None,
         };
         result.account_metadata();
         prune_logs(
@@ -193,7 +200,7 @@ impl Engine {
         if let Some((started, confirmed)) = self.online_window.take() {
             self.event(
                 "online_segment",
-                "已确认的持续在线观测区间",
+                "已记录一段在线时间",
                 None,
                 Some(confirmed.duration_since(started).as_millis() as u64),
             );
@@ -300,6 +307,7 @@ impl Engine {
                 wireless: false,
                 ssid: None,
                 virtual_adapter: false,
+                alternate_adapter: false,
             }]
         } else {
             bitnet_platform::network::interfaces()?
@@ -350,9 +358,12 @@ impl Engine {
                 None,
             );
         }
+        let system_authentication = uses_system_authentication(&self.snapshot);
         if !self.simulation {
-            let key = self.snapshot.active_binding.as_ref().map(|b| {
-                crate::controller::domain_key(&self.snapshot.settings.gateway.base_url, b)
+            let key = self.snapshot.active_binding.as_ref().and_then(|binding| {
+                (!system_authentication).then(|| {
+                    crate::controller::domain_key(&self.snapshot.settings.gateway.base_url, binding)
+                })
             });
             if self.domain_key != key {
                 // Acquire before publishing a usable binding. A contending
@@ -365,9 +376,10 @@ impl Engine {
                 self.domain_key = key;
             }
         }
-        self.snapshot.network_trusted = self.simulation
-            || network_fingerprint(&self.snapshot)
-                .is_some_and(|key| self.snapshot.settings.trusted_networks.contains(&key));
+        self.snapshot.network_trusted = !system_authentication
+            && (self.simulation
+                || network_fingerprint(&self.snapshot)
+                    .is_some_and(|key| self.snapshot.settings.trusted_networks.contains(&key)));
         if self.snapshot.active_binding.is_none() {
             self.snapshot.environment = if self
                 .snapshot
@@ -384,6 +396,13 @@ impl Engine {
         Ok(())
     }
     pub async fn check(&mut self, allow_login: bool) -> Result<(), AppError> {
+        self.check_network(allow_login, false).await
+    }
+    async fn check_network(
+        &mut self,
+        allow_login: bool,
+        explicit_login: bool,
+    ) -> Result<(), AppError> {
         self.snapshot.service = bitnet_platform::service::status();
         self.next_check = now_secs() + self.snapshot.settings.status_interval_secs;
         self.refresh_network().await?;
@@ -391,17 +410,23 @@ impl Engine {
             self.emit();
             return Ok(());
         }
-        if ignored_network(
-            &self.snapshot.settings,
-            self.snapshot.active_binding.as_ref().and_then(|b| {
-                self.snapshot
-                    .interfaces
-                    .iter()
-                    .find(|i| i.id == b.interface_id)
-            }),
-        ) {
+        let system_authentication = uses_system_authentication(&self.snapshot);
+        if system_authentication
+            || (!explicit_login
+                && ignored_network(&self.snapshot.settings, active_interface(&self.snapshot)))
+        {
+            self.close_online_window();
+            self.recovery_started = None;
+            self.stable_checks = 0;
+            self.snapshot.retry_count = 0;
+            self.snapshot.next_retry_at = None;
+            self.snapshot.session = GatewaySession::default();
+            self.snapshot.health = HealthStatus::default();
             self.snapshot.environment = Environment::NonCampus;
             self.snapshot.state = EngineState::Idle;
+            if system_authentication {
+                self.snapshot.last_error = None;
+            }
             self.emit();
             return Ok(());
         }
@@ -441,12 +466,84 @@ impl Engine {
         {
             self.event(
                 "environment_observed",
-                "已重新评估网络环境和认证状态",
+                "已检查当前网络和认证状态",
                 None,
                 None,
             );
         }
         self.reconcile_auth(allow_login).await
+    }
+    async fn enable_automatic(&mut self, expected_network: &str) -> Result<(), AppError> {
+        self.check(false).await?;
+        if uses_system_authentication(&self.snapshot) {
+            return Err(AppError::new(
+                ErrorCode::InvalidInput,
+                SYSTEM_AUTHENTICATION_MESSAGE,
+            ));
+        }
+        if self.snapshot.environment == Environment::NonCampus {
+            return Err(AppError::new(
+                ErrorCode::InvalidInput,
+                "当前网络被网络规则忽略，无法启用自动认证",
+            ));
+        }
+        if self.snapshot.session.auth == AuthState::Unknown {
+            return Err(AppError::new(
+                ErrorCode::GatewayUnavailable,
+                "未能确认当前网关的认证状态，请检查连接后重试",
+            ));
+        }
+        if self
+            .selected(self.snapshot.active_binding.as_ref(), None)?
+            .is_none_or(|account| account.password.is_empty())
+        {
+            return Err(AppError::new(
+                ErrorCode::Credentials,
+                "请先保存并选择校园网账户",
+            ));
+        }
+        // The read-only gateway probe above awaited network I/O. Check again
+        // before storing the user's approval for the displayed network.
+        let network_generation = self.snapshot.network_generation;
+        self.refresh_network().await?;
+        let key = network_fingerprint(&self.snapshot).filter(|key| {
+            self.snapshot.network_generation == network_generation && key == expected_network
+        });
+        let Some(key) = key else {
+            self.next_check = 0;
+            return Err(AppError::new(
+                ErrorCode::ConfirmationRequired,
+                "当前网络已变化，请检查网卡并重新确认",
+            ));
+        };
+        let mut settings = self.snapshot.settings.clone();
+        if !settings.trusted_networks.contains(&key) {
+            if settings.trusted_networks.len() >= 128 {
+                return Err(AppError::new(
+                    ErrorCode::InvalidInput,
+                    "已确认网络过多，请先删除旧记录",
+                ));
+            }
+            settings.trusted_networks.push(key);
+        }
+        settings.automatic = true;
+        if settings != self.snapshot.settings {
+            settings.revision = settings.revision.saturating_add(1);
+            persistence::write_settings(&self.paths.config_file, &settings)?;
+            self.snapshot.settings = settings;
+            self.event("network_trust", "已允许在当前网络自动认证", None, None);
+        }
+        self.snapshot.network_trusted = true;
+        if self
+            .snapshot
+            .last_error
+            .as_ref()
+            .is_some_and(|error| error.code == ErrorCode::ConfirmationRequired)
+        {
+            self.snapshot.last_error = None;
+        }
+        self.next_check = 0;
+        Ok(())
     }
     async fn reconcile_auth(&mut self, allow_login: bool) -> Result<(), AppError> {
         if self.snapshot.session.auth == AuthState::Authenticated {
@@ -473,7 +570,7 @@ impl Engine {
             self.snapshot.retry_count = 0;
             self.snapshot.next_retry_at = None;
             self.snapshot.last_error = None;
-        } else if self.snapshot.settings.paused {
+        } else if self.snapshot.settings.paused || self.snapshot.verification_hold {
             self.close_online_window();
             self.stable_checks = 0;
             self.snapshot.state = EngineState::Paused;
@@ -521,19 +618,7 @@ impl Engine {
         self.emit();
         let start = std::time::Instant::now();
         let result = if self.simulation {
-            if account.password.expose() == "wrong" {
-                Err(AppError::new(ErrorCode::Credentials, "模拟密码错误"))
-            } else {
-                self.simulation_session = GatewaySession {
-                    auth: AuthState::Authenticated,
-                    username: Some(account.username.clone()),
-                    ip: Some(Ipv4Addr::LOCALHOST),
-                    bytes_used: Some(1024),
-                    online_seconds: Some(0),
-                    balance: Some(20.0),
-                };
-                Ok(self.simulation_session.clone())
-            }
+            self.simulate_login(&account)
         } else {
             self.gateway
                 .login(
@@ -608,6 +693,352 @@ impl Engine {
             }
         }
     }
+    fn simulate_login(&mut self, account: &AccountSecret) -> Result<GatewaySession, AppError> {
+        if account.password.expose() == "wrong" {
+            return Err(AppError::new(ErrorCode::Credentials, "模拟密码错误"));
+        }
+        self.simulation_session = GatewaySession {
+            auth: AuthState::Authenticated,
+            username: Some(account.username.clone()),
+            ip: Some(Ipv4Addr::LOCALHOST),
+            bytes_used: Some(1024),
+            online_seconds: Some(0),
+            balance: Some(20.0),
+        };
+        Ok(self.simulation_session.clone())
+    }
+
+    async fn verification_binding(
+        &mut self,
+        expected_network: &str,
+        expected_binding: Option<&NetworkBinding>,
+    ) -> Result<NetworkBinding, AppError> {
+        self.refresh_network().await?;
+        if uses_system_authentication(&self.snapshot) {
+            return Err(AppError::new(
+                ErrorCode::InvalidInput,
+                SYSTEM_AUTHENTICATION_MESSAGE,
+            ));
+        }
+        if ignored_network(&self.snapshot.settings, active_interface(&self.snapshot)) {
+            return Err(AppError::new(
+                ErrorCode::InvalidInput,
+                "当前网络已设置为忽略，无法验证校园账户",
+            ));
+        }
+        if network_fingerprint(&self.snapshot).as_deref() != Some(expected_network) {
+            return Err(verification_network_changed());
+        }
+        if expected_binding
+            .is_some_and(|expected| self.snapshot.active_binding.as_ref() != Some(expected))
+        {
+            return Err(verification_network_changed());
+        }
+        self.snapshot
+            .active_binding
+            .clone()
+            .ok_or_else(verification_network_changed)
+    }
+
+    async fn verification_status(
+        &self,
+        gateway: &GatewayClient,
+        binding: &NetworkBinding,
+        changes: &mut Option<watch::Receiver<u64>>,
+    ) -> Result<GatewaySession, AppError> {
+        if self.simulation {
+            return Ok(self.simulation_session.clone());
+        }
+        observe_verification(gateway.status(Some(binding)), changes).await
+    }
+
+    async fn verify_account(
+        &mut self,
+        candidate: AccountSecret,
+        expected_network: &str,
+    ) -> Result<(), AppError> {
+        validate_account_id(&candidate.id)?;
+        GatewayClient::validate_credentials(&candidate.username, candidate.password.expose())
+            .map_err(|error| error.into_app_error())?;
+        if self.accounts.len() >= 32 && !self.accounts.iter().any(|a| a.id == candidate.id) {
+            return Err(AppError::new(ErrorCode::InvalidInput, "最多保存 32 个账户"));
+        }
+        let stored_accounts = match self.vault.as_ref() {
+            Some(Vault::Real(store)) => Some(store.load()?),
+            Some(Vault::Simulation) => None,
+            None => {
+                return Err(AppError::new(
+                    ErrorCode::CredentialsUnavailable,
+                    "凭据存储不可用，请修复后再验证校园账户",
+                ))
+            }
+        };
+        let mut changes = self.network_changes.clone().filter(|_| !self.simulation);
+        if let Some(changes) = &mut changes {
+            changes.borrow_and_update();
+        }
+        let binding = self.verification_binding(expected_network, None).await?;
+        let mut config = self.snapshot.settings.gateway.clone();
+        config.timeout_secs = self
+            .snapshot
+            .settings
+            .request_timeout_secs
+            .min(VERIFICATION_STEP_TIMEOUT_SECS);
+        let gateway = GatewayClient::new(config).map_err(|error| error.into_app_error())?;
+        let original = self
+            .verification_status(&gateway, &binding, &mut changes)
+            .await?;
+        if original.auth == AuthState::Unknown {
+            return Err(AppError::new(
+                ErrorCode::GatewayUnavailable,
+                "无法确认网关会话，账户验证未开始",
+            ));
+        }
+        self.verification_binding(expected_network, Some(&binding))
+            .await?;
+        let mut previous_accounts = stored_accounts
+            .as_deref()
+            .unwrap_or(&self.accounts)
+            .iter()
+            .filter(|account| {
+                Some(account.username.as_str()) == original.username.as_deref()
+                    && !account.password.is_empty()
+            });
+        let previous = previous_accounts
+            .next()
+            .filter(|_| previous_accounts.next().is_none())
+            .cloned();
+        drop(stored_accounts);
+        let was_held = self.snapshot.verification_hold;
+        self.snapshot.verification_hold = true;
+        self.recovery_started = None;
+        let started = std::time::Instant::now();
+        let result = self
+            .test_account_credentials(
+                &gateway,
+                &candidate,
+                &original,
+                (expected_network, &binding),
+                &mut changes,
+            )
+            .await;
+        let session = match result {
+            Ok(session) => session,
+            Err(error) => {
+                let restored = if error.code == ErrorCode::Cancelled {
+                    self.snapshot.session = GatewaySession::default();
+                    false
+                } else {
+                    self.restore_previous_session(
+                        &gateway,
+                        &original,
+                        previous.as_ref(),
+                        (expected_network, &binding),
+                        &mut changes,
+                    )
+                    .await
+                };
+                self.snapshot.verification_hold =
+                    was_held || !restored || original.auth != AuthState::Authenticated;
+                self.next_check = 0;
+                self.snapshot.state = if self.snapshot.session.auth == AuthState::Authenticated {
+                    EngineState::Online
+                } else if self.snapshot.verification_hold {
+                    EngineState::Paused
+                } else {
+                    EngineState::Idle
+                };
+                let status = if restored && original.auth == AuthState::Authenticated {
+                    "已确认原账户在线"
+                } else if restored {
+                    "原网络会话未登录，自动认证已暂停"
+                } else {
+                    "未确认恢复原会话，自动认证已暂停"
+                };
+                let error = AppError::new(
+                    error.code,
+                    format!("账户验证失败，凭据未保存。{status}。{}", error.message),
+                );
+                self.snapshot.last_error = Some(error.clone());
+                self.event("account_verification_failed", &error.message, None, None);
+                self.emit();
+                return Err(error);
+            }
+        };
+        self.snapshot.session = session;
+        self.observe_online();
+        self.snapshot.state = EngineState::Online;
+        self.snapshot.last_success_at = Some(now_secs());
+        self.snapshot.retry_count = 0;
+        self.snapshot.next_retry_at = None;
+        self.next_check = 0;
+        if let Err(error) = self.save_verified_account(candidate) {
+            self.snapshot.last_error = Some(error.clone());
+            self.emit();
+            return Err(error);
+        }
+        self.snapshot.verification_hold = false;
+        self.snapshot.last_error = None;
+        self.event(
+            "login_success",
+            "新凭据认证成功并已复核",
+            self.snapshot.settings.selected_account.as_deref(),
+            Some(started.elapsed().as_millis() as u64),
+        );
+        Ok(())
+    }
+
+    async fn test_account_credentials(
+        &mut self,
+        gateway: &GatewayClient,
+        candidate: &AccountSecret,
+        original: &GatewaySession,
+        (expected_network, expected_binding): (&str, &NetworkBinding),
+        changes: &mut Option<watch::Receiver<u64>>,
+    ) -> Result<GatewaySession, AppError> {
+        if let Some(username) = original.username.as_deref() {
+            let binding = self
+                .verification_binding(expected_network, Some(expected_binding))
+                .await?;
+            if self.simulation {
+                self.logout_gateway().await?;
+            } else {
+                self.close_online_window();
+                self.snapshot.session =
+                    observe_verification(gateway.logout(username, Some(&binding)), changes).await?;
+            }
+        }
+        let binding = self
+            .verification_binding(expected_network, Some(expected_binding))
+            .await?;
+        self.snapshot.state = EngineState::LoggingIn;
+        self.emit();
+        let session = if self.simulation {
+            self.simulate_login(candidate)?
+        } else {
+            observe_verification(
+                gateway.verify_credentials(
+                    &candidate.username,
+                    candidate.password.expose(),
+                    Some(&binding),
+                ),
+                changes,
+            )
+            .await?
+        };
+        self.verification_binding(expected_network, Some(expected_binding))
+            .await?;
+        if changes
+            .as_ref()
+            .is_some_and(|changes| changes.has_changed().unwrap_or(false))
+        {
+            return Err(verification_network_changed());
+        }
+        Ok(session)
+    }
+
+    async fn restore_previous_session(
+        &mut self,
+        gateway: &GatewayClient,
+        original: &GatewaySession,
+        previous: Option<&AccountSecret>,
+        (expected_network, expected_binding): (&str, &NetworkBinding),
+        changes: &mut Option<watch::Receiver<u64>>,
+    ) -> bool {
+        // An unsuccessful or interrupted request may have changed the gateway state.
+        self.snapshot.session = GatewaySession::default();
+        let Ok(binding) = self
+            .verification_binding(expected_network, Some(expected_binding))
+            .await
+        else {
+            return false;
+        };
+        let Ok(session) = self.verification_status(gateway, &binding, changes).await else {
+            return false;
+        };
+        self.snapshot.session = session;
+        if self.snapshot.session.auth == original.auth
+            && self.snapshot.session.username == original.username
+        {
+            return true;
+        }
+        let Some(previous) =
+            previous.filter(|_| self.snapshot.session.auth == AuthState::Unauthenticated)
+        else {
+            return false;
+        };
+        let Ok(binding) = self
+            .verification_binding(expected_network, Some(expected_binding))
+            .await
+        else {
+            return false;
+        };
+        let restored = if self.simulation {
+            self.simulate_login(previous)
+        } else {
+            observe_verification(
+                gateway.login(
+                    &previous.username,
+                    previous.password.expose(),
+                    Some(&binding),
+                ),
+                changes,
+            )
+            .await
+        };
+        if let Ok(session) = restored {
+            if self
+                .verification_binding(expected_network, Some(expected_binding))
+                .await
+                .is_ok()
+            {
+                self.snapshot.session = session;
+                self.observe_online();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn save_verified_account(&mut self, candidate: AccountSecret) -> Result<(), AppError> {
+        let id = candidate.id.clone();
+        let mut settings = self.snapshot.settings.clone();
+        settings.selected_account = Some(id.clone());
+        settings.blocked_accounts.retain(|blocked| blocked != &id);
+        settings.revision = settings.revision.saturating_add(1);
+        let mut accounts = self.accounts.clone();
+        accounts.retain(|account| account.id != id);
+        accounts.push(candidate);
+        self.save_accounts(&accounts).map_err(|_| {
+            AppError::new(
+                ErrorCode::Unavailable,
+                "新账户已登录，但凭据保存失败。请检查凭据存储后重试",
+            )
+        })?;
+        if persistence::write_settings(&self.paths.config_file, &settings).is_err() {
+            let previous = self.accounts.clone();
+            if self.save_accounts(&previous).is_err() {
+                self.accounts = accounts;
+                self.account_metadata();
+                return Err(AppError::new(
+                    ErrorCode::Unavailable,
+                    "新账户已登录。设置保存失败，凭据回退也失败，请检查账户存储",
+                ));
+            }
+            return Err(AppError::new(
+                ErrorCode::Unavailable,
+                "新账户已登录，但设置保存失败，之前的凭据已恢复",
+            ));
+        }
+        self.snapshot.settings = settings;
+        self.accounts = accounts;
+        if self.failed_credential.as_deref() == Some(&id) {
+            self.failed_credential = None;
+        }
+        self.account_metadata();
+        self.event("account_saved", "验证成功的账户已安全保存", Some(&id), None);
+        Ok(())
+    }
     pub async fn execute(
         &mut self,
         command: Command,
@@ -635,10 +1066,20 @@ impl Engine {
                 self.snapshot.settings.automatic = true;
                 self.failed_credential = None;
                 self.persist()?;
+                self.snapshot.verification_hold = false;
                 self.check(true).await?;
+            }
+            Command::EnableAutomatic { expected_network } => {
+                self.enable_automatic(&expected_network).await?;
             }
             Command::TrustNetwork { trusted } => {
                 self.check(false).await?;
+                if uses_system_authentication(&self.snapshot) {
+                    return Err(AppError::new(
+                        ErrorCode::InvalidInput,
+                        SYSTEM_AUTHENTICATION_MESSAGE,
+                    ));
+                }
                 let key = network_fingerprint(&self.snapshot).ok_or_else(|| {
                     AppError::new(ErrorCode::Network, "请先连接网络并确认认证网关可用")
                 })?;
@@ -748,7 +1189,13 @@ impl Engine {
                 force,
                 confirmed,
             } => {
-                self.check(false).await?;
+                self.check_network(false, true).await?;
+                if uses_system_authentication(&self.snapshot) {
+                    return Err(AppError::new(
+                        ErrorCode::InvalidInput,
+                        SYSTEM_AUTHENTICATION_MESSAGE,
+                    ));
+                }
                 if self.snapshot.active_binding.is_none() {
                     return Err(AppError::new(
                         ErrorCode::Network,
@@ -789,6 +1236,7 @@ impl Engine {
                 self.persist()?;
                 self.failed_credential = None;
                 self.login_selected(account_id.as_deref()).await?;
+                self.snapshot.verification_hold = false;
             }
             Command::Logout { confirmed } => {
                 if !confirmed {
@@ -797,13 +1245,20 @@ impl Engine {
                         "注销可能影响共享此认证的设备，请确认",
                     ));
                 }
+                let network = self.refresh_network().await;
+                if network.is_ok() && uses_system_authentication(&self.snapshot) {
+                    return Err(AppError::new(
+                        ErrorCode::InvalidInput,
+                        SYSTEM_AUTHENTICATION_MESSAGE,
+                    ));
+                }
                 // Persist intent BEFORE sending a potentially uncertain logout request.
                 self.snapshot.settings.paused = true;
                 self.persist()?;
                 self.snapshot.state = EngineState::Paused;
                 self.emit();
                 self.recovery_started = None;
-                self.refresh_network().await?;
+                network?;
                 self.logout_gateway().await?;
                 self.snapshot.state = EngineState::Paused;
                 self.event("logout", "手动注销；自动认证已持续暂停", None, None);
@@ -813,12 +1268,8 @@ impl Engine {
                 username,
                 password,
             } => {
-                if id.is_empty()
-                    || id.len() > 64
-                    || !id
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                    || username.trim().is_empty()
+                validate_account_id(&id)?;
+                if username.trim().is_empty()
                     || username.len() > 128
                     || password.is_empty()
                     || password.expose().len() > 1024
@@ -855,6 +1306,22 @@ impl Engine {
                 self.next_check = 0;
                 self.account_metadata();
                 self.event("account_saved", "账户凭据已安全更新", Some(&id), None);
+            }
+            Command::VerifyAccount {
+                id,
+                username,
+                password,
+                expected_network,
+            } => {
+                self.verify_account(
+                    AccountSecret {
+                        id,
+                        username,
+                        password,
+                    },
+                    &expected_network,
+                )
+                .await?;
             }
             Command::AccountDelete { id } => {
                 let accounts = self
@@ -915,7 +1382,9 @@ impl Engine {
                 let gateway =
                     GatewayClient::new(settings.gateway.clone()).map_err(|e| e.into_app_error())?;
                 if self.snapshot.scope == Scope::User {
-                    if settings.user_autostart != self.snapshot.settings.user_autostart {
+                    if !self.simulation
+                        && settings.user_autostart != self.snapshot.settings.user_autostart
+                    {
                         crate::maintenance::execute(
                             Scope::User,
                             crate::maintenance::MaintenanceAction::SetAutostart {
@@ -925,7 +1394,9 @@ impl Engine {
                         )
                         .await?;
                     }
-                    if settings.gui_autostart != self.snapshot.settings.gui_autostart {
+                    if !self.simulation
+                        && settings.gui_autostart != self.snapshot.settings.gui_autostart
+                    {
                         crate::maintenance::execute(
                             Scope::User,
                             crate::maintenance::MaintenanceAction::SetGuiAutostart {
@@ -1027,6 +1498,9 @@ impl Engine {
     }
     async fn health_check(&mut self) {
         self.next_health = now_secs() + self.snapshot.settings.health_interval_secs;
+        if self.snapshot.environment == Environment::NonCampus {
+            return;
+        }
         if self.simulation {
             self.snapshot.health = HealthStatus {
                 internet: Health::Healthy,
@@ -1248,13 +1722,60 @@ async fn ipv6_health(targets: &[String], timeout_secs: u64) -> Health {
         .unwrap_or(Health::Degraded)
 }
 
-fn network_fingerprint(snapshot: &Snapshot) -> Option<String> {
-    use sha2::{Digest, Sha256};
+fn active_interface(snapshot: &Snapshot) -> Option<&NetworkInterface> {
     let binding = snapshot.active_binding.as_ref()?;
-    let interface = snapshot
+    snapshot
         .interfaces
         .iter()
-        .find(|i| i.id == binding.interface_id)?;
+        .find(|interface| interface.id == binding.interface_id)
+}
+
+fn validate_account_id(id: &str) -> Result<(), AppError> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-' || ch == b'_')
+    {
+        return Err(AppError::new(
+            ErrorCode::InvalidInput,
+            "账号标识、用户名或密码无效",
+        ));
+    }
+    Ok(())
+}
+
+fn verification_network_changed() -> AppError {
+    AppError::new(ErrorCode::Cancelled, "当前网络已变化，请检查网卡并重新确认")
+}
+
+async fn observe_verification<T>(
+    operation: impl std::future::Future<Output = Result<T, bitnet_gateway::GatewayError>>,
+    changes: &mut Option<watch::Receiver<u64>>,
+) -> Result<T, AppError> {
+    if let Some(changes) = changes {
+        tokio::select! {
+            biased;
+            _ = changes.changed() => Err(verification_network_changed()),
+            result = operation => result.map_err(|error| error.into_app_error()),
+        }
+    } else {
+        operation.await.map_err(|error| error.into_app_error())
+    }
+}
+
+/// Reports whether the active wireless interface is on BIT-mobile.
+pub fn uses_system_authentication(snapshot: &Snapshot) -> bool {
+    active_interface(snapshot).is_some_and(|interface| {
+        interface.wireless && interface.ssid.as_deref() == Some("BIT-mobile")
+    })
+}
+
+/// Identifies the connection context displayed for network-trust confirmation.
+pub fn network_fingerprint(snapshot: &Snapshot) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let binding = snapshot.active_binding.as_ref()?;
+    let interface = active_interface(snapshot)?;
     let octets = binding.source_ip.octets();
     let context = serde_json::to_vec(&(
         &snapshot.settings.gateway.base_url,
@@ -1350,6 +1871,7 @@ pub async fn run(scope: Scope, simulation: bool) -> Result<(), AppError> {
             None,
         );
     } else {
+        engine.network_changes = Some(changes.receiver.clone());
         engine
             .snapshot
             .capabilities
@@ -1369,12 +1891,23 @@ pub async fn run(scope: Scope, simulation: bool) -> Result<(), AppError> {
             envelope=requests.recv()=>{
                 let Some(envelope)=envelope else{break};
                 let request_id=envelope.request.request_id;
-                let network_command=matches!(&envelope.request.command,Command::Check|Command::Login{..}|Command::Logout{..});
+                let verification=matches!(&envelope.request.command,Command::VerifyAccount{..});
+                if verification {
+                    if envelope.answer.is_closed() {
+                        continue;
+                    }
+                    if envelope.queued_at.elapsed() > Duration::from_secs(3) {
+                        let result = Err(AppError::new(ErrorCode::Busy, "认证后台正忙，账户验证尚未开始，请重试"));
+                        let _ = envelope.answer.send(Reply { api_version: API_VERSION, request_id, result });
+                        continue;
+                    }
+                }
+                let network_command=matches!(&envelope.request.command,Command::Check|Command::Login{..}|Command::Logout{..}|Command::EnableAutomatic{..});
                 let mut event=changes.receiver.clone();event.borrow_and_update();
                 let result=if network_command&&network_events_open&&!simulation{
                     tokio::select!{result=engine.execute(envelope.request.command,&envelope.caller)=>result,_=event.changed()=>{engine.next_check=now_secs()+2;Err(AppError::new(ErrorCode::Cancelled,"网络已变化，旧操作已取消；请先查看当前状态"))}}
                 }else{engine.execute(envelope.request.command,&envelope.caller).await};
-                if let Err(ref e)=result{if matches!(e.code,ErrorCode::Network|ErrorCode::GatewayUnavailable|ErrorCode::Credentials|ErrorCode::CredentialsUnavailable){engine.set_error(e.clone());engine.emit();}}
+                if let Err(ref e)=result{if !verification && matches!(e.code,ErrorCode::Network|ErrorCode::GatewayUnavailable|ErrorCode::Credentials|ErrorCode::CredentialsUnavailable){engine.set_error(e.clone());engine.emit();}}
                 let _=envelope.answer.send(Reply{api_version:API_VERSION,request_id,result});
                 if engine.stopping{let _=tokio::time::timeout(Duration::from_secs(2),envelope.response_written).await;}
             },
@@ -1473,6 +2006,88 @@ mod tests {
             administrator: false,
         }
     }
+
+    #[tokio::test]
+    async fn account_verification_saves_only_after_a_fresh_login() {
+        let (mut engine, paths) = isolated("verify-account");
+        engine
+            .execute(Command::AccountSelect { id: "demo".into() }, &owner())
+            .await
+            .unwrap();
+        engine.execute(Command::Resume, &owner()).await.unwrap();
+        let before = engine.snapshot.settings.clone();
+        let fingerprint = network_fingerprint(&engine.snapshot).unwrap();
+        let verify = |password: &str, expected_network: String| Command::VerifyAccount {
+            id: "new".into(),
+            username: "new-user".into(),
+            password: Secret::new(password),
+            expected_network,
+        };
+
+        let stale = engine
+            .execute(verify("good", "stale".into()), &owner())
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code, ErrorCode::Cancelled);
+        assert_eq!(engine.simulation_session.username.as_deref(), Some("demo"));
+        let bad = engine
+            .execute(verify("wrong", fingerprint.clone()), &owner())
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code, ErrorCode::Credentials);
+        assert!(bad.message.contains("已确认原账户在线"));
+        assert_eq!(engine.simulation_session.username.as_deref(), Some("demo"));
+        assert_eq!(engine.accounts.len(), 1);
+        assert_eq!(engine.snapshot.settings, before);
+        assert_eq!(
+            persistence::read_settings(&paths.config_file).unwrap(),
+            before
+        );
+
+        let good = engine
+            .execute(verify("good", fingerprint), &owner())
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(good.settings.selected_account.as_deref(), Some("new"));
+        assert_eq!(good.session.username.as_deref(), Some("new-user"));
+        assert_eq!(good.accounts.len(), 2);
+        assert_eq!(good.settings.revision, before.revision + 1);
+        assert_eq!(
+            persistence::read_settings(&paths.config_file).unwrap(),
+            good.settings
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_account_verification_does_not_guess_a_restore_account() {
+        let (mut engine, _) = isolated("verify-unknown-session");
+        engine.snapshot.settings.automatic = true;
+        engine.snapshot.settings.selected_account = Some("demo".into());
+        engine.simulation_session.auth = AuthState::Authenticated;
+        engine.simulation_session.username = Some("external".into());
+        engine.check(false).await.unwrap();
+        let expected_network = network_fingerprint(&engine.snapshot).unwrap();
+        let previous_settings = engine.snapshot.settings.clone();
+        let result = engine
+            .execute(
+                Command::VerifyAccount {
+                    id: "candidate".into(),
+                    username: "candidate".into(),
+                    password: Secret::new("wrong"),
+                    expected_network,
+                },
+                &owner(),
+            )
+            .await
+            .unwrap_err();
+        assert!(result.message.contains("自动认证已暂停"));
+        assert!(engine.snapshot.verification_hold);
+        assert_eq!(engine.snapshot.settings, previous_settings);
+        engine.check(true).await.unwrap();
+        assert_eq!(engine.simulation_session.auth, AuthState::Unauthenticated);
+    }
     #[test]
     fn conflicts_never_choose_an_arbitrary_account() {
         let mut s = Settings::default();
@@ -1508,6 +2123,71 @@ mod tests {
         });
         assert_eq!(resolve_account(&s, None).unwrap(), None);
     }
+
+    #[tokio::test]
+    async fn manual_check_of_ignored_network_does_not_report_an_old_session() {
+        let (mut engine, _) = isolated("ignored-check");
+        engine
+            .execute(Command::AccountSelect { id: "demo".into() }, &owner())
+            .await
+            .unwrap();
+        engine.execute(Command::Resume, &owner()).await.unwrap();
+        assert_eq!(engine.snapshot.session.auth, AuthState::Authenticated);
+        engine.health_check().await;
+
+        let mut settings = engine.snapshot.settings.clone();
+        settings.rules.push(NetworkRule {
+            id: "ignore".into(),
+            name: "Ignore simulation".into(),
+            interface_id: Some("simulation".into()),
+            ssid: None,
+            gateway: None,
+            account_id: None,
+            ignore: true,
+            priority: 1,
+        });
+        engine
+            .execute(
+                Command::SettingsPut {
+                    expected_revision: settings.revision,
+                    settings,
+                },
+                &owner(),
+            )
+            .await
+            .unwrap();
+        let snapshot = engine
+            .execute(Command::Check, &owner())
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(snapshot.environment, Environment::NonCampus);
+        assert!(snapshot.active_binding.is_some());
+        assert_eq!(snapshot.session.auth, AuthState::Unknown);
+        assert_eq!(snapshot.health, HealthStatus::default());
+        assert!(engine.online_window.is_none());
+        assert_eq!(engine.simulation_session.auth, AuthState::Authenticated);
+
+        engine.health_check().await;
+        assert_eq!(engine.snapshot.health, HealthStatus::default());
+
+        let login = engine
+            .execute(
+                Command::Login {
+                    account_id: None,
+                    force: false,
+                    confirmed: false,
+                },
+                &owner(),
+            )
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(login.session.auth, AuthState::Authenticated);
+    }
+
     #[tokio::test]
     async fn manual_logout_pause_survives_restart() {
         let (mut engine, paths) = isolated("logout");
@@ -1728,6 +2408,94 @@ mod tests {
             1
         );
     }
+
+    #[tokio::test]
+    async fn enabling_automatic_requires_the_displayed_network_and_saves_without_logging_in() {
+        let (mut engine, paths) = isolated("enable-automatic");
+        engine.check(false).await.unwrap();
+        let fingerprint = network_fingerprint(&engine.snapshot).unwrap();
+
+        let error = engine
+            .execute(
+                Command::EnableAutomatic {
+                    expected_network: fingerprint.clone(),
+                },
+                &owner(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Credentials);
+        engine
+            .execute(Command::AccountSelect { id: "demo".into() }, &owner())
+            .await
+            .unwrap();
+        let before = engine.snapshot.settings.clone();
+        let error = engine
+            .execute(
+                Command::EnableAutomatic {
+                    expected_network: "stale".into(),
+                },
+                &owner(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ConfirmationRequired);
+        assert_eq!(engine.snapshot.settings, before);
+        assert_eq!(
+            persistence::read_settings(&paths.config_file).unwrap(),
+            before
+        );
+
+        let snapshot = engine
+            .execute(
+                Command::EnableAutomatic {
+                    expected_network: fingerprint.clone(),
+                },
+                &owner(),
+            )
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(snapshot.settings.revision, before.revision + 1);
+        assert!(snapshot.settings.automatic);
+        assert_eq!(snapshot.settings.trusted_networks, vec![fingerprint]);
+        assert_eq!(
+            persistence::read_settings(&paths.config_file).unwrap(),
+            snapshot.settings
+        );
+        assert_eq!(snapshot.session.auth, AuthState::Unauthenticated);
+        assert_eq!(engine.simulation_session.auth, AuthState::Unauthenticated);
+
+        engine.check(true).await.unwrap();
+        assert_eq!(engine.snapshot.session.auth, AuthState::Authenticated);
+    }
+
+    #[test]
+    fn bit_mobile_requires_exact_wireless_ssid_on_the_active_binding() {
+        let mut snapshot = Snapshot::new(Scope::User);
+        snapshot.interfaces.push(NetworkInterface {
+            id: "wlan".into(),
+            name: "Wi-Fi".into(),
+            index: 1,
+            ipv4: vec![Ipv4Addr::new(10, 0, 1, 2)],
+            gateway: None,
+            up: true,
+            wireless: true,
+            ssid: Some("BIT-mobile".into()),
+            virtual_adapter: false,
+            alternate_adapter: false,
+        });
+        assert!(!uses_system_authentication(&snapshot));
+        snapshot.active_binding = snapshot.interfaces[0].binding();
+        assert!(uses_system_authentication(&snapshot));
+        snapshot.interfaces[0].ssid = Some("BIT-mobile-guest".into());
+        assert!(!uses_system_authentication(&snapshot));
+        snapshot.interfaces[0].ssid = Some("BIT-mobile".into());
+        snapshot.interfaces[0].wireless = false;
+        assert!(!uses_system_authentication(&snapshot));
+    }
+
     #[tokio::test]
     async fn profiles_restore_their_own_target_and_account_without_unpausing() {
         let (mut engine, _) = isolated("profiles");
@@ -1813,6 +2581,7 @@ mod tests {
             wireless: true,
             ssid: Some("Campus".into()),
             virtual_adapter: false,
+            alternate_adapter: false,
         });
         let first = network_fingerprint(&engine.snapshot).unwrap();
         engine.snapshot.interfaces[0].ssid = Some("Home".into());

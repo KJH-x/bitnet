@@ -15,6 +15,9 @@ if((Property $client 'ALLUSERS') -ne '' -or (Property $service 'ALLUSERS') -ne '
 if((Property $client 'ProductCode') -eq (Property $service 'ProductCode')) {throw 'Client/service ProductCode must be independent'}
 $view=$service.OpenView('SELECT `Name`,`Arguments`,`StartName` FROM `ServiceInstall`'); $view.Execute(); $record=$view.Fetch()
 if(-not $record -or $record.StringData(1) -ne 'BitNet' -or $record.StringData(2) -ne '--service' -or $record.StringData(3) -ne 'NT SERVICE\BitNet') {throw 'SCM service identity/arguments mismatch'}
+$view=$service.OpenView('SELECT `Action` FROM `InstallExecuteSequence` WHERE `Action` = ''MsiConfigureServices''')
+$view.Execute()
+if($view.Fetch()) {throw 'Service MSI must leave recovery configuration to bitmaint after installation'}
 $view=$service.OpenView('SELECT `SDDLText` FROM `MsiLockPermissionsEx`'); $view.Execute(); $record=$view.Fetch()
 if(-not $record) {throw 'Protected service-data ACL is absent'}
 $sddl=[string]$record.StringData(1)

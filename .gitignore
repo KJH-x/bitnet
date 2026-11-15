@@ -2,6 +2,7 @@
 /dist/
 /build/
 /.local/
+/.preview-data/
 *.log
 *.pdb
 *.key
@@ -11,5 +12,7 @@
 *.sqlite*
 *.secret
 /.env
+/.env.*
+!/.env.example
 __pycache__/
 *.pyc

@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod notifications;
+mod smooth_scroll;
 mod tray;
 mod views;
 
@@ -13,7 +14,11 @@ use bitnet_runtime::client::Client;
 use bitnet_runtime::maintenance::{self, MaintenanceAction, MaintenanceResult};
 use bitnet_runtime::update_policy::{self, UpdateOutcome, UpdatePolicy};
 use iced::{widget::text_editor, window, Element, Font, Subscription, Task, Theme};
-use std::{fmt, time::Duration};
+use std::{
+    collections::HashSet,
+    fmt,
+    time::{Duration, Instant},
+};
 use zeroize::Zeroize;
 
 fn main() -> iced::Result {
@@ -40,6 +45,10 @@ fn default_font() -> Font {
     }
 }
 
+fn preview_only() -> bool {
+    std::env::var("BITNET_SIMULATE_ONLY").as_deref() == Ok("1")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     Status,
@@ -50,20 +59,9 @@ enum Page {
     History,
     Statistics,
     Diagnostics,
-    Updates,
 }
 impl Page {
-    const ALL: [Self; 9] = [
-        Self::Status,
-        Self::Accounts,
-        Self::Networks,
-        Self::Settings,
-        Self::Service,
-        Self::History,
-        Self::Statistics,
-        Self::Diagnostics,
-        Self::Updates,
-    ];
+    const ALL: [Self; 4] = [Self::Status, Self::Accounts, Self::Service, Self::Settings];
     fn label(self, english: bool) -> &'static str {
         match (self, english) {
             (Self::Status, false) => "连接状态",
@@ -72,8 +70,8 @@ impl Page {
             (Self::Accounts, true) => "Accounts",
             (Self::Networks, false) => "网络与规则",
             (Self::Networks, true) => "Networks & rules",
-            (Self::Settings, false) => "偏好与设置",
-            (Self::Settings, true) => "Preferences",
+            (Self::Settings, false) => "软件设置",
+            (Self::Settings, true) => "Settings",
             (Self::Service, false) => "后台服务",
             (Self::Service, true) => "Background service",
             (Self::History, false) => "日志与历史",
@@ -82,8 +80,6 @@ impl Page {
             (Self::Statistics, true) => "Statistics",
             (Self::Diagnostics, false) => "网络诊断",
             (Self::Diagnostics, true) => "Diagnostics",
-            (Self::Updates, false) => "软件更新",
-            (Self::Updates, true) => "Updates",
         }
     }
 }
@@ -140,7 +136,6 @@ impl From<Mode> for Scope {
 
 #[derive(Debug, Clone, Copy)]
 enum SettingFlag {
-    Automatic,
     StartHidden,
     UserAutostart,
     GuiAutostart,
@@ -162,6 +157,15 @@ enum NumericSetting {
 enum Confirmation {
     LoginOnce,
     TrustNetwork,
+    EnableAutomatic {
+        expected_network: String,
+        adapter: String,
+    },
+    VerifyAccount {
+        expected_network: String,
+        username: String,
+        adapter: String,
+    },
     Logout,
     ForceLogin,
     DeleteAccount(String),
@@ -169,6 +173,56 @@ enum Confirmation {
     DeleteProfile(String),
     Shutdown,
     Maintenance(MaintenanceAction),
+}
+
+fn is_alternate_adapter(interface: &bitnet_core::NetworkInterface) -> bool {
+    let name = interface.name.to_ascii_lowercase();
+    interface.virtual_adapter
+        || interface.alternate_adapter
+        || [
+            "bluetooth",
+            "蓝牙",
+            "loopback",
+            "mihomo",
+            "wi-fi direct",
+            "local proxy",
+            "vmware",
+            "virtualbox",
+            "vethernet",
+            "hyper-v",
+            "tailscale",
+            "wireguard",
+        ]
+        .iter()
+        .any(|kind| name.contains(kind))
+        || name.starts_with("本地连接*")
+        || name.starts_with("local area connection*")
+}
+
+fn selected_binding(snapshot: &Snapshot) -> Option<&bitnet_core::NetworkBinding> {
+    snapshot.active_binding.as_ref().filter(|binding| {
+        snapshot
+            .settings
+            .interface_id
+            .as_ref()
+            .is_none_or(|id| *id == binding.interface_id)
+    })
+}
+
+fn confirmation_target(snapshot: &Snapshot) -> Option<(String, String)> {
+    let binding = selected_binding(snapshot)?;
+    let adapter = snapshot
+        .interfaces
+        .iter()
+        .find(|adapter| adapter.id == binding.interface_id)?;
+    let label = match &adapter.ssid {
+        Some(ssid) => format!("{} · {ssid}", adapter.name),
+        None => adapter.name.clone(),
+    };
+    Some((
+        bitnet_runtime::engine::network_fingerprint(snapshot)?,
+        label,
+    ))
 }
 
 #[derive(Clone)]
@@ -188,8 +242,18 @@ enum Message {
     AppearanceChanged(Appearance),
     LogLevelChanged(String),
     FlagChanged(SettingFlag, bool),
+    AutomaticChanged(bool),
+    BeginAutomatic,
     NumberChanged(NumericSetting, String),
-    HealthTargetsChanged(String),
+    ToggleAdvancedSettings,
+    OpenHealthEditor,
+    HealthEntryChanged(usize, String),
+    HealthEntryAdded,
+    HealthEntryRemoved(usize),
+    SaveHealthEditor,
+    CancelHealthEditor,
+    ToggleAlternateAdapters,
+    ToggleAdvancedNetworks,
     SaveSettings,
     RevertSettings,
     Run(Command),
@@ -220,6 +284,15 @@ enum Message {
     InterfaceSelected(String),
     HistoryFilterChanged(String),
     HistoryDetailToggled(i64),
+    HistoryMoveSelection(bool),
+    HistoryToggleSelection,
+    HistoryLoad(bool),
+    CopyHistory,
+    OpenHistoryExport,
+    CloseHistoryExport,
+    HistoryExportPathChanged(String),
+    ExportHistory,
+    HistoryExported(Result<(), std::io::ErrorKind>),
     ImportAction(text_editor::Action),
     ImportSettings,
     CopyExport,
@@ -330,17 +403,32 @@ struct App {
     profile_name: String,
     history: Vec<HistoryEvent>,
     history_filter: String,
-    expanded_history: Option<i64>,
+    history_selection: Option<i64>,
+    history_limit: u32,
+    history_export_path: Option<String>,
+    history_exporting: bool,
+    expanded_history: HashSet<i64>,
     statistics: Option<Statistics>,
     diagnostics: String,
     exported: String,
     import_content: text_editor::Content,
     confirmation: Option<Confirmation>,
+    modal: Option<Page>,
+    advanced_settings: bool,
+    health_editor: Option<Vec<String>>,
+    enabling_automatic: bool,
+    alternate_adapters: bool,
+    advanced_networks: bool,
     notice: Option<(bool, String)>,
+    notice_until: Option<Instant>,
+    connection_error: Option<AppError>,
+    pending_check: bool,
     connecting: bool,
     polling: bool,
     busy: bool,
     pending_settings: bool,
+    pending_account_settings: Option<Settings>,
+    verifying_account: bool,
     settings_epoch: u64,
     saved_epoch: u64,
     request_epoch: u64,
@@ -378,17 +466,32 @@ impl App {
             profile_name: String::new(),
             history: Vec::new(),
             history_filter: String::new(),
-            expanded_history: None,
+            history_selection: None,
+            history_limit: 40,
+            history_export_path: None,
+            history_exporting: false,
+            expanded_history: HashSet::new(),
             statistics: None,
             diagnostics: String::new(),
             exported: String::new(),
             import_content: text_editor::Content::new(),
             confirmation: None,
+            modal: None,
+            advanced_settings: false,
+            health_editor: None,
+            enabling_automatic: false,
+            alternate_adapters: false,
+            advanced_networks: false,
             notice: None,
+            notice_until: None,
+            connection_error: None,
+            pending_check: false,
             connecting: true,
             polling: false,
             busy: false,
             pending_settings: false,
+            pending_account_settings: None,
+            verifying_account: false,
             settings_epoch: 0,
             saved_epoch: 0,
             request_epoch: 0,
@@ -440,7 +543,12 @@ impl App {
         }
     }
     fn title(&self, _: window::Id) -> String {
-        format!("BitNet · {}", self.page.label(self.english()))
+        let app = if preview_only() {
+            self.t("BitNet 预览", "BitNet Preview")
+        } else {
+            "BitNet"
+        };
+        format!("{app} · {}", self.page.label(self.english()))
     }
     fn theme(&self, _: window::Id) -> Option<Theme> {
         match self.appearance {
@@ -454,6 +562,31 @@ impl App {
             iced::time::every(Duration::from_secs(2)).map(|_| Message::Tick),
             iced::time::every(Duration::from_millis(250)).map(|_| Message::TrayTick),
             window::close_requests().map(Message::WindowCloseRequested),
+            iced::keyboard::listen().filter_map(|event| match event {
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                } => Some(Message::Cancel),
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp),
+                    modifiers,
+                    ..
+                } if modifiers.is_empty() => Some(Message::HistoryMoveSelection(false)),
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown),
+                    modifiers,
+                    ..
+                } if modifiers.is_empty() => Some(Message::HistoryMoveSelection(true)),
+                iced::keyboard::Event::KeyPressed {
+                    key:
+                        iced::keyboard::Key::Named(
+                            iced::keyboard::key::Named::Enter | iced::keyboard::key::Named::Space,
+                        ),
+                    modifiers,
+                    ..
+                } if modifiers.is_empty() => Some(Message::HistoryToggleSelection),
+                _ => None,
+            }),
         ])
     }
     fn open_window(&mut self) -> Task<Message> {
@@ -494,6 +627,7 @@ impl App {
             tray.update(&snapshot, english);
         }
         self.snapshot_current = true;
+        self.connection_error = None;
         self.snapshot = Some(snapshot);
     }
     fn can_start_service(&self) -> bool {
@@ -524,10 +658,28 @@ impl App {
         self.busy = true;
         self.request_epoch = self.request_epoch.wrapping_add(1);
         self.pending_settings = matches!(command, Command::SettingsPut { .. });
+        self.pending_check = matches!(command, Command::Check);
+        self.verifying_account = matches!(command, Command::VerifyAccount { .. });
         if self.pending_settings {
             self.saved_epoch = self.settings_epoch;
         }
-        self.notice = None;
+        if let (
+            Command::AccountPut { id, .. } | Command::VerifyAccount { id, .. },
+            Some(snapshot),
+        ) = (&command, &self.snapshot)
+        {
+            // An account save advances the revision and clears its rejected marker.
+            let mut expected = snapshot.settings.clone();
+            self.pending_account_settings = expected.revision.checked_add(1).map(|revision| {
+                expected.revision = revision;
+                if self.verifying_account || expected.selected_account.is_none() {
+                    expected.selected_account = Some(id.clone());
+                }
+                expected.blocked_accounts.retain(|blocked| blocked != id);
+                expected
+            });
+        }
+        self.clear_notice();
         Task::perform(
             {
                 let client = self.client.clone();
@@ -537,7 +689,16 @@ impl App {
         )
     }
     fn error(&mut self, error: AppError) {
-        self.notice = Some((true, format!("{} · {:?}", error.message, error.code)));
+        self.show_notice(true, format!("{} · {:?}", error.message, error.code));
+    }
+    fn show_notice(&mut self, is_error: bool, message: String) {
+        self.notice = Some((is_error, message));
+        self.notice_until =
+            Some(Instant::now() + Duration::from_secs(if is_error { 10 } else { 5 }));
+    }
+    fn clear_notice(&mut self) {
+        self.notice = None;
+        self.notice_until = None;
     }
     fn mark_settings_dirty(&mut self) {
         self.draft.dirty = true;
@@ -547,13 +708,31 @@ impl App {
         if self.busy || self.connecting {
             return Task::none();
         }
+        if preview_only() {
+            self.show_notice(
+                false,
+                self.t(
+                    "预览模式不执行系统维护",
+                    "System maintenance is disabled in preview mode",
+                )
+                .into(),
+            );
+            return Task::none();
+        }
         self.busy = true;
         self.request_epoch = self.request_epoch.wrapping_add(1);
-        let scope = self
+        let current_scope = self
             .snapshot
             .as_ref()
             .map(|s| s.scope)
             .unwrap_or_else(|| self.mode.into());
+        let scope = match action {
+            MaintenanceAction::ServiceInstall
+            | MaintenanceAction::ServiceStart
+            | MaintenanceAction::ServiceStop
+            | MaintenanceAction::ServiceRemove { .. } => Scope::System,
+            _ => current_scope,
+        };
         Task::perform(
             maintenance::execute(scope, action, true),
             Message::MaintenanceCompleted,
@@ -585,17 +764,24 @@ impl App {
                         tray::Action::Open => self.open_window(),
                         tray::Action::Check => self.execute(Command::Check),
                         tray::Action::Pause => self.execute(Command::Pause),
-                        tray::Action::Resume => self.execute(Command::Resume),
+                        tray::Action::Resume => self.update(Message::Run(Command::Resume)),
                         tray::Action::Exit => iced::exit(),
                     };
                 }
                 Task::none()
             }
             Message::Tick => {
+                if self
+                    .notice_until
+                    .is_some_and(|until| until <= Instant::now())
+                {
+                    self.clear_notice();
+                }
                 let status = self.refresh();
                 let notification = self
                     .pending_notification
                     .take()
+                    .filter(|_| !preview_only())
                     .map(|kind| {
                         Task::perform(
                             notifications::show(kind, self.english()),
@@ -603,7 +789,7 @@ impl App {
                         )
                     })
                     .unwrap_or_else(Task::none);
-                let update = if !self.busy && !self.connecting {
+                let update = if !self.busy && !self.connecting && !preview_only() {
                     self.snapshot
                         .as_ref()
                         .filter(|snapshot| {
@@ -624,7 +810,11 @@ impl App {
             }
             Message::NotificationSent(result) => {
                 if result.is_err() && self.notice.is_none() {
-                    self.notice = Some((true, self.t("系统通知暂不可用，请在界面查看错误；系统通知设置未被更改。", "Desktop notifications are unavailable. Review errors here; system notification settings were not changed.").into()));
+                    self.show_notice(
+                        true,
+                        self.t("系统通知暂不可用", "Desktop notifications are unavailable")
+                            .into(),
+                    );
                 }
                 Task::none()
             }
@@ -633,7 +823,7 @@ impl App {
                     .complete(result.is_ok(), bitnet_core::now_secs());
                 match result {
                     Ok(UpdateOutcome::Available { version }) => {
-                        self.notice = Some((
+                        self.show_notice(
                             false,
                             format!(
                                 "{} {version}",
@@ -642,12 +832,12 @@ impl App {
                                     "Update available; review it in Updates:"
                                 )
                             ),
-                        ));
+                        );
                         self.pending_notification
                             .get_or_insert(notifications::Kind::Update);
                     }
                     Ok(UpdateOutcome::InstallerStarted { message }) => {
-                        self.notice = Some((false, message))
+                        self.show_notice(false, message)
                     }
                     Ok(UpdateOutcome::NoUpdate | UpdateOutcome::Unconfigured) => {}
                     Err(error) => {
@@ -664,7 +854,7 @@ impl App {
                     Ok(snapshot) => self.apply_snapshot(snapshot),
                     Err(error) => {
                         self.snapshot_current = false;
-                        self.error(error);
+                        self.connection_error = Some(error);
                     }
                 }
                 let hidden = self.tray.is_some()
@@ -686,21 +876,70 @@ impl App {
                     Ok(snapshot) => self.apply_snapshot(snapshot),
                     Err(error) => {
                         self.snapshot_current = false;
-                        self.error(error);
+                        self.connection_error = Some(error);
                     }
                 }
                 Task::none()
             }
             Message::Completed(result) => {
                 self.busy = false;
+                let verified_account = std::mem::take(&mut self.verifying_account);
+                let checked = std::mem::take(&mut self.pending_check);
+                let expected_account_settings = self.pending_account_settings.take();
                 match result {
                     Ok(ReplyData::Snapshot(snapshot)) => {
                         if self.pending_settings && self.saved_epoch == self.settings_epoch {
                             self.draft.dirty = false;
                         }
+                        // Rebase only the revision produced by our account
+                        // write. A poll or a different settings write must
+                        // never make a stale draft valid.
+                        if self.draft.dirty
+                            && self.draft.settings.revision.checked_add(1)
+                                == Some(snapshot.settings.revision)
+                            && expected_account_settings.as_ref() == Some(&snapshot.settings)
+                        {
+                            self.draft.settings.revision = snapshot.settings.revision;
+                            self.draft.settings.selected_account =
+                                snapshot.settings.selected_account.clone();
+                            self.draft.settings.blocked_accounts =
+                                snapshot.settings.blocked_accounts.clone();
+                        }
+                        let (attention, message) = if verified_account {
+                            self.account = AccountDraft::default();
+                            (
+                                false,
+                                self.t(
+                                    "登录验证通过，账户已保存",
+                                    "Sign-in verified. Account saved.",
+                                ),
+                            )
+                        } else if !checked {
+                            (false, self.t("操作已完成", "Operation completed"))
+                        } else if snapshot.active_binding.is_none() {
+                            (
+                                true,
+                                self.t(
+                                    "未检测：请选择可用网卡",
+                                    "Check skipped: select an available adapter",
+                                ),
+                            )
+                        } else if snapshot.environment == Environment::NonCampus {
+                            (
+                                true,
+                                self.t(
+                                    "未检测：当前网络已跳过",
+                                    "Check skipped on the current network",
+                                ),
+                            )
+                        } else {
+                            (
+                                false,
+                                self.t("已查询校园网状态", "Campus network status checked"),
+                            )
+                        };
                         self.apply_snapshot(*snapshot);
-                        self.notice =
-                            Some((false, self.t("操作已完成", "Operation completed").into()));
+                        self.show_notice(attention, message.into());
                     }
                     Ok(ReplyData::History(history)) => self.history = history,
                     Ok(ReplyData::Statistics(statistics)) => self.statistics = Some(statistics),
@@ -714,26 +953,48 @@ impl App {
                         if self.pending_settings && self.saved_epoch == self.settings_epoch {
                             self.draft.dirty = false;
                         }
-                        self.notice = Some((false, message));
+                        self.show_notice(false, message);
                     }
+                    Err(error) if verified_account => self.show_notice(true, error.message),
                     Err(error) => self.error(error),
                 }
                 self.pending_settings = false;
                 self.refresh()
             }
-            Message::Navigate(page) => {
-                self.page = page;
-                match page {
-                    Page::History => self.execute(Command::History { limit: 200 }),
-                    Page::Statistics => self.execute(Command::Statistics),
-                    _ => Task::none(),
+            Message::Navigate(page) => match page {
+                Page::Networks => {
+                    self.modal = Some(page);
+                    Task::none()
                 }
-            }
+                Page::History => {
+                    self.modal = Some(page);
+                    self.history_selection = None;
+                    self.history_limit = 40;
+                    self.history.clear();
+                    self.history_export_path = None;
+                    self.execute(Command::History {
+                        limit: self.history_limit,
+                    })
+                }
+                Page::Statistics => self.execute(Command::Statistics),
+                Page::Diagnostics => {
+                    self.page = Page::Settings;
+                    Task::none()
+                }
+                _ => {
+                    self.page = page;
+                    if page == Page::Status && self.snapshot_current {
+                        self.execute(Command::Statistics)
+                    } else {
+                        Task::none()
+                    }
+                }
+            },
             Message::Maintain(action) => self.maintain(action),
             Message::MaintenanceCompleted(result) => {
                 self.busy = false;
                 match result {
-                    Ok(result) => self.notice = Some((false, result.message)),
+                    Ok(result) => self.show_notice(false, result.message),
                     Err(error) => self.error(error),
                 }
                 self.refresh()
@@ -757,6 +1018,14 @@ impl App {
                 self.client = Client::new(mode.into());
                 self.snapshot = None;
                 self.snapshot_current = false;
+                self.connection_error = None;
+                self.history.clear();
+                self.expanded_history.clear();
+                self.history_selection = None;
+                self.history_export_path = None;
+                self.statistics = None;
+                self.diagnostics.clear();
+                self.exported.clear();
                 self.draft = SettingsDraft::new(Settings::default());
                 self.connecting = true;
                 Self::connect(self.client.clone())
@@ -775,12 +1044,54 @@ impl App {
                     self.refresh()
                 }
             }
+            Message::Run(Command::Resume)
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.settings.automatic) =>
+            {
+                let task = self.update(Message::AutomaticChanged(true));
+                Task::batch([task, self.open_window()])
+            }
             Message::Run(command) => self.execute(command),
             Message::Ask(confirmation) => {
                 self.confirmation = Some(confirmation);
                 self.open_window()
             }
             Message::Confirm => match self.confirmation.take() {
+                Some(Confirmation::VerifyAccount {
+                    expected_network,
+                    username,
+                    ..
+                }) => {
+                    if self.busy
+                        || !self.snapshot_current
+                        || self.account.username.trim() != username
+                        || self.account.password.is_empty()
+                    {
+                        return Task::none();
+                    }
+                    let id = self
+                        .account
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("account-{}", bitnet_core::now_ms()));
+                    let password = Secret::new(&self.account.password);
+                    self.account.password.zeroize();
+                    self.execute(Command::VerifyAccount {
+                        id,
+                        username,
+                        password,
+                        expected_network,
+                    })
+                }
+                Some(Confirmation::EnableAutomatic {
+                    expected_network, ..
+                }) => {
+                    self.enabling_automatic = false;
+                    self.modal = None;
+                    self.execute(Command::EnableAutomatic { expected_network })
+                }
                 Some(Confirmation::LoginOnce) => self.execute(Command::Login {
                     account_id: None,
                     force: false,
@@ -811,11 +1122,14 @@ impl App {
                 None => Task::none(),
             },
             Message::Cancel => {
-                self.confirmation = None;
+                if self.confirmation.take().is_none() && self.health_editor.take().is_none() {
+                    self.modal = None;
+                    self.enabling_automatic = false;
+                }
                 Task::none()
             }
             Message::DismissNotice => {
-                self.notice = None;
+                self.clear_notice();
                 Task::none()
             }
             Message::UsernameChanged(value) => {
@@ -846,23 +1160,47 @@ impl App {
                 Task::none()
             }
             Message::AccountSave => {
+                if self.busy || !self.snapshot_current {
+                    return Task::none();
+                }
                 let username = self.account.username.trim().to_owned();
                 if username.is_empty() || self.account.password.is_empty() {
                     self.error(AppError::new(ErrorCode::InvalidInput, self.t("请输入账号和新密码；保存的密码不会回显", "Enter an account and a new password; saved passwords are never displayed")));
                     return Task::none();
                 }
-                let id = self
-                    .account
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| format!("account-{}", bitnet_core::now_ms()));
-                let password = Secret::new(&self.account.password);
-                self.account = AccountDraft::default();
-                self.execute(Command::AccountPut {
-                    id,
+                let Some(snapshot) = &self.snapshot else {
+                    return Task::none();
+                };
+                if !snapshot
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "verify_account")
+                {
+                    self.show_notice(
+                        true,
+                        self.t(
+                            "请先更新认证引擎，再验证并保存账户。",
+                            "Update the authentication engine to verify and save accounts.",
+                        )
+                        .into(),
+                    );
+                    return Task::none();
+                }
+                if bitnet_runtime::engine::uses_system_authentication(snapshot) {
+                    self.show_notice(true, self.t("BIT-mobile 由系统登录。请在使用校园门户的网络上验证账户。", "Your system signs in to BIT-mobile. Verify this account on a campus portal network.").into());
+                    return Task::none();
+                }
+                let Some((expected_network, adapter)) = confirmation_target(snapshot) else {
+                    self.show_notice(true, self.t("请先连接校园认证网络，或在「网络与规则」中选择网卡。", "Connect to the campus portal network or choose an adapter in Network and rules.").into());
+                    return Task::none();
+                };
+                self.clear_notice();
+                self.confirmation = Some(Confirmation::VerifyAccount {
+                    expected_network,
                     username,
-                    password,
-                })
+                    adapter,
+                });
+                Task::none()
             }
             Message::LanguageChanged(language) => {
                 self.language = language;
@@ -893,7 +1231,6 @@ impl App {
             }
             Message::FlagChanged(flag, value) => {
                 match flag {
-                    SettingFlag::Automatic => self.draft.settings.automatic = value,
                     SettingFlag::StartHidden => self.draft.settings.start_hidden = value,
                     SettingFlag::UserAutostart => self.draft.settings.user_autostart = value,
                     SettingFlag::GuiAutostart => self.draft.settings.gui_autostart = value,
@@ -916,20 +1253,208 @@ impl App {
                 self.mark_settings_dirty();
                 Task::none()
             }
-            Message::HealthTargetsChanged(value) => {
-                self.draft.health_targets = value;
+            Message::SaveSettings => self.save_settings(),
+            Message::AutomaticChanged(false) => {
+                self.draft.settings.automatic = false;
                 self.mark_settings_dirty();
                 Task::none()
             }
-            Message::SaveSettings => self.save_settings(),
-            Message::RevertSettings => {
-                if let Some(snapshot) = self.snapshot.clone() {
-                    self.draft.dirty = false;
-                    self.apply_snapshot(snapshot);
+            Message::AutomaticChanged(true) => {
+                let Some(snapshot) = self
+                    .snapshot
+                    .as_ref()
+                    .filter(|_| self.snapshot_current && !self.busy)
+                else {
+                    return Task::none();
+                };
+                if snapshot.settings.automatic {
+                    self.draft.settings.automatic = true;
+                    return Task::none();
+                }
+                if !snapshot
+                    .capabilities
+                    .iter()
+                    .any(|item| item == "enable_automatic")
+                {
+                    self.error(AppError::new(
+                        ErrorCode::Incompatible,
+                        self.t(
+                            "请先更新后台，再开启自动保持登录",
+                            "Update the background engine before enabling automatic authentication",
+                        ),
+                    ));
+                    return Task::none();
+                }
+                if !snapshot.accounts.iter().any(|account| account.has_password) {
+                    self.page = Page::Accounts;
+                    self.error(AppError::new(
+                        ErrorCode::Credentials,
+                        self.t("请先保存校园账户", "Save a campus account first"),
+                    ));
+                    return Task::none();
+                }
+                if self.draft.dirty {
+                    self.error(AppError::new(
+                        ErrorCode::Busy,
+                        self.t(
+                            "请先保存或放弃当前设置",
+                            "Save or discard pending settings first",
+                        ),
+                    ));
+                    return Task::none();
+                }
+                let mut candidates = snapshot.interfaces.iter().filter(|adapter| {
+                    adapter.up
+                        && !is_alternate_adapter(adapter)
+                        && adapter
+                            .ipv4
+                            .iter()
+                            .chain(adapter.gateway.iter())
+                            .any(|ip| ip.octets()[0] == 10)
+                });
+                let unique = candidates.next().filter(|_| candidates.next().is_none());
+                self.enabling_automatic = true;
+                if !bitnet_runtime::engine::uses_system_authentication(snapshot)
+                    && selected_binding(snapshot).is_some_and(|binding| {
+                        snapshot.settings.interface_id.is_some()
+                            || unique.is_some_and(|adapter| binding.interface_id == adapter.id)
+                    })
+                {
+                    return self.update(Message::BeginAutomatic);
+                }
+                self.modal = Some(Page::Networks);
+                Task::none()
+            }
+            Message::BeginAutomatic => {
+                if self.busy || !self.snapshot_current {
+                    return Task::none();
+                }
+                if self.snapshot.as_ref().is_some_and(|snapshot| {
+                    bitnet_runtime::engine::uses_system_authentication(snapshot)
+                        || (selected_binding(snapshot).is_some()
+                            && snapshot.environment == Environment::NonCampus)
+                }) {
+                    self.error(AppError::new(
+                        ErrorCode::Network,
+                        self.t("当前网络不使用校园门户认证，请选择其他网卡", "This network does not use campus portal sign-in. Select another adapter."),
+                    ));
+                    return Task::none();
+                }
+                let candidate = self.snapshot.as_ref().and_then(confirmation_target);
+                match candidate {
+                    Some((expected_network, adapter)) => {
+                        self.confirmation = Some(Confirmation::EnableAutomatic {
+                            expected_network,
+                            adapter,
+                        });
+                    }
+                    None => self.error(AppError::new(
+                        ErrorCode::Network,
+                        self.t(
+                            "请选择可用的校园网网卡",
+                            "Select an available campus network adapter",
+                        ),
+                    )),
                 }
                 Task::none()
             }
+            Message::RevertSettings => {
+                let settings = self
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.settings.clone())
+                    .unwrap_or_default();
+                self.language = if settings.language == "en" {
+                    Language::English
+                } else {
+                    Language::Chinese
+                };
+                self.appearance = match settings.theme.as_str() {
+                    "light" => Appearance::Light,
+                    "dark" => Appearance::Dark,
+                    _ => Appearance::System,
+                };
+                self.draft = SettingsDraft::new(settings);
+                self.settings_epoch = self.settings_epoch.wrapping_add(1);
+                Task::none()
+            }
+            Message::ToggleAdvancedSettings => {
+                self.advanced_settings = !self.advanced_settings;
+                Task::none()
+            }
+            Message::OpenHealthEditor => {
+                self.health_editor = Some(
+                    self.draft
+                        .health_targets
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|address| !address.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                );
+                Task::none()
+            }
+            Message::HealthEntryChanged(index, address) => {
+                if let Some(entries) = self
+                    .health_editor
+                    .as_mut()
+                    .filter(|entries| index < entries.len())
+                {
+                    if address.contains([';', '\n', '\r']) {
+                        let pasted: Vec<_> = address
+                            .split([';', '\n', '\r'])
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned)
+                            .collect();
+                        if entries.len() - 1 + pasted.len() <= 8 {
+                            entries.splice(index..=index, pasted);
+                        }
+                    } else {
+                        entries[index] = address;
+                    }
+                }
+                Task::none()
+            }
+            Message::HealthEntryAdded => {
+                if let Some(entries) = &mut self.health_editor {
+                    if entries.len() < 8 {
+                        entries.push(String::new());
+                    }
+                }
+                Task::none()
+            }
+            Message::HealthEntryRemoved(index) => {
+                if let Some(entries) = &mut self.health_editor {
+                    if index < entries.len() {
+                        entries.remove(index);
+                    }
+                }
+                Task::none()
+            }
+            Message::SaveHealthEditor => {
+                if let Some(entries) = self.health_editor.take() {
+                    self.draft.health_targets = entries.join("; ");
+                    self.mark_settings_dirty();
+                }
+                Task::none()
+            }
+            Message::CancelHealthEditor => {
+                self.health_editor = None;
+                Task::none()
+            }
+            Message::ToggleAlternateAdapters => {
+                self.alternate_adapters = !self.alternate_adapters;
+                Task::none()
+            }
+            Message::ToggleAdvancedNetworks => {
+                self.advanced_networks = !self.advanced_networks;
+                Task::none()
+            }
             Message::InterfaceSelected(value) => {
+                if self.busy || !self.snapshot_current || self.draft.dirty {
+                    return Task::none();
+                }
                 self.draft.settings.interface_id =
                     if value.is_empty() { None } else { Some(value) };
                 self.mark_settings_dirty();
@@ -1040,14 +1565,136 @@ impl App {
             },
             Message::HistoryFilterChanged(value) => {
                 self.history_filter = value;
+                self.history_selection = None;
                 Task::none()
             }
             Message::HistoryDetailToggled(id) => {
-                self.expanded_history = if self.expanded_history == Some(id) {
-                    None
-                } else {
-                    Some(id)
+                self.history_selection = Some(id);
+                if !self.expanded_history.remove(&id) {
+                    self.expanded_history.insert(id);
+                }
+                Task::none()
+            }
+            Message::HistoryMoveSelection(forward) => {
+                if self.modal == Some(Page::History) && self.confirmation.is_none() {
+                    let ids: Vec<_> = self.visible_history().map(|event| event.id).collect();
+                    let index = ids
+                        .iter()
+                        .position(|id| Some(*id) == self.history_selection);
+                    self.history_selection = match index {
+                        Some(index) if forward => ids.get((index + 1).min(ids.len() - 1)),
+                        Some(index) => ids.get(index.saturating_sub(1)),
+                        None => ids.first(),
+                    }
+                    .copied();
+                }
+                Task::none()
+            }
+            Message::HistoryToggleSelection => {
+                if self.modal == Some(Page::History) && self.confirmation.is_none() {
+                    if let Some(id) = self.history_selection {
+                        return self.update(Message::HistoryDetailToggled(id));
+                    }
+                }
+                Task::none()
+            }
+            Message::HistoryLoad(older) => {
+                if self.busy || !self.snapshot_current || self.modal != Some(Page::History) {
+                    return Task::none();
+                }
+                if older {
+                    self.history_limit = (self.history_limit + 40).min(200);
+                }
+                self.execute(Command::History {
+                    limit: self.history_limit,
+                })
+            }
+            Message::CopyHistory => iced::clipboard::write(
+                serde_json::to_string_pretty(&self.history).unwrap_or_default(),
+            ),
+            Message::OpenHistoryExport => {
+                self.history_export_path = Some(String::new());
+                Task::none()
+            }
+            Message::CloseHistoryExport => {
+                self.history_export_path = None;
+                Task::none()
+            }
+            Message::HistoryExportPathChanged(value) => {
+                if self.history_export_path.is_some() && !self.history_exporting {
+                    self.history_export_path = Some(value);
+                }
+                Task::none()
+            }
+            Message::ExportHistory => {
+                let Some(value) = self.history_export_path.as_deref() else {
+                    return Task::none();
                 };
+                if self.history_exporting || self.history.is_empty() {
+                    return Task::none();
+                }
+                let path = std::path::PathBuf::from(value.trim());
+                let json_extension = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+                if !path.is_absolute() || !json_extension {
+                    self.show_notice(
+                        true,
+                        self.t(
+                            "请输入完整的 JSON 文件路径。",
+                            "Enter the full path to a JSON file.",
+                        )
+                        .into(),
+                    );
+                    return Task::none();
+                }
+                let history = self.history.clone();
+                let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                let worker = std::thread::Builder::new().spawn(move || {
+                    let _ = sender.send(write_history_export(&path, &history));
+                });
+                if worker.is_err() {
+                    self.show_notice(
+                        true,
+                        self.t("无法启动日志导出。", "Could not start log export.")
+                            .into(),
+                    );
+                    return Task::none();
+                }
+                self.history_exporting = true;
+                self.clear_notice();
+                Task::perform(
+                    async move { receiver.await.unwrap_or(Err(std::io::ErrorKind::Other)) },
+                    Message::HistoryExported,
+                )
+            }
+            Message::HistoryExported(result) => {
+                self.history_exporting = false;
+                match result {
+                    Ok(()) => {
+                        self.history_export_path = None;
+                        self.show_notice(
+                            false,
+                            self.t("已导出当前载入的记录。", "Exported the loaded activity.")
+                                .into(),
+                        );
+                    }
+                    Err(kind) => self.show_notice(
+                        true,
+                        match kind {
+                            std::io::ErrorKind::AlreadyExists => self.t(
+                                "该文件已存在，请换一个文件名。",
+                                "This file already exists. Choose another name.",
+                            ),
+                            _ => self.t(
+                                "无法保存日志，请选择可写的目录和新的文件名。",
+                                "Could not save activity. Choose a writable folder and a new name.",
+                            ),
+                        }
+                        .into(),
+                    ),
+                }
                 Task::none()
             }
             Message::ImportAction(action) => {
@@ -1094,6 +1741,19 @@ impl App {
                 }
             }
         }
+    }
+
+    fn visible_history(&self) -> impl Iterator<Item = &HistoryEvent> {
+        let filter = self.history_filter.to_lowercase();
+        self.history.iter().filter(move |event| {
+            filter.is_empty()
+                || self
+                    .history_title(&event.kind)
+                    .to_lowercase()
+                    .contains(&filter)
+                || event.kind.to_lowercase().contains(&filter)
+                || event.message.to_lowercase().contains(&filter)
+        })
     }
 
     fn validated_rule(&self) -> Result<NetworkRule, AppError> {
@@ -1206,6 +1866,26 @@ impl App {
     }
 }
 
+fn write_history_export(
+    path: &std::path::Path,
+    history: &[HistoryEvent],
+) -> Result<(), std::io::ErrorKind> {
+    use std::io::{ErrorKind, Write};
+
+    let bytes = serde_json::to_vec_pretty(history).map_err(|_| ErrorKind::InvalidData)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| error.kind())?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| error.kind())
+}
+
 fn account_label(account: &AccountInfo) -> String {
     format!("{}  ·  {}", account.username, account.id)
 }
@@ -1219,22 +1899,6 @@ fn format_bytes(bytes: u64) -> String {
 }
 fn format_duration(seconds: u64) -> String {
     format!("{} h {:02} min", seconds / 3600, (seconds / 60) % 60)
-}
-fn format_timestamp(timestamp: Option<u64>) -> String {
-    timestamp
-        .map(|at| {
-            let elapsed = bitnet_core::now_secs().saturating_sub(at);
-            if elapsed < 60 {
-                format!("{elapsed} s ago / 秒前")
-            } else if elapsed < 3600 {
-                format!("{} min ago / 分钟前", elapsed / 60)
-            } else if elapsed < 86400 {
-                format!("{} h ago / 小时前", elapsed / 3600)
-            } else {
-                format!("{} d ago / 天前", elapsed / 86400)
-            }
-        })
-        .unwrap_or_else(|| "—".into())
 }
 
 #[cfg(test)]
@@ -1257,17 +1921,32 @@ mod tests {
             profile_name: String::new(),
             history: Vec::new(),
             history_filter: String::new(),
-            expanded_history: None,
+            history_selection: None,
+            history_limit: 40,
+            history_export_path: None,
+            history_exporting: false,
+            expanded_history: HashSet::new(),
             statistics: None,
             diagnostics: String::new(),
             exported: String::new(),
             import_content: text_editor::Content::new(),
             confirmation: None,
+            modal: None,
+            advanced_settings: false,
+            health_editor: None,
+            enabling_automatic: false,
+            alternate_adapters: false,
+            advanced_networks: false,
             notice: None,
+            notice_until: None,
+            connection_error: None,
+            pending_check: false,
             connecting: false,
             polling: false,
             busy: false,
             pending_settings: false,
+            pending_account_settings: None,
+            verifying_account: false,
             settings_epoch: 0,
             saved_epoch: 0,
             request_epoch: 0,
@@ -1319,17 +1998,115 @@ mod tests {
         assert!(app.draft.dirty);
     }
     #[test]
+    fn saving_an_account_rebases_the_pending_automatic_setting() {
+        let mut app = fixture();
+        let mut reply = Snapshot::new(Scope::User);
+        reply.settings.revision = 7;
+        reply.settings.automatic = true;
+        reply.settings.blocked_accounts.push("first".into());
+        app.apply_snapshot(reply.clone());
+        let _ = app.update(Message::AutomaticChanged(false));
+        let _ = app.execute(Command::AccountPut {
+            id: "first".into(),
+            username: "test-user".into(),
+            password: Secret::new("test-password"),
+        });
+        reply.settings.revision = 8;
+        reply.settings.selected_account = Some("first".into());
+        reply.settings.blocked_accounts.clear();
+        let _ = app.update(Message::Completed(Ok(ReplyData::Snapshot(Box::new(reply)))));
+
+        let submitted = app.draft.validated().unwrap();
+        assert!(app.draft.dirty);
+        assert!(!submitted.automatic);
+        assert_eq!(submitted.revision, 8);
+        assert_eq!(submitted.selected_account.as_deref(), Some("first"));
+        assert!(submitted.blocked_accounts.is_empty());
+    }
+    #[test]
+    fn saving_an_account_preserves_a_concurrent_settings_conflict() {
+        let mut app = fixture();
+        let mut reply = Snapshot::new(Scope::User);
+        reply.settings.revision = 7;
+        reply.settings.automatic = true;
+        app.apply_snapshot(reply.clone());
+        let _ = app.update(Message::AutomaticChanged(false));
+        let _ = app.execute(Command::AccountPut {
+            id: "first".into(),
+            username: "test-user".into(),
+            password: Secret::new("test-password"),
+        });
+        reply.settings.revision = 9;
+        reply.settings.selected_account = Some("first".into());
+        reply.settings.language = "en".into();
+        let _ = app.update(Message::Completed(Ok(ReplyData::Snapshot(Box::new(reply)))));
+
+        assert!(app.draft.dirty);
+        assert_eq!(app.draft.settings.revision, 7);
+        assert_eq!(app.snapshot.as_ref().unwrap().settings.revision, 9);
+    }
+    #[test]
+    fn account_save_waits_for_confirmation_and_failure_keeps_the_account_draft() {
+        let mut app = fixture();
+        let mut snapshot = Snapshot::new(Scope::User);
+        let adapter = bitnet_core::NetworkInterface {
+            id: "ethernet".into(),
+            name: "Ethernet".into(),
+            index: 5,
+            ipv4: vec![std::net::Ipv4Addr::new(10, 1, 2, 3)],
+            gateway: Some(std::net::Ipv4Addr::new(10, 1, 2, 1)),
+            up: true,
+            wireless: false,
+            ssid: None,
+            virtual_adapter: false,
+            alternate_adapter: false,
+        };
+        snapshot.active_binding = adapter.binding();
+        snapshot.interfaces.push(adapter);
+        snapshot.capabilities.push("verify_account".into());
+        app.apply_snapshot(snapshot);
+        app.account.id = Some("existing".into());
+        app.account.username = "test-user".into();
+        app.account.password = "incorrect".into();
+
+        let _ = app.update(Message::AccountSave);
+        assert!(matches!(
+            app.confirmation,
+            Some(Confirmation::VerifyAccount { .. })
+        ));
+        assert!(!app.busy);
+        let _ = app.update(Message::Cancel);
+        assert_eq!(app.account.password, "incorrect");
+
+        let _ = app.update(Message::AccountSave);
+        let _ = app.update(Message::Confirm);
+        assert!(app.verifying_account);
+        assert!(app.account.password.is_empty());
+        let _ = app.update(Message::Completed(Err(AppError::new(
+            ErrorCode::Credentials,
+            "Login failed",
+        ))));
+        assert_eq!(app.account.username, "test-user");
+        assert_eq!(app.account.id.as_deref(), Some("existing"));
+        assert_eq!(
+            app.notice
+                .as_ref()
+                .map(|(err, message)| (*err, message.as_str())),
+            Some((true, "Login failed"))
+        );
+    }
+    #[test]
     fn a_save_reply_does_not_discard_edits_made_while_saving() {
         let mut app = fixture();
         app.pending_settings = true;
         app.busy = true;
         app.saved_epoch = 0;
-        let _ = app.update(Message::FlagChanged(SettingFlag::Automatic, true));
+        let _ = app.update(Message::FlagChanged(SettingFlag::StartHidden, true));
         let _ = app.update(Message::Completed(Ok(ReplyData::Snapshot(Box::new(
             Snapshot::new(Scope::User),
         )))));
         assert!(app.draft.dirty);
-        assert!(app.draft.settings.automatic);
+        assert!(app.draft.settings.start_hidden);
         assert!(!app.busy);
     }
     #[test]
@@ -1341,6 +2118,32 @@ mod tests {
         let _ = app.update(Message::Refreshed(1, Ok(Snapshot::new(Scope::User))));
         assert!(app.snapshot.as_ref().unwrap().settings.paused);
         assert!(!app.polling);
+    }
+    #[test]
+    fn successful_refresh_clears_only_the_disconnected_warning() {
+        let mut app = fixture();
+        let disconnected = AppError::new(ErrorCode::Unavailable, "engine disconnected");
+        let _ = app.update(Message::Refreshed(0, Err(disconnected)));
+        assert!(app.connection_error.is_some());
+        app.show_notice(true, "operation failed".into());
+
+        let _ = app.update(Message::Refreshed(0, Ok(Snapshot::new(Scope::User))));
+        assert!(app.connection_error.is_none());
+        assert!(app.snapshot_current);
+        assert!(app.notice.is_some());
+    }
+    #[test]
+    fn automatic_setup_waits_for_the_newly_selected_adapter_binding() {
+        let mut snapshot = Snapshot::new(Scope::User);
+        snapshot.settings.interface_id = Some("ethernet".into());
+        snapshot.active_binding = Some(bitnet_core::NetworkBinding {
+            interface_id: "wireless".into(),
+            interface_index: 5,
+            source_ip: std::net::Ipv4Addr::new(192, 168, 1, 2),
+        });
+        assert!(selected_binding(&snapshot).is_none());
+        snapshot.active_binding.as_mut().unwrap().interface_id = "ethernet".into();
+        assert!(selected_binding(&snapshot).is_some());
     }
     #[test]
     fn maintenance_and_engine_startup_never_overlap() {

@@ -17,6 +17,7 @@ pub struct Envelope {
     pub request: Request,
     pub caller: Caller,
     pub answer: oneshot::Sender<Reply>,
+    pub queued_at: std::time::Instant,
     pub response_written: oneshot::Receiver<()>,
 }
 
@@ -396,6 +397,7 @@ async fn process_request(
             request,
             caller,
             answer,
+            queued_at: std::time::Instant::now(),
             response_written,
         })
         .is_err()

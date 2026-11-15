@@ -44,6 +44,7 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                 ssid: None,
                 virtual_adapter: a.ifa_flags & libc::IFF_LOOPBACK as u32 != 0
                     || super::is_tunnel(&name),
+                alternate_adapter: false,
             });
             if !a.ifa_addr.is_null() && (*a.ifa_addr).sa_family as i32 == libc::AF_INET {
                 let ip = Ipv4Addr::from(

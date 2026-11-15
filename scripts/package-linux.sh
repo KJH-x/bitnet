@@ -2,7 +2,7 @@
 # Build-only: never executes maintainer scripts, starts services, or installs packages.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-version=${VERSION:-0.1.0}
+version=${VERSION:-0.1.1}
 arch=${ARCH:-$(dpkg --print-architecture)}
 glibc_min=${GLIBC_MIN:-$(getconf GNU_LIBC_VERSION | awk '{print $2}')}
 case "$arch" in amd64|arm64|i386) ;; *) echo 'Supported package architectures: amd64 arm64 i386' >&2; exit 2;; esac

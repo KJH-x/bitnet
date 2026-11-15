@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitnet-core",
  "bitnet-platform",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-gateway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "bitnet-core",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitnet-core",
  "bitnet-runtime",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "bitnet-core",

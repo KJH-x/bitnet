@@ -8,11 +8,9 @@
     <StandardDirectory Id="$(var.ProgramFilesId)"><Directory Id="ServiceDir" Name="BitNet Service">
       <Component Id="SystemEngine" Guid="*">
         <File Id="SystemEngineExe" Source="$(var.Stage)\bitengine.exe" KeyPath="yes" />
-        <ServiceInstall Id="BitNetInstall" Name="BitNet" DisplayName="BitNet campus connection manager" Description="Campus authentication independent of desktop login." Type="ownProcess" Start="auto" ErrorControl="normal" Account="NT SERVICE\BitNet" Arguments="--service" Vital="yes">
-          <ServiceConfigFailureActions OnInstall="yes" OnReinstall="yes" ResetPeriod="86400">
-            <Failure Action="restart" Delay="5000"/><Failure Action="restart" Delay="10000"/><Failure Action="restart" Delay="30000"/>
-          </ServiceConfigFailureActions>
-        </ServiceInstall>
+        <!-- bitmaint configures recovery via SCM after the MSI commits. The
+             MSI recovery action can fail with 1939 and roll back registration. -->
+        <ServiceInstall Id="BitNetInstall" Name="BitNet" DisplayName="BitNet campus connection manager" Description="Campus authentication independent of desktop login." Type="ownProcess" Start="auto" ErrorControl="normal" Account="NT SERVICE\BitNet" Arguments="--service" Vital="yes" />
         <ServiceControl Id="BitNetControl" Name="BitNet" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
       <Component Id="SystemMaintenance" Guid="*"><File Source="$(var.Stage)\bitmaint.exe" KeyPath="yes" /></Component>

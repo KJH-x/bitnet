@@ -1,12 +1,13 @@
 param(
     [ValidateSet('x86','x64','arm64')][string]$Arch='x64',
-    [string]$Version='0.1.0', [switch]$Development,
+    [string]$Version='0.1.1', [switch]$Development,
     [string]$SecretKey=$env:BITNET_RELEASE_SECRET_KEY_FILE,
     [string]$PublicKey=$env:BITNET_RELEASE_PUBLIC_KEY_FILE,
     [string]$Wix=$env:BITNET_WIX,
     [string]$Minisign=$env:BITNET_MINISIGN,
     [string]$MakeNsis=$env:BITNET_MAKENSIS,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [ValidatePattern('^[a-z0-9-]+$')][string]$OutputSuffix
 )
 $ErrorActionPreference='Stop'
 $root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -56,7 +57,8 @@ foreach($name in @('bitengine','bitctl','bitmaint','bitnet-gui')) {if(-not (Test
 if(-not [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("$stage\bitmaint.exe")).Contains($publicLines[0])) {
     throw 'bitmaint was not compiled with this release public key; rebuild without -SkipBuild'
 }
-$out=Join-Path $root "dist\windows-$Arch"
+$outName=if($OutputSuffix) {"windows-$Arch-$OutputSuffix"} else {"windows-$Arch"}
+$out=Join-Path $root "dist\$outName"
 New-Item -ItemType Directory -Force $out | Out-Null
 $licenses=Join-Path $root "build\licenses\windows-$Arch"
 & python "$PSScriptRoot\generate-notices.py" --target $triple --output-dir $licenses --strict
@@ -91,7 +93,7 @@ if($LASTEXITCODE) {throw 'Service MSI signature self-check failed'}
 WixBuild "$root\installers\windows\Client.wxs" $client ($definitions+@('-d',"ServiceMsi=$service",'-d',"ServiceSignature=$service.minisig"))
 & "$PSScriptRoot\inspect-windows-packages.ps1" -Directory $out
 $setup=Join-Path $out "BitNetSetup-$Version-windows-$Arch.exe"
-& $MakeNsis "/DCLIENT_MSI=$client" "/DOUTPUT=$setup" "$root\installers\windows\Setup.nsi"
+& $MakeNsis /INPUTCHARSET UTF8 "/DCLIENT_MSI=$client" "/DOUTPUT=$setup" "$root\installers\windows\Setup.nsi"
 if($LASTEXITCODE) {throw 'NSIS wrapper build failed'}
 $portable=Join-Path $root "build\portable-windows-$Arch-$([Guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Force "$portable\licenses","$portable\packages" | Out-Null

@@ -147,6 +147,16 @@ impl GatewayClient {
         binding: Option<&NetworkBinding>,
     ) -> Result<GatewaySession, GatewayError> {
         self.validate_binding(binding)?;
+        Self::validate_credentials(username, password)?;
+        timeout_at(
+            Instant::now() + self.timeout,
+            self.login_inner(username, password, binding, false),
+        )
+        .await
+        .map_err(|_| GatewayError::Deadline)?
+    }
+
+    pub fn validate_credentials(username: &str, password: &str) -> Result<(), GatewayError> {
         if !valid_username(username)
             || password.is_empty()
             || password.len() > 1024
@@ -154,9 +164,21 @@ impl GatewayClient {
         {
             return Err(GatewayError::InvalidInput);
         }
+        Ok(())
+    }
+
+    /// Verify a new credential by submitting it and confirming the resulting session.
+    pub async fn verify_credentials(
+        &self,
+        username: &str,
+        password: &str,
+        binding: Option<&NetworkBinding>,
+    ) -> Result<GatewaySession, GatewayError> {
+        self.validate_binding(binding)?;
+        Self::validate_credentials(username, password)?;
         timeout_at(
             Instant::now() + self.timeout,
-            self.login_inner(username, password, binding),
+            self.login_inner(username, password, binding, true),
         )
         .await
         .map_err(|_| GatewayError::Deadline)?
@@ -212,10 +234,11 @@ impl GatewayClient {
         username: &str,
         password: &str,
         binding: Option<&NetworkBinding>,
+        require_fresh_login: bool,
     ) -> Result<GatewaySession, GatewayError> {
         let current = self.status_inner(binding).await?;
         if current.auth == AuthState::Authenticated {
-            return if current.username.as_deref() == Some(username) {
+            return if !require_fresh_login && current.username.as_deref() == Some(username) {
                 Ok(current)
             } else {
                 Err(GatewayError::AccountMismatch)
@@ -258,6 +281,10 @@ impl GatewayClient {
             r.ensure_success()?;
             parse_portal(&r.body)
         });
+        if require_fresh_login {
+            result?;
+            return self.confirm(username, true, Ok(()), binding).await;
+        }
         self.confirm(username, true, result, binding).await
     }
 
@@ -365,6 +392,7 @@ impl GatewayClient {
                 if ![
                     "/",
                     "/index.html",
+                    "/index_1.html",
                     "/srun_portal_pc",
                     "/srun_portal",
                     "/srun_portal_success",

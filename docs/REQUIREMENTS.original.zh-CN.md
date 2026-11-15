@@ -598,6 +598,8 @@
 
 # 六、与现有 BitGateway 的功能状态对照
 
+上游现名 [BITERNET（bitoolkit/biternet）](https://github.com/bitoolkit/biternet)，后续跟进新仓库。下表保留 2026-10-25 的需求调研口径。
+
 虽然本清单按独立产品需求制定，我仍将现有 BitGateway 的公开功能列在这里，方便后续判断实现差距。
 
 截至 **2026 年 10 月 25 日**，BitGateway 官方 README 明确说明其具备校园网登录、注销、账户信息展示、自动登录、当前用户自启动、静默启动、托盘常驻和更新检查等功能。README 同时确认，目前记住密码使用明文 `credentials.json` 保存。[GitHub](https://github.com/so1ve/bitgateway)

@@ -1,16 +1,35 @@
 use super::*;
 use iced::{
+    advanced::{layout, mouse, renderer, widget::Tree, Layout, Widget},
     alignment,
     widget::{
-        button, checkbox, column, container, pick_list, row, rule, scrollable, text, text_editor,
+        button, checkbox, column, container, pick_list, row, rule, stack, text, text_editor,
         text_input, Space,
     },
-    Length,
+    Color, Length, Rectangle, Size,
 };
+
+pub(super) fn action_style(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::secondary(theme, status);
+    let primary = theme.extended_palette().primary;
+    match status {
+        button::Status::Active => {
+            style.background = None;
+            style.text_color = theme.extended_palette().background.base.text;
+            style.border = style.border.color(primary.base.color).width(1);
+        }
+        button::Status::Hovered | button::Status::Pressed => {
+            style = button::primary(theme, status);
+            style.border = style.border.color(primary.base.color).width(1);
+        }
+        button::Status::Disabled => {}
+    }
+    style
+}
 
 fn card<'a>(content: impl Into<Element<'a, Message>>) -> iced::widget::Container<'a, Message> {
     container(content)
-        .padding(20)
+        .padding(16)
         .width(Length::Fill)
         .style(container::rounded_box)
 }
@@ -22,14 +41,191 @@ fn pair<'a>(label: &'a str, value: impl ToString) -> iced::widget::Row<'a, Messa
     .spacing(12)
 }
 
-impl App {
-    pub(super) fn shell(&self) -> Element<'_, Message> {
-        let content = if let Some(confirmation) = &self.confirmation {
-            self.confirmation_view(confirmation)
+// Preserve the underlying page and its widget state while a modal owns input.
+struct Inactive<'a> {
+    content: Element<'a, Message>,
+    inactive: bool,
+}
+
+impl Widget<Message, Theme, iced::Renderer> for Inactive<'_> {
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(&[&self.content]);
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            if self.inactive {
+                mouse::Cursor::Unavailable
+            } else {
+                cursor
+            },
+            viewport,
+        );
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &iced::Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if !self.inactive {
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        if !self.inactive {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                operation,
+            );
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        if self.inactive {
+            mouse::Interaction::None
         } else {
-            self.main_shell()
-        };
-        if self.snapshot.as_ref().is_some_and(|snapshot| {
+            self.content.as_widget().mouse_interaction(
+                &tree.children[0],
+                layout,
+                cursor,
+                viewport,
+                renderer,
+            )
+        }
+    }
+
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: iced::Vector,
+    ) -> Option<iced::advanced::overlay::Element<'a, Message, Theme, iced::Renderer>> {
+        if self.inactive {
+            None
+        } else {
+            self.content.as_widget_mut().overlay(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                viewport,
+                translation,
+            )
+        }
+    }
+}
+
+fn layer<'a>(content: Element<'a, Message>, inactive: bool) -> Element<'a, Message> {
+    Element::new(Inactive { content, inactive })
+}
+
+fn scrim(_: &Theme) -> container::Style {
+    container::Style::default().background(Color::from_rgba(0.0, 0.0, 0.0, 0.58))
+}
+
+fn format_elapsed_minutes(elapsed: u64, english: bool) -> String {
+    let minutes = elapsed / 60;
+    match (minutes, english) {
+        (0, false) => "刚刚".into(),
+        (0, true) => "Just now".into(),
+        (1, true) => "1 minute ago".into(),
+        (_, true) => format!("{minutes} minutes ago"),
+        (_, false) => format!("{minutes} 分钟前"),
+    }
+}
+
+fn format_history_duration(ms: u64, english: bool) -> String {
+    let seconds = ms / 1000;
+    let (hours, minutes) = (seconds / 3600, seconds / 60 % 60);
+    match english {
+        true if hours > 0 => format!("{hours} h {minutes} min"),
+        false if hours > 0 => format!("{hours} 小时 {minutes} 分钟"),
+        true if minutes > 0 => format!("{minutes} min {} s", seconds % 60),
+        false if minutes > 0 => format!("{minutes} 分钟 {} 秒", seconds % 60),
+        true if seconds > 0 => format!("{:.1} s", ms as f64 / 1_000.0),
+        false if seconds > 0 => format!("{:.1} 秒", ms as f64 / 1_000.0),
+        true => format!("{ms} ms"),
+        false => format!("{ms} 毫秒"),
+    }
+}
+
+impl App {
+    fn relative_time(&self, timestamp: Option<u64>) -> String {
+        timestamp.map_or_else(
+            || "—".into(),
+            |at| format_elapsed_minutes(bitnet_core::now_secs().saturating_sub(at), self.english()),
+        )
+    }
+
+    pub(super) fn shell(&self) -> Element<'_, Message> {
+        let content = self.main_shell();
+        let content = if self.snapshot.as_ref().is_some_and(|snapshot| {
             snapshot
                 .capabilities
                 .iter()
@@ -52,16 +248,89 @@ impl App {
             .into()
         } else {
             content
+        };
+        let confirmation = self.confirmation.as_ref();
+        let health_editor = self.health_editor.as_deref();
+        let mut layers = stack([layer(
+            content,
+            self.modal.is_some() || confirmation.is_some() || health_editor.is_some(),
+        )]);
+        if let Some(page) = self.modal {
+            let content = match page {
+                Page::Networks => Some(self.networks_view()),
+                Page::History => Some(self.history_view()),
+                _ => None,
+            };
+            if let Some(content) = content {
+                layers = layers.push(layer(
+                    self.dialog(page.label(self.english()), content, Message::Cancel),
+                    confirmation.is_some() || health_editor.is_some(),
+                ));
+            }
         }
+        if let Some(entries) = health_editor {
+            layers = layers.push(layer(
+                self.health_editor_view(entries),
+                confirmation.is_some(),
+            ));
+        }
+        if let Some(confirmation) = confirmation {
+            layers = layers.push(self.confirmation_view(confirmation));
+        }
+        layers.into()
+    }
+
+    fn dialog<'a>(
+        &'a self,
+        title: &'a str,
+        content: Element<'a, Message>,
+        close: Message,
+    ) -> Element<'a, Message> {
+        let heading = row![
+            text(title).size(23).width(Length::Fill),
+            button(self.t("关闭", "Close"))
+                .on_press(close)
+                .style(action_style),
+        ]
+        .spacing(12)
+        .align_y(alignment::Vertical::Center);
+        let mut dialog = column![heading].spacing(14);
+        if let Some(banner) = self.notice_banner() {
+            dialog = dialog.push(banner);
+        }
+        let body = smooth_scroll::vertical(content).scrollbar_spacing(8.0);
+        container(card(dialog.push(body)).max_width(880))
+            .padding(24)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(scrim)
+            .into()
+    }
+
+    fn notice_banner(&self) -> Option<Element<'_, Message>> {
+        let (is_error, message) = self.notice.as_ref()?;
+        let banner = row![
+            text(message).width(Length::Fill),
+            button(self.t("关闭", "Dismiss"))
+                .on_press(Message::DismissNotice)
+                .style(button::text)
+        ]
+        .spacing(12);
+        Some(
+            container(banner)
+                .padding(12)
+                .width(Length::Fill)
+                .style(if *is_error {
+                    container::danger
+                } else {
+                    container::success
+                })
+                .into(),
+        )
     }
 
     fn main_shell(&self) -> Element<'_, Message> {
-        let mut navigation = column![
-            text("BitNet").size(32),
-            text(self.t("校园网连接管理器", "Campus connection manager")).size(12),
-            Space::new().height(18),
-        ]
-        .spacing(7);
+        let mut navigation = column![text("BitNet").size(32), Space::new().height(12),].spacing(7);
         for page in Page::ALL {
             let selected = page == self.page;
             navigation = navigation.push(
@@ -78,8 +347,23 @@ impl App {
                     }),
             );
         }
+        let scope = if self.connecting {
+            self.t("正在连接后台", "Connecting to engine")
+        } else {
+            match self
+                .snapshot
+                .as_ref()
+                .filter(|_| self.snapshot_current)
+                .map(|s| s.scope)
+            {
+                Some(Scope::System) => self.t("已连接系统后台", "System service connected"),
+                Some(Scope::User) => self.t("已连接个人引擎", "User engine connected"),
+                None => self.t("未连接后台", "Engine disconnected"),
+            }
+        };
         navigation = navigation
             .push(Space::new().height(Length::Fill))
+            .push(text(scope).size(13))
             .push(text(format!("v{APP_VERSION}")).size(11))
             .push(
                 button(self.t("隐藏界面", "Hide window"))
@@ -89,21 +373,12 @@ impl App {
                             .and(self.window)
                             .map(Message::WindowCloseRequested),
                     )
+                    .padding([4, 0])
                     .style(button::text),
             );
 
-        let actual_scope = self.snapshot.as_ref().map(|s| s.scope);
-        let scope = match actual_scope {
-            Some(Scope::System) => self.t("系统共享后台", "Shared system service"),
-            Some(Scope::User) => self.t("个人桌面引擎", "User engine"),
-            None => self.t("尚未连接", "Not connected"),
-        };
         let header = row![
-            column![
-                text(self.page.label(self.english())).size(27),
-                text(scope).size(13)
-            ]
-            .spacing(4),
+            text(self.page.label(self.english())).size(27),
             Space::new().width(Length::Fill),
             pick_list(
                 [Mode::User, Mode::System],
@@ -111,31 +386,41 @@ impl App {
                 Message::ModeChanged
             )
             .width(225),
-            button(self.t("刷新", "Refresh")).on_press_maybe(
-                (!self.busy && !self.connecting && !self.polling).then_some(Message::Refresh)
-            ),
+            button(self.t("刷新", "Refresh"))
+                .on_press_maybe(
+                    (!self.busy && !self.connecting && !self.polling).then_some(Message::Refresh)
+                )
+                .style(action_style),
         ]
         .spacing(12)
         .align_y(alignment::Vertical::Center);
-        let mut content = column![header].spacing(18);
-        if let Some((is_error, message)) = &self.notice {
-            let banner = row![
-                text(message).width(Length::Fill),
-                button(self.t("关闭", "Dismiss"))
-                    .on_press(Message::DismissNotice)
-                    .style(button::text)
-            ]
-            .spacing(12);
-            content = content.push(container(banner).padding(12).width(Length::Fill).style(
-                if *is_error {
-                    container::danger
-                } else {
-                    container::success
-                },
-            ));
+        let mut content = column![header].spacing(14);
+        if let Some(error) = &self.connection_error {
+            content = content.push(
+                container(
+                    row![
+                        text(&error.message).width(Length::Fill),
+                        button(self.t("后台服务", "Background service"))
+                            .on_press(Message::Navigate(Page::Service))
+                            .style(button::text),
+                    ]
+                    .spacing(10)
+                    .align_y(alignment::Vertical::Center),
+                )
+                .padding(12)
+                .width(Length::Fill)
+                .style(container::danger),
+            );
+        }
+        if self.modal.is_none() && self.health_editor.is_none() {
+            if let Some(banner) = self.notice_banner() {
+                content = content.push(banner);
+            }
         }
         if self.snapshot.is_some() && !self.snapshot_current && !self.connecting {
-            content = content.push(text(self.t("后台连接已断开，以下保留最后成功快照；请重新连接或使用服务维护。", "The engine is unavailable. The last successful snapshot is shown below; reconnect or use service maintenance.")).size(13));
+            content = content.push(
+                text(self.t("显示断开前的数据", "Showing data from before disconnect")).size(13),
+            );
         }
         if self.busy || self.connecting {
             content = content.push(
@@ -156,15 +441,14 @@ impl App {
             Page::History => self.history_view(),
             Page::Statistics => self.statistics_view(),
             Page::Diagnostics => self.diagnostics_view(),
-            Page::Updates => self.updates_view(),
         });
         row![
             container(navigation)
-                .width(210)
+                .width(180)
                 .height(Length::Fill)
-                .padding(20)
+                .padding(16)
                 .style(container::rounded_box),
-            scrollable(container(content).padding(26).width(Length::Fill))
+            smooth_scroll::vertical(container(content).padding(20).width(Length::Fill))
                 .height(Length::Fill)
                 .width(Length::Fill)
         ]
@@ -174,10 +458,26 @@ impl App {
 
     fn status_view(&self) -> Element<'_, Message> {
         let Some(snapshot) = &self.snapshot else {
-            return card(column![text(self.t("先连接本机引擎", "Connect to the local engine first")).size(22),
-                text(self.t("桌面模式会启动当前用户的引擎。已安装系统服务时，将连接该服务。", "Desktop mode starts your user engine. If a system service is installed, BitNet connects to it.")),
-                button(self.t("连接 / 重试", "Connect / retry")).on_press_maybe((!self.connecting).then_some(Message::Refresh))].spacing(16)).into();
+            return card(
+                column![
+                    text(self.t("请先连接后台", "Connect to the engine first")).size(22),
+                    row![
+                        button(self.t("连接 / 重试", "Connect / retry"))
+                            .on_press_maybe((!self.connecting).then_some(Message::Refresh)),
+                        button(self.t("后台服务", "Background service"))
+                            .on_press(Message::Navigate(Page::Service))
+                            .style(action_style),
+                    ]
+                    .spacing(10)
+                    .wrap(),
+                ]
+                .spacing(12),
+            )
+            .into();
         };
+        let connected = self.snapshot_current && !self.busy;
+        let system_auth = bitnet_runtime::engine::uses_system_authentication(snapshot);
+        let portal_controls = connected && !system_auth;
         let auth = match snapshot.session.auth {
             AuthState::Authenticated => self.t("已认证", "Authenticated"),
             AuthState::Unauthenticated => self.t("尚未认证", "Not authenticated"),
@@ -187,9 +487,9 @@ impl App {
             column![
                 text(self.state_label(&snapshot.state)).size(34),
                 text(format!(
-                    "{} · {}",
-                    auth,
-                    self.environment_label(&snapshot.environment)
+                            "{} · {}",
+                            auth,
+                            self.environment_label(&snapshot.environment)
                 ))
                 .size(16),
                 rule::horizontal(1),
@@ -235,73 +535,83 @@ impl App {
                 )).size(12),
                 row![
                     button(self.t("登录", "Connect")).on_press_maybe(
-                        (!self.busy && !snapshot.accounts.is_empty())
+                        (portal_controls && !snapshot.accounts.is_empty())
                             .then_some(Self::login_message(snapshot))
                     ),
                     button(self.t("注销…", "Disconnect…"))
-                        .on_press_maybe((!self.busy).then_some(Message::Ask(Confirmation::Logout)))
-                        .style(button::secondary),
+                        .on_press_maybe(portal_controls.then_some(Message::Ask(Confirmation::Logout)))
+                        .style(action_style),
                     button(self.t("立即检测", "Check now"))
-                        .on_press_maybe((!self.busy).then_some(Message::Run(Command::Check)))
-                        .style(button::secondary),
-                    button(if snapshot.settings.paused {
+                        .on_press_maybe(portal_controls.then_some(Message::Run(Command::Check)))
+                        .style(action_style),
+                    button(if snapshot.settings.paused || snapshot.verification_hold {
                         self.t("恢复自动认证", "Resume")
                     } else {
                         self.t("暂停自动认证", "Pause")
                     })
-                    .on_press_maybe((!self.busy).then_some(Message::Run(
-                        if snapshot.settings.paused {
+                    .on_press_maybe(connected.then_some(Message::Run(
+                        if snapshot.settings.paused || snapshot.verification_hold {
                             Command::Resume
                         } else {
                             Command::Pause
                         }
                     )))
-                    .style(button::secondary),
+                    .style(action_style),
                     button(self.t("重新认证…", "Reauthenticate…"))
                         .on_press_maybe(
-                            (!self.busy && !snapshot.accounts.is_empty())
+                            (portal_controls && !snapshot.accounts.is_empty())
                                 .then_some(Message::Ask(Confirmation::ForceLogin))
                         )
                         .style(button::text),
+                    button(Page::Networks.label(self.english()))
+                        .on_press(Message::Navigate(Page::Networks))
+                        .style(action_style),
                 ]
                 .spacing(10)
                 .wrap(),
             ]
             .spacing(12),
         );
-        let mut content = column![state].spacing(18);
-        if snapshot
-            .capabilities
-            .iter()
-            .any(|capability| capability == "network_trust")
+        let mut content = column![state].spacing(14);
+        if system_auth {
+            content = content.push(text(self.t(
+                "BIT-mobile 由系统完成认证",
+                "Your system handles BIT-mobile sign-in",
+            )));
+        } else if snapshot.settings.automatic
+            && !snapshot.settings.paused
+            && !snapshot.verification_hold
+            && !snapshot.network_trusted
+            && snapshot.active_binding.is_some()
+            && snapshot
+                .capabilities
+                .iter()
+                .any(|capability| capability == "network_trust")
         {
-            content = content.push(card(column![
-                text(if snapshot.network_trusted {
-                    self.t("当前网络已信任", "Current network is trusted")
-                } else {
-                    self.t("当前网络尚未信任", "Current network is not trusted")
-                }).size(20),
-                text(self.t(
-                    "未知网络仅查询认证状态，不自动发送账户凭据。信任按网卡、SSID、网关、来源网段及认证目标识别；HTTP 校园门户不提供加密的服务器身份保证。",
-                    "Unknown networks are checked without sending account credentials automatically. Trust uses the interface, SSID, gateway, source subnet and authentication endpoint. An HTTP campus portal provides no cryptographic server identity guarantee."
-                )).size(13),
-                if snapshot.network_trusted {
-                    button(self.t("取消当前网络信任", "Stop trusting this network"))
-                        .on_press_maybe((!self.busy).then_some(Message::Run(Command::TrustNetwork { trusted: false })))
-                        .style(button::secondary)
-                } else {
-                    button(self.t("信任当前网络…", "Trust this network…"))
-                        .on_press_maybe((!self.busy && snapshot.active_binding.is_some()).then_some(Message::Ask(Confirmation::TrustNetwork)))
-                        .style(button::secondary)
-                },
-            ].spacing(12)));
+            content = content.push(card(
+                row![
+                    text(self.t(
+                        "自动认证需要信任当前网络",
+                        "Automatic authentication requires a trusted network"
+                    ))
+                    .width(Length::Fill),
+                    button(self.t("查看网络", "View network"))
+                        .on_press(Message::Navigate(Page::Networks))
+                        .style(action_style),
+                ]
+                .spacing(10)
+                .align_y(alignment::Vertical::Center),
+            ));
         }
         if snapshot.accounts.is_empty() {
-            content = content.push(card(column![
-                text(self.t("欢迎使用 BitNet", "Welcome to BitNet")).size(22),
-                text(self.t("1. 添加校园网账号和密码。\n2. 选择是否自动认证。\n3. 需要在 Windows/macOS/Linux 登录前联网时，再启用系统后台。", "1. Add your campus account and password.\n2. Choose whether to authenticate automatically.\n3. Enable the system service when you need connectivity before signing in.")),
-                button(self.t("添加第一个账户", "Add your first account")).on_press(Message::Navigate(Page::Accounts)),
-            ].spacing(12)));
+            content = content.push(card(
+                column![
+                    text(self.t("欢迎使用 BitNet", "Welcome to BitNet")).size(22),
+                    button(self.t("添加第一个账户", "Add your first account"))
+                        .on_press(Message::Navigate(Page::Accounts)),
+                ]
+                .spacing(12),
+            ));
         }
         if let Some(error) = &snapshot.last_error {
             content = content.push(card(
@@ -314,14 +624,75 @@ impl App {
                 .spacing(12),
             ));
         }
-        content = content.push(card(column![text(self.t("连接健康", "Connection health")).size(20),
-            pair(self.t("互联网", "Internet"), self.health_label(&snapshot.health.internet)),
-            pair("DNS", self.health_label(&snapshot.health.dns)), pair("IPv6", self.health_label(&snapshot.health.ipv6)),
-            pair(self.t("最近成功认证", "Last successful login"), format_timestamp(snapshot.last_success_at)),
-            pair(self.t("重试次数", "Retry attempts"), snapshot.retry_count),
-            text(self.t("认证状态与互联网可用性分开判断。DNS 或外网异常不会自动注销校园网。", "Authentication and internet health are separate. DNS or internet failures do not disconnect a campus session.")).size(12),
-        ].spacing(10)));
-        content.into()
+        content = content.push(card(
+            column![
+                text(self.t("连接健康", "Connection health")).size(20),
+                pair(
+                    self.t("互联网", "Internet"),
+                    self.health_label(&snapshot.health.internet)
+                ),
+                pair("DNS", self.health_label(&snapshot.health.dns)),
+                pair("IPv6", self.health_label(&snapshot.health.ipv6)),
+                pair(
+                    self.t("最近成功认证", "Last successful login"),
+                    self.relative_time(snapshot.last_success_at)
+                ),
+                pair(self.t("重试次数", "Retry attempts"), snapshot.retry_count),
+            ]
+            .spacing(10),
+        ));
+        content.push(self.statistics_view()).into()
+    }
+
+    fn network_trust_view(&self) -> Element<'_, Message> {
+        let Some(snapshot) = self.snapshot.as_ref().filter(|s| {
+            s.capabilities
+                .iter()
+                .any(|capability| capability == "network_trust")
+        }) else {
+            return Space::new().into();
+        };
+        if bitnet_runtime::engine::uses_system_authentication(snapshot) {
+            return text(self.t(
+                "BIT-mobile 由系统完成认证",
+                "Your system handles BIT-mobile sign-in",
+            ))
+            .into();
+        }
+        let enabled = self.snapshot_current && !self.busy && snapshot.active_binding.is_some();
+        let (label, action, button_label) = if snapshot.network_trusted {
+            (
+                self.t("当前网络已信任", "Current network is trusted"),
+                Message::Run(Command::TrustNetwork { trusted: false }),
+                self.t("取消网络信任", "Remove trust"),
+            )
+        } else {
+            (
+                self.t("当前网络尚未信任", "Current network is not trusted"),
+                if snapshot.settings.automatic
+                    && snapshot
+                        .capabilities
+                        .iter()
+                        .any(|item| item == "enable_automatic")
+                {
+                    Message::BeginAutomatic
+                } else {
+                    Message::Ask(Confirmation::TrustNetwork)
+                },
+                self.t("信任当前网络…", "Trust this network…"),
+            )
+        };
+        card(
+            row![
+                text(label),
+                button(button_label)
+                    .on_press_maybe(enabled.then_some(action))
+                    .style(action_style),
+            ]
+            .spacing(10)
+            .align_y(alignment::Vertical::Center),
+        )
+        .into()
     }
 
     fn accounts_view(&self) -> Element<'_, Message> {
@@ -369,7 +740,7 @@ impl App {
                                     (!self.busy)
                                         .then_some(Message::AccountEdit(account.id.clone()))
                                 )
-                                .style(button::secondary),
+                                .style(action_style),
                             button(self.t("删除…", "Delete…"))
                                 .on_press_maybe((!self.busy).then_some(Message::Ask(
                                     Confirmation::DeleteAccount(account.id.clone())
@@ -383,23 +754,97 @@ impl App {
                 ));
             }
         }
-        content = content.push(card(column![
-            text(if self.account.id.is_some() { self.t("覆盖修改账户", "Replace account details") } else { self.t("添加账户", "Add account") }).size(21),
-            text_input(self.t("校园账号", "Campus username"), &self.account.username).on_input(Message::UsernameChanged).padding(12),
-            text_input(self.t("输入新的密码", "Enter a new password"), &self.account.password).secure(true).on_input(Message::PasswordChanged).padding(12),
-            row![button(self.t("安全保存账户", "Save account securely")).on_press_maybe((!self.busy && self.snapshot.is_some()).then_some(Message::AccountSave)),
-                button(self.t("清空 / 取消", "Clear / cancel")).on_press(Message::AccountCancel).style(button::secondary)].spacing(10),
-            checkbox(self.draft.settings.automatic).label(self.t("启用校园网络自动认证", "Authenticate automatically on campus networks"))
-                .on_toggle(|value| Message::FlagChanged(SettingFlag::Automatic, value)),
-            button(self.t("保存自动认证设置", "Save automatic authentication preference"))
-                .on_press_maybe((!self.busy && self.snapshot.is_some() && self.draft.dirty).then_some(Message::SaveSettings)).style(button::secondary),
-            text(self.t("共享后台中的账户可由本机用户管理。认证服务器与软件更新权限由管理员控制。", "Local users can manage shared accounts. Authentication endpoints and software updates remain administrator-controlled.")).size(12),
-        ].spacing(13)));
+        content = content.push(card(
+            column![
+                text(if self.account.id.is_some() {
+                    self.t("覆盖修改账户", "Replace account details")
+                } else {
+                    self.t("添加账户", "Add account")
+                })
+                .size(21),
+                text_input(
+                    self.t("校园账号", "Campus username"),
+                    &self.account.username
+                )
+                .on_input_maybe((!self.verifying_account).then_some(Message::UsernameChanged))
+                .padding(12),
+                text_input(
+                    self.t("输入新的密码", "Enter a new password"),
+                    &self.account.password
+                )
+                .secure(true)
+                .on_input_maybe((!self.verifying_account).then_some(Message::PasswordChanged))
+                .padding(12),
+                row![
+                    button(if self.verifying_account {
+                        self.t("正在验证登录…", "Verifying sign-in…")
+                    } else {
+                        self.t("验证并保存…", "Verify and save…")
+                    })
+                    .on_press_maybe(
+                        (!self.busy && self.snapshot_current).then_some(Message::AccountSave)
+                    ),
+                    button(self.t("清空 / 取消", "Clear / cancel"))
+                        .on_press_maybe((!self.verifying_account).then_some(Message::AccountCancel))
+                        .style(action_style)
+                ]
+                .spacing(10),
+                text(if self.snapshot_current {
+                    ""
+                } else {
+                    self.t(
+                        "连接后台后即可保存账户",
+                        "Connect to the engine to save an account",
+                    )
+                })
+                .size(13),
+                checkbox(self.draft.settings.automatic)
+                    .label(self.t(
+                        "启用校园网络自动认证",
+                        "Authenticate automatically on campus networks"
+                    ))
+                    .on_toggle_maybe(
+                        (!self.busy && self.snapshot_current).then_some(Message::AutomaticChanged)
+                    ),
+                row![
+                    button(self.t("保存设置", "Save settings"))
+                        .on_press_maybe(
+                            (!self.busy && self.snapshot_current && self.draft.dirty)
+                                .then_some(Message::SaveSettings)
+                        )
+                        .style(action_style),
+                    button(Page::Networks.label(self.english()))
+                        .on_press(Message::Navigate(Page::Networks))
+                        .style(action_style),
+                ]
+                .spacing(10)
+                .wrap(),
+            ]
+            .spacing(13),
+        ));
         content.into()
     }
 
     fn networks_view(&self) -> Element<'_, Message> {
-        let mut content = column![text(self.t("网卡选择与网络规则由统一引擎执行，不改变系统路由。", "Interface selection and network rules are enforced by the engine without changing system routes.")).size(14)].spacing(16);
+        let mut content =
+            column![
+                button(self.t("恢复自动选择网卡", "Select an interface automatically"))
+                    .on_press_maybe(
+                        (!self.busy && self.snapshot_current && !self.draft.dirty)
+                            .then_some(Message::InterfaceSelected(String::new()))
+                    ),
+            ]
+            .spacing(10);
+        if self.enabling_automatic {
+            content = content.push(
+                button(self.t("继续设置信任", "Continue to network trust")).on_press_maybe(
+                    (!self.busy
+                        && self.snapshot_current
+                        && self.snapshot.as_ref().and_then(selected_binding).is_some())
+                    .then_some(Message::BeginAutomatic),
+                ),
+            );
+        }
         let mut profiles = column![
             text(self.t("认证环境配置", "Authentication profiles")).size(22),
             text(self.t("保存当前已应用的网关、接口、账户和规则；只有明确选择时才切换。系统后台的认证目标变更仍须管理员授权。", "Capture the currently applied gateway, interface, account and rules. Profiles switch only when selected. Changing a system-service authentication endpoint still requires administrator authorization.")).size(13),
@@ -472,37 +917,134 @@ impl App {
         if self.draft.dirty {
             profiles = profiles.push(text(self.t("有未保存设置：请先到偏好页保存或放弃，再切换或保存环境。", "Pending edits: save or discard preferences before capturing or switching profiles.")).size(12));
         }
-        content = content.push(card(profiles));
         if let Some(snapshot) = &self.snapshot {
-            for interface in &snapshot.interfaces {
+            let mut interfaces: Vec<_> = snapshot.interfaces.iter().collect();
+            interfaces.sort_by_key(|interface| {
+                let saved = snapshot.settings.interface_id.as_ref() == Some(&interface.id);
                 let active = snapshot
                     .active_binding
                     .as_ref()
                     .is_some_and(|binding| binding.interface_id == interface.id);
+                let mut addresses = interface.ipv4.iter().copied().chain(interface.gateway);
+                let campus_range = addresses.clone().any(|ip| ip.octets()[0] == 10);
+                let home_range = addresses.any(|ip| ip.octets()[..2] == [192, 168]);
+                (
+                    !saved,
+                    !active,
+                    is_alternate_adapter(interface),
+                    !interface.up,
+                    !campus_range,
+                    !home_range,
+                    interface.index,
+                )
+            });
+            let mut alternate_count = 0;
+            let mut alternatives = column![].spacing(7);
+            for interface in interfaces {
+                let active = snapshot
+                    .active_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.interface_id == interface.id);
+                let saved = snapshot.settings.interface_id.as_ref() == Some(&interface.id);
+                let alternate = is_alternate_adapter(interface);
                 let source = interface
                     .ipv4
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ");
-                content = content.push(card(column![
-                    row![text(&interface.name).size(20), Space::new().width(Length::Fill), text(if active { self.t("当前出口", "Active interface") } else if interface.up { self.t("已连接", "Connected") } else { self.t("未连接", "Disconnected") })],
-                    pair("ID", &interface.id), pair("IPv4", if source.is_empty() { "—".into() } else { source }),
-                    pair(self.t("网关", "Gateway"), interface.gateway.map(|ip| ip.to_string()).unwrap_or_else(|| "—".into())),
-                    pair("SSID", interface.ssid.as_deref().unwrap_or("—")),
-                    text(if interface.virtual_adapter { self.t("虚拟网卡：需要明确的校园网归属，不能仅凭默认路由认证。", "Virtual adapter: campus ownership must be confirmed before authentication.") } else { self.t("物理网络接口", "Physical network interface") }).size(12),
-                    button(self.t("使用此网卡", "Use this interface")).on_press_maybe((!self.busy && interface.up).then_some(Message::InterfaceSelected(interface.id.clone()))).style(button::secondary),
-                ].spacing(9)));
+                let badge = |label: &'static str| {
+                    container(text(label).size(12))
+                        .padding([3, 7])
+                        .style(container::rounded_box)
+                };
+                let mut heading = row![
+                    badge(if interface.virtual_adapter {
+                        self.t("虚拟网卡", "Virtual")
+                    } else if alternate {
+                        self.t("备选网卡", "Alternative")
+                    } else {
+                        self.t("物理网卡", "Physical")
+                    }),
+                    badge(if interface.up {
+                        self.t("● 已连接", "● Connected")
+                    } else {
+                        self.t("○ 未连接", "○ Disconnected")
+                    }),
+                    container(
+                        text(&interface.name)
+                            .size(17)
+                            .wrapping(text::Wrapping::WordOrGlyph)
+                    )
+                    .max_width(320),
+                    button(self.t("使用此网卡", "Use this adapter"))
+                        .on_press_maybe(
+                            (!self.busy
+                                && self.snapshot_current
+                                && !self.draft.dirty
+                                && interface.up
+                                && !saved)
+                                .then_some(Message::InterfaceSelected(interface.id.clone()))
+                        )
+                        .padding([4, 8])
+                        .style(action_style),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center);
+                if saved {
+                    heading = heading.push(badge(self.t("已记录", "Saved")));
+                }
+                if active {
+                    heading = heading.push(badge(self.t("当前活跃", "Active")));
+                }
+                let mut addresses = vec![format!(
+                    "IPv4 {}",
+                    if source.is_empty() { "—" } else { &source }
+                )];
+                if let Some(gateway) = interface.gateway {
+                    addresses.push(format!("{} {gateway}", self.t("网关", "Gateway")));
+                }
+                if let Some(ssid) = &interface.ssid {
+                    addresses.push(format!("SSID {ssid}"));
+                }
+                let entry = container(
+                    column![heading.wrap(), text(addresses.join("  ·  ")).size(13),].spacing(5),
+                )
+                .width(Length::Fill)
+                .padding([8, 12])
+                .style(container::rounded_box);
+                if alternate && !saved && !active {
+                    alternate_count += 1;
+                    if self.alternate_adapters {
+                        alternatives = alternatives.push(entry);
+                    }
+                } else {
+                    content = content.push(entry);
+                }
+            }
+            if alternate_count > 0 {
+                content = content
+                    .push(
+                        button(text(format!(
+                            "{} ({alternate_count})",
+                            if self.alternate_adapters {
+                                self.t("收起备选网卡", "Hide alternative adapters")
+                            } else {
+                                self.t("展开备选网卡", "Show alternative adapters")
+                            }
+                        )))
+                        .on_press(Message::ToggleAlternateAdapters),
+                    )
+                    .push(alternatives);
             }
         }
-        content = content.push(
-            button(self.t("恢复自动选择网卡", "Select an interface automatically"))
-                .on_press_maybe(
-                    (!self.busy && self.snapshot.is_some())
-                        .then_some(Message::InterfaceSelected(String::new())),
-                )
-                .style(button::secondary),
-        );
+        content = content
+            .push(self.network_trust_view())
+            .push(button(self.t("高级", "Advanced")).on_press(Message::ToggleAdvancedNetworks));
+        if !self.advanced_networks {
+            return content.into();
+        }
+        content = content.push(card(profiles));
         let mut rules = column![text(self.t("网络规则", "Network rules")).size(22),
             text(self.t("高优先级规则优先。忽略规则用于禁止在指定网络自动认证。", "Higher-priority rules take precedence. Ignore rules prevent automatic authentication on matching networks.")).size(12)].spacing(12);
         for (index, rule) in self.draft.settings.rules.iter().enumerate() {
@@ -630,6 +1172,7 @@ impl App {
 
     fn settings_view(&self) -> Element<'_, Message> {
         let mut preferences = column![
+            text(self.t("基本", "General")).size(21),
             row![
                 text(self.t("日志级别", "Log level")).width(180),
                 pick_list(
@@ -639,7 +1182,6 @@ impl App {
                 )
             ]
             .spacing(12),
-            text(self.t("日常偏好", "Preferences")).size(21),
             row![
                 text(self.t("界面语言", "Language")).width(180),
                 pick_list(
@@ -660,29 +1202,34 @@ impl App {
             .spacing(12),
         ]
         .spacing(14);
+        preferences = preferences.push(
+            checkbox(self.draft.settings.automatic)
+                .label(self.t("自动认证", "Automatic authentication"))
+                .on_toggle_maybe(
+                    (!self.busy && self.snapshot_current).then_some(Message::AutomaticChanged),
+                ),
+        );
         for (flag, value, label) in [
-            (
-                SettingFlag::Automatic,
-                self.draft.settings.automatic,
-                self.t("自动认证", "Automatic authentication"),
-            ),
             (
                 SettingFlag::UserAutostart,
                 self.draft.settings.user_autostart,
                 self.t(
-                    "登录后保持后台运行",
-                    "Start the background engine after signing in",
+                    "登录系统后保持后台运行",
+                    "Start the engine after signing in to your computer",
                 ),
             ),
             (
                 SettingFlag::GuiAutostart,
                 self.draft.settings.gui_autostart,
-                self.t("登录后打开界面", "Open the window after signing in"),
+                self.t(
+                    "登录系统后打开界面",
+                    "Open the window after signing in to your computer",
+                ),
             ),
             (
                 SettingFlag::StartHidden,
                 self.draft.settings.start_hidden,
-                self.t("启动时隐藏主窗口", "Start with the main window hidden"),
+                self.t("启动软件时隐藏主窗口", "Start with the main window hidden"),
             ),
             (
                 SettingFlag::NotifyErrors,
@@ -760,10 +1307,37 @@ impl App {
                 .align_y(alignment::Vertical::Center),
             );
         }
-        advanced = advanced.push(text(self.t("健康探测地址（用分号分隔，最多 8 个）", "Health check URLs (semicolon-separated, up to 8)")).size(13))
-            .push(text_input("http://…; http://…", &self.draft.health_targets).on_input(Message::HealthTargetsChanged).padding(10))
-            .push(pair(self.t("认证服务器", "Authentication endpoint"), &self.draft.settings.gateway.base_url))
-            .push(text(self.t("系统后台的认证地址、安全参数及更新执行权限由管理员控制。", "System authentication endpoints, security policy and update execution are administrator-controlled.")).size(12));
+        let mut targets = column![row![
+            text(self.t("健康探测地址", "Health check URLs")).width(Length::Fill),
+            button(self.t("修改…", "Edit…"))
+                .on_press(Message::OpenHealthEditor)
+                .style(action_style),
+        ]
+        .spacing(10)
+        .align_y(alignment::Vertical::Center)]
+        .spacing(5);
+        for url in self
+            .draft
+            .health_targets
+            .split(';')
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            targets = targets.push(text(url).size(13).style(text::secondary));
+        }
+        let effective_endpoint = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.settings.gateway.base_url.as_str())
+            .unwrap_or("—");
+        advanced = advanced.push(targets).push(
+            row![
+                text(self.t("认证服务器", "Authentication endpoint")).width(Length::Fill),
+                text_input("", effective_endpoint).width(230).padding(8),
+            ]
+            .spacing(14)
+            .align_y(alignment::Vertical::Center),
+        );
         let save = row![
             button(self.t("保存设置", "Save settings")).on_press_maybe(
                 (self.draft.dirty && !self.busy && self.snapshot.is_some())
@@ -771,7 +1345,7 @@ impl App {
             ),
             button(self.t("放弃修改", "Discard changes"))
                 .on_press_maybe(self.draft.dirty.then_some(Message::RevertSettings))
-                .style(button::secondary),
+                .style(action_style),
             text(if self.draft.dirty {
                 self.t("有未保存修改", "Unsaved changes")
             } else {
@@ -787,7 +1361,8 @@ impl App {
                 button(self.t("复制导出", "Copy export")).on_press_maybe((!self.exported.is_empty()).then_some(Message::CopyExport)).style(button::secondary)].spacing(10),
         ].spacing(12);
         if !self.exported.is_empty() {
-            transfer = transfer.push(scrollable(text(&self.exported).size(12)).height(150));
+            transfer =
+                transfer.push(smooth_scroll::vertical(text(&self.exported).size(12)).height(150));
         }
         transfer = transfer
             .push(
@@ -806,9 +1381,72 @@ impl App {
                     )
                     .style(button::secondary),
             );
-        column![card(preferences), card(advanced), save, card(transfer)]
-            .spacing(18)
-            .into()
+        let tools = row![
+            button(Page::Networks.label(self.english()))
+                .on_press(Message::Navigate(Page::Networks))
+                .style(action_style),
+            button(Page::History.label(self.english()))
+                .on_press(Message::Navigate(Page::History))
+                .style(action_style),
+        ]
+        .spacing(10)
+        .wrap();
+        let mut content = column![
+            self.diagnostics_view(),
+            tools,
+            card(preferences),
+            self.updates_view(),
+            button(if self.advanced_settings {
+                self.t("收起高级设置", "Hide advanced settings")
+            } else {
+                self.t("展开高级设置", "Show advanced settings")
+            })
+            .on_press(Message::ToggleAdvancedSettings)
+            .style(action_style),
+        ]
+        .spacing(14);
+        if self.advanced_settings {
+            content = content.push(card(advanced)).push(card(transfer));
+        }
+        content.push(save).into()
+    }
+
+    fn health_editor_view<'a>(&'a self, entries: &'a [String]) -> Element<'a, Message> {
+        let mut content = column![text(self.t(
+            "每行一个地址。一次粘贴多个地址时，用分号分隔。",
+            "Enter one URL per row. Separate URLs with semicolons when pasting several.",
+        ))
+        .size(13)]
+        .spacing(9);
+        for (index, entry) in entries.iter().enumerate() {
+            content = content.push(
+                row![
+                    text_input("http://…", entry)
+                        .on_input(move |value| Message::HealthEntryChanged(index, value))
+                        .padding(8),
+                    button(self.t("移除", "Remove"))
+                        .on_press(Message::HealthEntryRemoved(index))
+                        .style(action_style),
+                ]
+                .spacing(8)
+                .align_y(alignment::Vertical::Center),
+            );
+        }
+        content = content.push(
+            row![
+                button(self.t("添加地址", "Add URL"))
+                    .on_press_maybe((entries.len() < 8).then_some(Message::HealthEntryAdded))
+                    .style(action_style),
+                button(self.t("应用", "Apply")).on_press(Message::SaveHealthEditor),
+            ]
+            .spacing(10)
+            .wrap(),
+        );
+        self.dialog(
+            self.t("编辑健康探测地址", "Edit health check URLs"),
+            content.into(),
+            Message::CancelHealthEditor,
+        )
     }
 
     fn service_view(&self) -> Element<'_, Message> {
@@ -929,61 +1567,250 @@ impl App {
                     .style(button::secondary),
                 );
         }
-        content.push(card(column![text(self.t("管理说明", "Management")).size(21),
-            text(self.t("安装、卸载和更新系统后台需要管理员确认。修改校园账号、暂停和恢复自动认证不需要管理员权限。", "Installing, removing or updating the system service requires administrator approval. Managing campus accounts and pausing or resuming authentication does not.")),
-            text(self.t("服务未运行时不会自动改用第二个桌面控制器。可先使用安装包的后台服务维护选项。", "An unavailable installed service does not trigger a second desktop controller. Use the installer's service maintenance option when needed.")).size(13),
-            text(self.t("系统磁盘与网络需已解锁；软件不会绕过磁盘启动密码或 VPN 网络策略。", "The system disk and network must be unlocked. BitNet does not bypass disk startup passwords or VPN policy.")).size(12),
-        ].spacing(13))).into()
+        content.into()
+    }
+
+    pub(super) fn history_title(&self, kind: &str) -> &'static str {
+        match kind {
+            "reconnect" => self.t("校园网已恢复", "Campus connection restored"),
+            "login_success" => self.t("校园网登录成功", "Campus sign-in succeeded"),
+            "login_failure" => self.t("校园网登录失败", "Campus sign-in failed"),
+            "account_verification_failed" => self.t("账户验证失败", "Account verification failed"),
+            "account_saved" => self.t("账户已保存", "Account saved"),
+            "environment_observed" => self.t("网络状态已更新", "Network status updated"),
+            "online_segment" => self.t("在线时段", "Online period"),
+            "session_lost" => self.t("校园网认证已断开", "Campus session ended"),
+            "health_degraded" => self.t("互联网连接检查异常", "Internet connectivity issue"),
+            _ => self.t("其他事件", "Other activity"),
+        }
+    }
+
+    fn history_summary(&self, event: &HistoryEvent) -> String {
+        let duration = event
+            .duration_ms
+            .map(|ms| format_history_duration(ms, self.english()));
+        match event.kind.as_str() {
+            "reconnect" => duration.map_or_else(
+                || {
+                    self.t(
+                        "已确认恢复校园网连接。",
+                        "Campus connectivity was confirmed.",
+                    )
+                    .into()
+                },
+                |duration| format!("{} {duration}", self.t("恢复用时", "Recovery took")),
+            ),
+            "login_success" => duration.map_or_else(
+                || {
+                    self.t("已向校园网确认登录。", "The gateway confirmed the sign-in.")
+                        .into()
+                },
+                |duration| format!("{} {duration}", self.t("登录用时", "Sign-in took")),
+            ),
+            "environment_observed" => {
+                let auth = event
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("auth_state"))
+                    .and_then(serde_json::Value::as_str);
+                match auth {
+                    Some("authenticated") => {
+                        self.t("已确认校园网在线。", "Campus sign-in was confirmed.")
+                    }
+                    Some("unauthenticated") => {
+                        self.t("当前需要登录校园网。", "Campus sign-in is required.")
+                    }
+                    _ => self.t(
+                        "已检查当前网络和认证状态。",
+                        "The network and sign-in status were checked.",
+                    ),
+                }
+                .into()
+            }
+            "online_segment" => duration.map_or_else(
+                || {
+                    self.t(
+                        "记录了一段校园网在线时间。",
+                        "A period of campus connectivity was recorded.",
+                    )
+                    .into()
+                },
+                |duration| {
+                    format!(
+                        "{} {duration}",
+                        self.t("观测到连续在线", "Observed online for")
+                    )
+                },
+            ),
+            "session_lost" => self
+                .t("校园网要求重新登录。", "Campus sign-in is required again.")
+                .into(),
+            "health_degraded" => self
+                .t(
+                    "校园网登录仍有效，访问互联网出现异常。",
+                    "Campus sign-in is still active, but internet checks failed.",
+                )
+                .into(),
+            _ => event.message.clone(),
+        }
     }
 
     fn history_view(&self) -> Element<'_, Message> {
-        let mut content = column![row![text_input(self.t("按类型或内容筛选", "Filter by event type or message"), &self.history_filter).on_input(Message::HistoryFilterChanged).padding(10),
-            button(self.t("刷新历史", "Refresh activity")).on_press_maybe((!self.busy).then_some(Message::Run(Command::History { limit: 200 })))].spacing(12),
-            text(self.t("记录只包含脱敏事件。正常周期检查不会逐次写入日志。", "Only redacted activity is shown. Routine periodic checks are not logged individually.")).size(12),
-        ].spacing(14);
-        let filter = self.history_filter.to_lowercase();
+        let mut content = column![row![
+            text_input(self.t("筛选记录", "Filter activity"), &self.history_filter)
+                .on_input(Message::HistoryFilterChanged)
+                .padding(8),
+            button(self.t("刷新历史", "Refresh activity"))
+                .on_press_maybe(
+                    (!self.busy && self.snapshot_current).then_some(Message::HistoryLoad(false))
+                )
+                .style(action_style),
+            button(self.t("复制 JSON", "Copy JSON"))
+                .on_press_maybe((!self.history.is_empty()).then_some(Message::CopyHistory))
+                .style(action_style),
+            button(self.t("保存到文件…", "Save to file…"))
+                .on_press_maybe(
+                    (!self.history.is_empty()
+                        && !self.history_exporting
+                        && self.history_export_path.is_none())
+                    .then_some(Message::OpenHistoryExport)
+                )
+                .style(action_style),
+        ]
+        .spacing(10)
+        .align_y(alignment::Vertical::Center)
+        .wrap()]
+        .spacing(8);
+        content = content.push(
+            text(self.t(
+                "按 ↑ / ↓ 选择记录，按回车展开或收起。",
+                "Use ↑ / ↓ to select a record and Enter to expand or collapse it.",
+            ))
+            .size(12)
+            .style(text::secondary),
+        );
+        if let Some(path) = self.history_export_path.as_deref() {
+            let mut path_input = text_input(
+                self.t("完整的 JSON 文件路径", "Full path to a JSON file"),
+                path,
+            )
+            .padding(8);
+            if !self.history_exporting {
+                path_input = path_input
+                    .on_input(Message::HistoryExportPathChanged)
+                    .on_submit(Message::ExportHistory);
+            }
+            content = content.push(card(
+                column![
+                    text(self.t("导出当前载入的记录", "Export loaded activity")).size(16),
+                    path_input,
+                    row![
+                        button(self.t("保存 JSON", "Save JSON")).on_press_maybe(
+                            (!self.history_exporting && !path.trim().is_empty())
+                                .then_some(Message::ExportHistory)
+                        ),
+                        button(self.t("取消", "Cancel"))
+                            .on_press_maybe(
+                                (!self.history_exporting).then_some(Message::CloseHistoryExport)
+                            )
+                            .style(action_style),
+                    ]
+                    .spacing(10)
+                    .wrap(),
+                ]
+                .spacing(8),
+            ));
+        }
         let mut shown = 0;
-        for event in self.history.iter().rev().filter(|event| {
-            filter.is_empty()
-                || event.kind.to_lowercase().contains(&filter)
-                || event.message.to_lowercase().contains(&filter)
-        }) {
+        let now = bitnet_core::now_secs();
+        for event in self.visible_history() {
             shown += 1;
-            let mut event_content = column![
-                row![
-                    text(&event.kind).size(16),
-                    Space::new().width(Length::Fill),
-                    text(format_timestamp(Some(event.at))).size(12),
-                    button(self.t("详情", "Details"))
-                        .on_press(Message::HistoryDetailToggled(event.id))
-                        .style(button::text)
-                ],
-                text(&event.message),
-                text(format!(
-                    "#{}  {}",
+            let expanded = self.expanded_history.contains(&event.id);
+            let selected = self.history_selection == Some(event.id);
+            let heading = row![
+                text(if expanded { "▾" } else { "▸" }),
+                text(self.history_title(&event.kind))
+                    .size(16)
+                    .width(Length::Fill),
+                text(format_elapsed_minutes(
+                    now.saturating_sub(event.at),
+                    self.english()
+                ))
+                .size(12),
+            ]
+            .spacing(8)
+            .align_y(alignment::Vertical::Center);
+            let mut event_content = column![button(
+                column![heading, text(self.history_summary(event)).size(14)]
+                    .spacing(4)
+                    .width(Length::Fill)
+            )
+            .width(Length::Fill)
+            .on_press(Message::HistoryDetailToggled(event.id))
+            .padding([10, 14])
+            .style(move |theme, status| {
+                if selected {
+                    action_style(theme, status)
+                } else {
+                    button::background(theme, status)
+                }
+            }),]
+            .spacing(4);
+            if expanded {
+                let mut details = column![text(format!(
+                    "#{}  {}  {}",
                     event.id,
+                    event.kind,
                     event.account.as_deref().unwrap_or("")
                 ))
-                .size(11)
-            ]
-            .spacing(8);
-            if self.expanded_history == Some(event.id) {
+                .size(12)]
+                .spacing(3);
+                if let Some(payload) = &event.details {
+                    details = details.push(
+                        text(serde_json::to_string_pretty(payload).unwrap_or_default())
+                            .size(12)
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                    );
+                }
                 event_content = event_content.push(
-                    text(serde_json::to_string_pretty(&event.details).unwrap_or_default()).size(12),
+                    container(details)
+                        .padding(10)
+                        .width(Length::Fill)
+                        .style(container::bordered_box),
                 );
             }
-            content = content.push(card(event_content));
+            content = content.push(event_content);
         }
         if shown == 0 {
             content = content.push(card(text(self.t("暂无匹配记录", "No matching activity"))));
+        }
+        if self.history.len() == self.history_limit as usize && self.history_limit < 200 {
+            content = content.push(
+                button(self.t("加载更早记录", "Load older activity"))
+                    .on_press_maybe(
+                        (!self.busy && self.snapshot_current).then_some(Message::HistoryLoad(true)),
+                    )
+                    .style(action_style),
+            );
         }
         content.into()
     }
 
     fn statistics_view(&self) -> Element<'_, Message> {
-        let mut content = column![button(self.t("刷新统计", "Refresh statistics"))
-            .on_press_maybe((!self.busy).then_some(Message::Run(Command::Statistics)))]
-        .spacing(18);
+        let mut content = column![row![
+            text(Page::Statistics.label(self.english()))
+                .size(21)
+                .width(Length::Fill),
+            button(self.t("刷新统计", "Refresh statistics"))
+                .on_press_maybe(
+                    (!self.busy && self.snapshot_current)
+                        .then_some(Message::Run(Command::Statistics))
+                )
+                .style(action_style),
+        ]
+        .spacing(10)
+        .align_y(alignment::Vertical::Center)]
+        .spacing(9);
         if let Some(statistics) = &self.statistics {
             content = content.push(card(
                 column![
@@ -997,14 +1824,25 @@ impl App {
                     ),
                     pair(self.t("恢复连接", "Reconnections"), statistics.reconnects),
                     pair(self.t("事件总数", "Activity events"), statistics.events),
-                    pair(self.t("观测在线总时长", "Observed online duration"), format_duration(statistics.observed_online_seconds)),
-                    pair(self.t("最长观测在线段", "Longest observed online segment"), format_duration(statistics.longest_observed_online_seconds)),
-                    pair(self.t("观测会话中断", "Observed session interruptions"), statistics.session_interruptions),
-                    pair(self.t("健康异常次数", "Health anomalies"), statistics.health_anomalies),
-                    text(self.t("观测时长来自本地监测，不等同于校方计费时间。", "Observed durations come from local monitoring and are not campus billing time.")).size(12),
+                    pair(
+                        self.t("观测在线总时长", "Observed online duration"),
+                        format_duration(statistics.observed_online_seconds)
+                    ),
+                    pair(
+                        self.t("最长观测在线段", "Longest observed online segment"),
+                        format_duration(statistics.longest_observed_online_seconds)
+                    ),
+                    pair(
+                        self.t("观测会话中断", "Observed session interruptions"),
+                        statistics.session_interruptions
+                    ),
+                    pair(
+                        self.t("健康异常次数", "Health anomalies"),
+                        statistics.health_anomalies
+                    ),
                     pair(
                         self.t("最近成功", "Last success"),
-                        format_timestamp(statistics.last_success_at)
+                        self.relative_time(statistics.last_success_at)
                     ),
                     pair(
                         self.t("平均恢复时间", "Average recovery time"),
@@ -1014,55 +1852,39 @@ impl App {
                             .unwrap_or_else(|| "—".into())
                     ),
                 ]
-                .spacing(14),
+                .spacing(7),
             ));
         } else {
-            content = content.push(card(text(self.t(
-                "正在获取统计或尚无记录",
-                "Loading statistics, or no activity is available yet",
-            ))));
-        }
-        if let Some(snapshot) = &self.snapshot {
-            content = content.push(card(
-                column![
-                    text(self.t("校方网关统计", "Campus gateway totals")).size(21),
-                    pair(
-                        self.t("网关累计在线时长", "Gateway accumulated online time"),
-                        snapshot
-                            .session
-                            .online_seconds
-                            .map(format_duration)
-                            .unwrap_or_else(|| "—".into())
-                    ),
-                    pair(
-                        self.t("网关统计流量", "Gateway data usage"),
-                        snapshot
-                            .session
-                            .bytes_used
-                            .map(format_bytes)
-                            .unwrap_or_else(|| "—".into())
-                    ),
-                    text(self.t(
-                        "统计周期和计费口径以校方网关为准，不代表本次连续会话。",
-                        "The gateway defines the accounting period and billing rules; these are not totals for this connection.",
-                    )).size(12),
-                    pair(
-                        self.t("网络变化代次", "Network generation"),
-                        snapshot.network_generation
-                    ),
-                ]
-                .spacing(12),
-            ));
+            content = content.push(card(text(self.t("暂无统计数据", "No statistics yet"))));
         }
         content.into()
     }
 
     fn diagnostics_view(&self) -> Element<'_, Message> {
-        let mut content = column![card(column![text(self.t("按需诊断", "Diagnostics on demand")).size(24),
-            text(self.t("诊断由统一引擎执行，结果已脱敏；不会主动注销、重置网卡或修改 DNS。", "The engine produces redacted diagnostics without logging out, resetting adapters or changing DNS.")),
-            row![button(self.t("开始诊断", "Run diagnostics")).on_press_maybe((!self.busy).then_some(Message::Run(Command::Diagnose))),
-                button(self.t("复制诊断报告", "Copy report")).on_press_maybe((!self.diagnostics.is_empty()).then_some(Message::CopyDiagnostics)).style(button::secondary)].spacing(12),
-        ].spacing(13))].spacing(18);
+        let mut content = column![card(
+            column![
+                text(Page::Diagnostics.label(self.english())).size(21),
+                text(self.t(
+                    "检查当前网络并生成诊断报告。",
+                    "Check your network and generate a diagnostic report."
+                )),
+                row![
+                    button(self.t("开始诊断", "Run diagnostics")).on_press_maybe(
+                        (!self.busy && self.snapshot_current)
+                            .then_some(Message::Run(Command::Diagnose))
+                    ),
+                    button(self.t("复制诊断报告", "Copy report"))
+                        .on_press_maybe(
+                            (!self.diagnostics.is_empty()).then_some(Message::CopyDiagnostics)
+                        )
+                        .style(action_style)
+                ]
+                .spacing(10)
+                .wrap(),
+            ]
+            .spacing(9)
+        )]
+        .spacing(8);
         if !self.diagnostics.is_empty() {
             content = content.push(card(text(&self.diagnostics).size(13)));
         }
@@ -1099,7 +1921,9 @@ impl App {
         let (title, detail) = match confirmation {
             Confirmation::DeleteProfile(_) => (self.t("删除保存的认证环境？", "Delete this authentication profile?"), self.t("删除该环境快照，不删除账户密码。实际使用的认证目标和当前会话由引擎按统一规则处理。", "Remove this saved profile without deleting account passwords. The engine applies its shared rules to the active configuration and session.")),
             Confirmation::LoginOnce => (self.t("只在当前网络登录一次？", "Connect once on this untrusted network?"), self.t("确认当前网络和认证目标由你信任。本次操作会发送认证材料，但不会保存长期网络信任；后续自动认证仍需明确“信任当前网络”。HTTP 门户无法提供加密的服务器身份保证。", "Confirm that you trust this network and authentication endpoint. This sends authentication material once without saving network trust. Automatic authentication still requires trusting the network. An HTTP portal provides no cryptographic server identity guarantee.")),
-            Confirmation::TrustNetwork => (self.t("信任当前网络以允许自动认证？", "Trust this network for automatic authentication?"), self.t("仅在你已确认这是可用的校园认证环境时继续。引擎将记录当前接口、SSID、网关、来源网段和认证目标的指纹。此确认不是服务器证书验证，HTTP 门户无法抵御仿冒网络。", "Continue only after confirming this is a campus authentication environment. The engine records a fingerprint of the interface, SSID, gateway, source subnet and authentication endpoint. This is not certificate verification; an HTTP portal cannot protect against an impersonated network.")),
+            Confirmation::TrustNetwork => (self.t("信任当前网络？", "Trust this network?"), self.t("确认这是校园认证网络。信任后，BitNet 可在此网络自动使用已保存的账号登录。", "Confirm that this is the campus authentication network. Once trusted, BitNet can use your saved account to sign in automatically on this network.")),
+            Confirmation::EnableAutomatic { .. } => (self.t("信任当前网络并启用自动认证？", "Trust this network and enable automatic authentication?"), self.t("确认这是校园认证网络。启用后，BitNet 会在已信任的网络自动登录。", "Confirm that this is the campus authentication network. BitNet will then sign in automatically on trusted networks.")),
+            Confirmation::VerifyAccount { .. } => (self.t("验证这个校园账户？", "Verify this campus account?"), self.t("请确认这是校园认证网络。如果当前已登录，BitNet 会先退出该会话，再用新凭据尝试登录。网络可能短暂中断，验证通过后会保存并选中这个账户。", "Confirm that this network uses the campus portal. BitNet will sign out of any active session, then try the new credentials. The connection may drop briefly. A successful test saves and selects this account.")),
             Confirmation::Logout => (self.t("确认注销校园网？", "Disconnect the campus session?"), self.t("可能影响共享这个认证会话的设备。注销后自动认证保持暂停，直到你主动恢复。", "Devices sharing this session may lose connectivity. Automatic authentication stays paused until you resume it.")),
             Confirmation::ForceLogin => (self.t("强制重新认证？", "Force reauthentication?"), self.t("将执行完整的重新认证流程，可能影响共享连接。", "A full reauthentication may affect devices sharing this connection.")),
             Confirmation::DeleteAccount(_) => (self.t("删除保存的账户？", "Delete the saved account?"), self.t("账户及保存的密码将被删除。不会自动注销当前网络会话。", "The account and saved password will be removed. The current network session is not disconnected automatically.")),
@@ -1116,28 +1940,52 @@ impl App {
                 MaintenanceAction::CheckUpdate | MaintenanceAction::SetAutostart { .. } | MaintenanceAction::SetGuiAutostart { .. } => (self.t("应用维护操作？", "Apply this maintenance operation?"), self.t("将通过统一维护流程应用更改。", "The shared maintenance workflow will apply this change.")),
             },
         };
+        let mut contents = column![text(title).size(25)];
+        if let Confirmation::EnableAutomatic { adapter, .. } = confirmation {
+            contents = contents.push(text(adapter.clone()).size(18));
+        }
+        if let Confirmation::VerifyAccount {
+            username, adapter, ..
+        } = confirmation
+        {
+            contents = contents.push(text(format!("{username} · {adapter}")).size(18));
+        }
         container(
             card(
-                column![
-                    text(title).size(25),
-                    text(detail),
-                    row![
-                        button(self.t("取消", "Cancel"))
-                            .on_press(Message::Cancel)
-                            .style(button::secondary),
-                        button(self.t("确认继续", "Confirm"))
-                            .on_press_maybe((!self.busy).then_some(Message::Confirm))
+                contents
+                    .push(text(detail))
+                    .push(
+                        row![
+                            button(self.t("取消", "Cancel"))
+                                .on_press(Message::Cancel)
+                                .style(button::secondary),
+                            button(
+                                if matches!(confirmation, Confirmation::VerifyAccount { .. }) {
+                                    self.t("确认并验证", "Verify sign-in")
+                                } else {
+                                    self.t("确认继续", "Confirm")
+                                }
+                            )
+                            .on_press_maybe(
+                                (!self.busy
+                                    && (!matches!(
+                                        confirmation,
+                                        Confirmation::VerifyAccount { .. }
+                                    ) || self.snapshot_current))
+                                    .then_some(Message::Confirm)
+                            )
                             .style(button::danger)
-                    ]
-                    .spacing(14)
-                ]
-                .spacing(20),
+                        ]
+                        .spacing(14),
+                    )
+                    .spacing(20),
             )
             .max_width(640),
         )
         .center_x(Length::Fill)
         .center_y(Length::Fill)
-        .padding(40)
+        .padding(24)
+        .style(scrim)
         .into()
     }
 

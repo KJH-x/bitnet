@@ -91,6 +91,25 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
             }
             let wireless = a.IfType == IF_TYPE_IEEE80211;
             let ssid = if wireless { wifi_ssid(&a.Luid) } else { None };
+            let description = description.to_ascii_lowercase();
+            let mut interface_row = MIB_IF_ROW2 {
+                InterfaceLuid: a.Luid,
+                ..MIB_IF_ROW2::default()
+            };
+            // HardwareInterface is bit 0 of InterfaceAndOperStatusFlags.
+            let software = GetIfEntry2(&mut interface_row) == 0
+                && interface_row.InterfaceAndOperStatusFlags._bitfield & 1 == 0;
+            let alternate_adapter = software
+                || !matches!(a.IfType, IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211)
+                || [
+                    "bluetooth",
+                    "wi-fi direct",
+                    "vmware",
+                    "virtualbox",
+                    "hyper-v",
+                ]
+                .iter()
+                .any(|kind| description.contains(kind));
             out.push(NetworkInterface {
                 id,
                 name,
@@ -104,6 +123,7 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                     a.IfType,
                     IF_TYPE_TUNNEL | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_PPP
                 ) || super::is_tunnel(&description),
+                alternate_adapter,
             });
             row = a.Next;
         }

@@ -2,11 +2,11 @@
 
 北京理工大学校园网认证与连接管理器。Rust 核心、独立 Iced 软件渲染 GUI、CLI 与系统后台共用同一认证逻辑。
 
-**当前为开发版本。** 支持范围、实测结果与尚未完成的验收以 [STATUS](docs/STATUS.md) 为准；构建成功不代表已通过真实校园网或全部平台验证。
+**当前为开发版本。** 各平台的实现进度见 [实现与验证状态](docs/STATUS.md)。
 
 ## 使用方式
 
-- `bitnet-gui`：桌面界面，提供账户、网络、设置、后台、历史、统计、诊断和更新页面。
+- `bitnet-gui`：桌面界面，提供连接状态、账户管理、后台服务和软件设置。网卡、网络规则及日志在窗口内打开。
 - `bitctl`：交互式与自动化管理。密码通过隐藏输入或标准输入提交，不接受命令行密码参数。
 - `bitengine`：独立后台，用户模式或系统服务模式。GUI 退出不必终止认证引擎。
 - `bitmaint`：安装、修复、启动项和更新维护。系统操作按需授权，不常驻。
@@ -66,4 +66,4 @@ target/debug/bitctl.exe --data-dir $env:BITNET_DATA_DIR stop
 - [200 项需求覆盖矩阵](docs/FEATURE-MATRIX.md)
 - [依赖许可与来源](docs/LICENSES.md)
 
-代码采用 MIT 许可证。SRUN 编解码移植自 `so1ve/bitgateway`，上游版权和许可见 [gateway NOTICE](crates/bitnet-gateway/NOTICE)。`KJH-x/BIT-Connect` 与本地 netdiag 用作需求和设计参考。
+代码采用 MIT 许可证。校园网客户端的上游跟进目标是 [BITERNET（bitoolkit/biternet）](https://github.com/bitoolkit/biternet)，原名 BitGateway，协议库现名 `biternet-client`。本项目的 SRUN 编解码移植自迁移前的 `bitgateway-client`，原始提交、版权和许可见 [gateway NOTICE](crates/bitnet-gateway/NOTICE)。`KJH-x/BIT-Connect` 与本地 netdiag 用作需求和设计参考。

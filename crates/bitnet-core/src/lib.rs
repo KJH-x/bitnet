@@ -61,6 +61,9 @@ pub struct NetworkInterface {
     pub wireless: bool,
     pub ssid: Option<String>,
     pub virtual_adapter: bool,
+    /// Presentation hint only; it does not change the authentication route policy.
+    #[serde(default)]
+    pub alternate_adapter: bool,
 }
 impl NetworkInterface {
     pub fn binding(&self) -> Option<NetworkBinding> {
@@ -346,6 +349,8 @@ pub struct Snapshot {
     pub environment: Environment,
     #[serde(default)]
     pub network_trusted: bool,
+    #[serde(default)]
+    pub verification_hold: bool,
     pub session: GatewaySession,
     pub health: HealthStatus,
     pub interfaces: Vec<NetworkInterface>,
@@ -370,6 +375,7 @@ impl Snapshot {
             state: EngineState::Initializing,
             environment: Environment::Unknown,
             network_trusted: false,
+            verification_hold: false,
             session: GatewaySession::default(),
             health: HealthStatus::default(),
             interfaces: Vec::new(),
@@ -420,6 +426,9 @@ pub enum Command {
     },
     Pause,
     Resume,
+    EnableAutomatic {
+        expected_network: String,
+    },
     TrustNetwork {
         trusted: bool,
     },
@@ -437,6 +446,12 @@ pub enum Command {
         id: String,
         username: String,
         password: Secret,
+    },
+    VerifyAccount {
+        id: String,
+        username: String,
+        password: Secret,
+        expected_network: String,
     },
     AccountDelete {
         id: String,

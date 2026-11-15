@@ -245,7 +245,8 @@ async fn successful_login_discovers_ac_id_and_waits_for_actual_session() {
     let (client, server) = fixture(
         vec![
             step("/cgi-bin/rad_user_info", OFFLINE),
-            redirect("/", "/srun_portal_pc?ac_id=7"),
+            redirect("/", "/index_1.html"),
+            redirect("/index_1.html", "/srun_portal_pc?ac_id=7"),
             step("/cgi-bin/get_challenge", CHALLENGE),
             step("/cgi-bin/srun_portal", OK),
             step("/cgi-bin/rad_user_info", OFFLINE),
@@ -264,10 +265,11 @@ async fn successful_login_discovers_ac_id_and_waits_for_actual_session() {
         AuthState::Authenticated
     );
     let observed = finish(server).await;
-    let query: std::collections::HashMap<_, _> = observed[3].query_pairs().into_owned().collect();
+    let login = &observed[4];
+    let query: std::collections::HashMap<_, _> = login.query_pairs().into_owned().collect();
     assert_eq!(query.get("ac_id").unwrap(), "7");
     assert_eq!(query.get("action").unwrap(), "login");
-    assert!(!observed[3].as_str().contains("fixture-password"));
+    assert!(!login.as_str().contains("fixture-password"));
     assert!(query.get("info").unwrap().starts_with("{SRBX1}"));
 }
 
@@ -306,6 +308,59 @@ async fn already_online_is_idempotent_and_different_account_is_preserved() {
         .await
         .iter()
         .all(|url| url.path() == "/cgi-bin/rad_user_info"));
+}
+
+#[tokio::test]
+async fn credential_verification_requires_a_fresh_and_accepted_login() {
+    let (client, server) =
+        fixture(vec![step("/cgi-bin/rad_user_info", ONLINE)], Some("1"), 2).await;
+    assert_eq!(
+        client
+            .verify_credentials("fixture-user", "fixture-password", None)
+            .await
+            .unwrap_err(),
+        GatewayError::AccountMismatch
+    );
+    finish(server).await;
+
+    let rejected = r#"jsonp({"error":"login_error","error_msg":"You are already online"})"#;
+    let (client, server) = fixture(
+        vec![
+            step("/cgi-bin/rad_user_info", OFFLINE),
+            step("/cgi-bin/get_challenge", CHALLENGE),
+            step("/cgi-bin/srun_portal", rejected),
+        ],
+        Some("1"),
+        2,
+    )
+    .await;
+    assert_eq!(
+        client
+            .verify_credentials("fixture-user", "fixture-password", None)
+            .await
+            .unwrap_err(),
+        GatewayError::Rejected
+    );
+    finish(server).await;
+
+    let (client, server) = fixture(
+        vec![
+            step("/cgi-bin/rad_user_info", OFFLINE),
+            step("/cgi-bin/get_challenge", CHALLENGE),
+            step("/cgi-bin/srun_portal", OK),
+            step("/cgi-bin/rad_user_info", ONLINE),
+        ],
+        Some("1"),
+        2,
+    )
+    .await;
+    let session = client
+        .verify_credentials("fixture-user", "fixture-password", None)
+        .await
+        .unwrap();
+    assert_eq!(session.auth, AuthState::Authenticated);
+    assert_eq!(session.username.as_deref(), Some("fixture-user"));
+    finish(server).await;
 }
 
 #[tokio::test]

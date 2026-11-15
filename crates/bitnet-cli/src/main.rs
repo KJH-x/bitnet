@@ -686,7 +686,7 @@ fn print_data(value: ReplyData, json: bool) -> Result<(), AppError> {
                 "账户：{}  自动认证：{}  暂停：{}",
                 s.session.username.as_deref().unwrap_or("未知"),
                 s.settings.automatic,
-                s.settings.paused
+                s.settings.paused || s.verification_hold
             );
             if let Some(e) = s.last_error {
                 println!("提示：{}", e.message);

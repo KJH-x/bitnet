@@ -67,6 +67,7 @@ impl Tray {
     }
 
     pub fn update(&mut self, snapshot: &bitnet_core::Snapshot, english: bool) {
+        let paused = snapshot.settings.paused || snapshot.verification_hold;
         use bitnet_core::{AuthState, EngineState, Health};
         let state = if snapshot.session.auth == AuthState::Authenticated {
             if snapshot.health.internet == Health::Degraded {
@@ -79,7 +80,7 @@ impl Tray {
             EngineState::AuthError | EngineState::CredentialsUnavailable
         ) {
             2
-        } else if snapshot.settings.paused {
+        } else if paused {
             1
         } else if matches!(
             snapshot.state,
@@ -89,7 +90,7 @@ impl Tray {
         } else {
             3
         };
-        let key = (state, snapshot.settings.paused, english);
+        let key = (state, paused, english);
         if self.status == Some(key) {
             return;
         }
@@ -122,7 +123,7 @@ impl Tray {
             (_, false) => "正在检查",
             (_, true) => "Checking",
         };
-        let suffix = if state == 0 && snapshot.settings.paused {
+        let suffix = if state == 0 && paused {
             if english {
                 " · automatic authentication paused"
             } else {
