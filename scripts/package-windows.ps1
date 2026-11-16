@@ -1,6 +1,6 @@
 param(
     [ValidateSet('x86','x64','arm64')][string]$Arch='x64',
-    [string]$Version='0.1.1', [switch]$Development,
+    [string]$Version='0.1.2', [switch]$Development,
     [string]$SecretKey=$env:BITNET_RELEASE_SECRET_KEY_FILE,
     [string]$PublicKey=$env:BITNET_RELEASE_PUBLIC_KEY_FILE,
     [string]$Wix=$env:BITNET_WIX,
@@ -105,12 +105,20 @@ Copy-Item $service "$portable\packages\Service.msi"
 Copy-Item "$service.minisig" "$portable\packages\Service.msi.minisig"
 $zip=Join-Path $out "BitNet-$Version-windows-$Arch.zip"
 Compress-Archive -Path "$portable\*" -DestinationPath $zip -CompressionLevel Optimal -Force
-foreach($asset in @($client,$setup,$zip)) {
+$portableExe=Join-Path $out "BitNetPortable-$Version-windows-$Arch.exe"
+$payloadHashes=@('bitnet-gui','bitengine','bitctl','bitmaint') | ForEach-Object {
+    (Get-FileHash -LiteralPath "$portable\$_.exe" -Algorithm SHA256).Hash
+}
+$payloadBytes=[Text.Encoding]::ASCII.GetBytes(($payloadHashes -join ':'))
+$payloadHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($payloadBytes))
+& $MakeNsis /INPUTCHARSET UTF8 "/DSTAGE=$portable" "/DOUTPUT=$portableExe" "/DPAYLOAD_ID=$Version-$Arch-$payloadHash" "$root\installers\windows\Portable.nsi"
+if($LASTEXITCODE) {throw 'NSIS portable wrapper build failed'}
+foreach($asset in @($client,$setup,$zip,$portableExe)) {
     & $Minisign -S -s $SecretKey -m $asset -x "$asset.minisig" -t "BitNet $Version Windows $Arch" *> $null
     if($LASTEXITCODE) {throw 'Release artifact signing failed'}
     & $Minisign -V -p $PublicKey -m $asset -x "$asset.minisig" *> $null
     if($LASTEXITCODE) {throw 'Release artifact signature self-check failed'}
 }
-@($service,$client,$setup,$zip) | ForEach-Object {$item=Get-Item $_; "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant(),$item.Name} | Set-Content -Encoding ascii "$out\SHA256SUMS"
+@($service,$client,$setup,$zip,$portableExe) | ForEach-Object {$item=Get-Item $_; "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant(),$item.Name} | Set-Content -Encoding ascii "$out\SHA256SUMS"
 @{version=$Version;arch=$Arch;development=[bool]$Development;public_key=$publicLines[0];source_sha256=$fingerprint.source_sha256;wix_source='7.0.0/b8977d6f88e7b68e000bac226a2814f236770570';static_crt_imports_checked=$true;installation_tested=$false} | ConvertTo-Json | Set-Content -Encoding utf8 "$out\build-info.json"
 Write-Output "Built and signature-checked Windows packages: $out. Nothing was installed."

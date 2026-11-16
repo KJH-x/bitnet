@@ -156,6 +156,12 @@ enum NumericSetting {
 #[derive(Clone)]
 enum Confirmation {
     LoginOnce,
+    TemporaryLogin {
+        expected_network: String,
+        username: String,
+        adapter: String,
+        gateway: String,
+    },
     TrustNetwork,
     EnableAutomatic {
         expected_network: String,
@@ -230,12 +236,14 @@ enum Message {
     Tick,
     TrayTick,
     NotificationSent(Result<(), String>),
-    UpdateChecked(Result<UpdateOutcome, AppError>),
+    CheckUpdates,
+    UpdateChecked(Result<UpdateOutcome, AppError>, bool),
+    OpenReleasePage,
+    ReleasePageOpened(bool),
     Connected(Result<Snapshot, AppError>),
     Refreshed(u64, Result<Snapshot, AppError>),
     Completed(Result<ReplyData, AppError>),
     MaintenanceCompleted(Result<MaintenanceResult, AppError>),
-    Maintain(MaintenanceAction),
     Navigate(Page),
     ModeChanged(Mode),
     LanguageChanged(Language),
@@ -260,6 +268,9 @@ enum Message {
     Ask(Confirmation),
     Confirm,
     Cancel,
+    Escape,
+    KeyboardEnter,
+    MoveFocus(bool),
     DismissNotice,
     Refresh,
     UsernameChanged(String),
@@ -267,6 +278,8 @@ enum Message {
     AccountEdit(String),
     AccountCancel,
     AccountSave,
+    OpenQuickLogin,
+    TemporaryLogin,
     RuleNameChanged(String),
     ProfileIdChanged(String),
     ProfileNameChanged(String),
@@ -371,6 +384,19 @@ struct AccountDraft {
     username: String,
     password: String,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialRequest {
+    VerifyAccount,
+    VerifyQuickLogin,
+    TemporaryLogin,
+}
+impl CredentialRequest {
+    fn saves_account(self) -> bool {
+        self != Self::TemporaryLogin
+    }
+}
+
 impl Drop for AccountDraft {
     fn drop(&mut self) {
         self.password.zeroize();
@@ -398,6 +424,7 @@ struct App {
     language: Language,
     appearance: Appearance,
     account: AccountDraft,
+    quick_login: Option<AccountDraft>,
     rule: RuleDraft,
     profile_id: String,
     profile_name: String,
@@ -428,7 +455,7 @@ struct App {
     busy: bool,
     pending_settings: bool,
     pending_account_settings: Option<Settings>,
-    verifying_account: bool,
+    credential_request: Option<CredentialRequest>,
     settings_epoch: u64,
     saved_epoch: u64,
     request_epoch: u64,
@@ -450,7 +477,9 @@ impl App {
         };
         let client = Client::new(mode.into());
         let tray = tray::Tray::new().ok();
-        let hide = args.iter().any(|s| s == "--hidden") && tray.is_some();
+        let hide = args
+            .iter()
+            .any(|s| matches!(s.as_str(), "--hidden" | "--silent"));
         let app = Self {
             client,
             mode,
@@ -461,6 +490,7 @@ impl App {
             language: Language::Chinese,
             appearance: Appearance::System,
             account: AccountDraft::default(),
+            quick_login: None,
             rule: RuleDraft::default(),
             profile_id: String::new(),
             profile_name: String::new(),
@@ -491,7 +521,7 @@ impl App {
             busy: false,
             pending_settings: false,
             pending_account_settings: None,
-            verifying_account: false,
+            credential_request: None,
             settings_epoch: 0,
             saved_epoch: 0,
             request_epoch: 0,
@@ -542,6 +572,128 @@ impl App {
             Message::Ask(Confirmation::LoginOnce)
         }
     }
+    fn login_draft(&self) -> &AccountDraft {
+        self.quick_login.as_ref().unwrap_or(&self.account)
+    }
+    fn login_draft_mut(&mut self) -> &mut AccountDraft {
+        self.quick_login.as_mut().unwrap_or(&mut self.account)
+    }
+    fn take_confirmed_password(
+        &mut self,
+        username: &str,
+        expected_network: &str,
+    ) -> Option<Secret> {
+        if self.busy || !self.snapshot_current {
+            return None;
+        }
+        if self
+            .snapshot
+            .as_ref()
+            .and_then(confirmation_target)
+            .is_none_or(|(target, _)| target != expected_network)
+        {
+            self.login_draft_mut().password.zeroize();
+            self.show_notice(
+                true,
+                self.t(
+                    "登录网络已变化，请重新确认",
+                    "The sign-in network changed. Confirm the new network.",
+                )
+                .into(),
+            );
+            return None;
+        }
+        let draft = self.login_draft_mut();
+        if draft.username.trim() != username || draft.password.is_empty() {
+            return None;
+        }
+        Some(Secret::new(std::mem::take(&mut draft.password)))
+    }
+    fn prepare_login_confirmation(&mut self, temporary: bool) {
+        if self.busy
+            || !self.snapshot_current
+            || self.confirmation.is_some()
+            || (temporary && self.quick_login.is_none())
+        {
+            return;
+        }
+        let username = self.login_draft().username.trim().to_owned();
+        if username.is_empty() || self.login_draft().password.is_empty() {
+            self.show_notice(
+                true,
+                self.t(
+                    "请输入校园账号和密码",
+                    "Enter your campus username and password.",
+                )
+                .into(),
+            );
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        if temporary && snapshot.session.auth == AuthState::Authenticated {
+            self.show_notice(
+                true,
+                self.t(
+                    "已有校园网会话在线",
+                    "A campus network session is already active.",
+                )
+                .into(),
+            );
+            return;
+        }
+        let capability = if temporary {
+            "login_once"
+        } else {
+            "verify_account"
+        };
+        if !snapshot.capabilities.iter().any(|item| item == capability) {
+            self.show_notice(
+                true,
+                self.t(
+                    "请更新认证引擎后重试",
+                    "Update the authentication engine and try again.",
+                )
+                .into(),
+            );
+            return;
+        }
+        if bitnet_runtime::engine::uses_system_authentication(snapshot) {
+            self.show_notice(
+                true,
+                self.t(
+                    "BIT-mobile 由系统登录。请在使用校园门户的网络上继续。",
+                    "Your system signs in to BIT-mobile. Use a campus portal network to continue.",
+                )
+                .into(),
+            );
+            return;
+        }
+        let Some((expected_network, adapter)) = confirmation_target(snapshot) else {
+            self.show_notice(true, self.t(
+                "请先连接校园认证网络，或在「网络与规则」中选择网卡。",
+                "Connect to the campus portal network or choose an adapter in Network and rules.",
+            ).into());
+            return;
+        };
+        let confirmation = if temporary {
+            Confirmation::TemporaryLogin {
+                expected_network,
+                username,
+                adapter,
+                gateway: snapshot.settings.gateway.base_url.clone(),
+            }
+        } else {
+            Confirmation::VerifyAccount {
+                expected_network,
+                username,
+                adapter,
+            }
+        };
+        self.clear_notice();
+        self.confirmation = Some(confirmation);
+    }
     fn title(&self, _: window::Id) -> String {
         let app = if preview_only() {
             self.t("BitNet 预览", "BitNet Preview")
@@ -560,13 +712,24 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             iced::time::every(Duration::from_secs(2)).map(|_| Message::Tick),
-            iced::time::every(Duration::from_millis(250)).map(|_| Message::TrayTick),
+            if self.tray.is_some() {
+                iced::time::every(Duration::from_millis(250)).map(|_| Message::TrayTick)
+            } else {
+                Subscription::none()
+            },
             window::close_requests().map(Message::WindowCloseRequested),
             iced::keyboard::listen().filter_map(|event| match event {
                 iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                     ..
-                } => Some(Message::Cancel),
+                } => Some(Message::Escape),
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                    modifiers,
+                    ..
+                } if modifiers.is_empty() || modifiers == iced::keyboard::Modifiers::SHIFT => {
+                    Some(Message::MoveFocus(modifiers.shift()))
+                }
                 iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp),
                     modifiers,
@@ -578,10 +741,13 @@ impl App {
                     ..
                 } if modifiers.is_empty() => Some(Message::HistoryMoveSelection(true)),
                 iced::keyboard::Event::KeyPressed {
-                    key:
-                        iced::keyboard::Key::Named(
-                            iced::keyboard::key::Named::Enter | iced::keyboard::key::Named::Space,
-                        ),
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+                    modifiers,
+                    repeat: false,
+                    ..
+                } if modifiers.is_empty() => Some(Message::KeyboardEnter),
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
                     modifiers,
                     ..
                 } if modifiers.is_empty() => Some(Message::HistoryToggleSelection),
@@ -659,7 +825,14 @@ impl App {
         self.request_epoch = self.request_epoch.wrapping_add(1);
         self.pending_settings = matches!(command, Command::SettingsPut { .. });
         self.pending_check = matches!(command, Command::Check);
-        self.verifying_account = matches!(command, Command::VerifyAccount { .. });
+        self.credential_request = match &command {
+            Command::VerifyAccount { .. } if self.quick_login.is_some() => {
+                Some(CredentialRequest::VerifyQuickLogin)
+            }
+            Command::VerifyAccount { .. } => Some(CredentialRequest::VerifyAccount),
+            Command::LoginOnce { .. } => Some(CredentialRequest::TemporaryLogin),
+            _ => None,
+        };
         if self.pending_settings {
             self.saved_epoch = self.settings_epoch;
         }
@@ -672,7 +845,11 @@ impl App {
             let mut expected = snapshot.settings.clone();
             self.pending_account_settings = expected.revision.checked_add(1).map(|revision| {
                 expected.revision = revision;
-                if self.verifying_account || expected.selected_account.is_none() {
+                if self
+                    .credential_request
+                    .is_some_and(CredentialRequest::saves_account)
+                    || expected.selected_account.is_none()
+                {
                     expected.selected_account = Some(id.clone());
                 }
                 expected.blocked_accounts.retain(|blocked| blocked != id);
@@ -759,7 +936,17 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::TrayTick => {
-                if let Some(action) = tray::poll() {
+                if self
+                    .tray
+                    .as_ref()
+                    .is_some_and(|tray| !tray.is_starting() && !tray.is_available())
+                {
+                    self.tray = None;
+                    if self.window.is_none() && !self.connecting {
+                        return self.open_window();
+                    }
+                }
+                if let Some(action) = self.tray.as_ref().and_then(tray::Tray::poll) {
                     return match action {
                         tray::Action::Open => self.open_window(),
                         tray::Action::Check => self.execute(Command::Check),
@@ -798,8 +985,11 @@ impl App {
                         })
                         .map(|snapshot| {
                             Task::perform(
-                                update_policy::check(snapshot.scope, snapshot.settings.auto_update),
-                                Message::UpdateChecked,
+                                update_policy::check_desktop(
+                                    snapshot.scope,
+                                    snapshot.settings.auto_update,
+                                ),
+                                |result| Message::UpdateChecked(result, false),
                             )
                         })
                         .unwrap_or_else(Task::none)
@@ -818,7 +1008,33 @@ impl App {
                 }
                 Task::none()
             }
-            Message::UpdateChecked(result) => {
+            Message::OpenReleasePage => open_release_page(),
+            Message::ReleasePageOpened(opened) => {
+                if !opened {
+                    self.show_notice(
+                        true,
+                        self.t(
+                            "无法打开发布页面：https://github.com/KJH-x/bitnet/releases",
+                            "Could not open https://github.com/KJH-x/bitnet/releases",
+                        )
+                        .into(),
+                    );
+                }
+                Task::none()
+            }
+            Message::CheckUpdates => {
+                if preview_only() || !self.update_policy.begin_manual() {
+                    return Task::none();
+                }
+                let scope = self
+                    .snapshot
+                    .as_ref()
+                    .map_or(self.mode.into(), |snapshot| snapshot.scope);
+                Task::perform(update_policy::check_desktop(scope, false), |result| {
+                    Message::UpdateChecked(result, true)
+                })
+            }
+            Message::UpdateChecked(result, manual) => {
                 self.update_policy
                     .complete(result.is_ok(), bitnet_core::now_secs());
                 match result {
@@ -839,6 +1055,20 @@ impl App {
                     Ok(UpdateOutcome::InstallerStarted { message }) => {
                         self.show_notice(false, message)
                     }
+                    Ok(UpdateOutcome::PublicRelease { version }) => {
+                        self.show_notice(
+                            false,
+                            format!("{} {version}", self.t(
+                            "GitHub 已发布新版，可在「发布说明与下载」获取",
+                            "New GitHub release available under Release notes and downloads",
+                        )),
+                        )
+                    }
+                    Ok(UpdateOutcome::NoUpdate) if manual => self.show_notice(
+                        false,
+                        self.t("当前没有新版", "No newer release is available")
+                            .into(),
+                    ),
                     Ok(UpdateOutcome::NoUpdate | UpdateOutcome::Unconfigured) => {}
                     Err(error) => {
                         if self.notice.is_none() {
@@ -857,7 +1087,10 @@ impl App {
                         self.connection_error = Some(error);
                     }
                 }
-                let hidden = self.tray.is_some()
+                let hidden = self
+                    .tray
+                    .as_ref()
+                    .is_some_and(|tray| tray.is_starting() || tray.is_available())
                     && (self.startup_hidden || self.draft.settings.start_hidden);
                 if self.window.is_none() && !hidden {
                     self.open_window()
@@ -883,7 +1116,7 @@ impl App {
             }
             Message::Completed(result) => {
                 self.busy = false;
-                let verified_account = std::mem::take(&mut self.verifying_account);
+                let credential_request = self.credential_request.take();
                 let checked = std::mem::take(&mut self.pending_check);
                 let expected_account_settings = self.pending_account_settings.take();
                 match result {
@@ -905,14 +1138,26 @@ impl App {
                             self.draft.settings.blocked_accounts =
                                 snapshot.settings.blocked_accounts.clone();
                         }
-                        let (attention, message) = if verified_account {
-                            self.account = AccountDraft::default();
+                        let (attention, message) = if credential_request
+                            .is_some_and(CredentialRequest::saves_account)
+                        {
+                            if credential_request == Some(CredentialRequest::VerifyQuickLogin) {
+                                self.quick_login = None;
+                            } else {
+                                self.account = AccountDraft::default();
+                            }
                             (
                                 false,
                                 self.t(
                                     "登录验证通过，账户已保存",
                                     "Sign-in verified. Account saved.",
                                 ),
+                            )
+                        } else if credential_request == Some(CredentialRequest::TemporaryLogin) {
+                            self.quick_login = None;
+                            (
+                                false,
+                                self.t("已登录，未保存凭据", "Signed in for this session"),
                             )
                         } else if !checked {
                             (false, self.t("操作已完成", "Operation completed"))
@@ -955,7 +1200,9 @@ impl App {
                         }
                         self.show_notice(false, message);
                     }
-                    Err(error) if verified_account => self.show_notice(true, error.message),
+                    Err(error) if credential_request.is_some() => {
+                        self.show_notice(true, error.message)
+                    }
                     Err(error) => self.error(error),
                 }
                 self.pending_settings = false;
@@ -990,7 +1237,6 @@ impl App {
                     }
                 }
             },
-            Message::Maintain(action) => self.maintain(action),
             Message::MaintenanceCompleted(result) => {
                 self.busy = false;
                 match result {
@@ -1019,6 +1265,8 @@ impl App {
                 self.snapshot = None;
                 self.snapshot_current = false;
                 self.connection_error = None;
+                self.quick_login = None;
+                self.confirmation = None;
                 self.history.clear();
                 self.expanded_history.clear();
                 self.history_selection = None;
@@ -1059,25 +1307,35 @@ impl App {
                 self.open_window()
             }
             Message::Confirm => match self.confirmation.take() {
+                Some(Confirmation::TemporaryLogin {
+                    expected_network,
+                    username,
+                    ..
+                }) => {
+                    let Some(password) = self.take_confirmed_password(&username, &expected_network)
+                    else {
+                        return Task::none();
+                    };
+                    self.execute(Command::LoginOnce {
+                        username,
+                        password,
+                        expected_network,
+                    })
+                }
                 Some(Confirmation::VerifyAccount {
                     expected_network,
                     username,
                     ..
                 }) => {
-                    if self.busy
-                        || !self.snapshot_current
-                        || self.account.username.trim() != username
-                        || self.account.password.is_empty()
-                    {
+                    let Some(password) = self.take_confirmed_password(&username, &expected_network)
+                    else {
                         return Task::none();
-                    }
+                    };
                     let id = self
-                        .account
+                        .login_draft()
                         .id
                         .clone()
                         .unwrap_or_else(|| format!("account-{}", bitnet_core::now_ms()));
-                    let password = Secret::new(&self.account.password);
-                    self.account.password.zeroize();
                     self.execute(Command::VerifyAccount {
                         id,
                         username,
@@ -1122,23 +1380,59 @@ impl App {
                 None => Task::none(),
             },
             Message::Cancel => {
-                if self.confirmation.take().is_none() && self.health_editor.take().is_none() {
+                if self.confirmation.take().is_none()
+                    && self.health_editor.take().is_none()
+                    && self.quick_login.take().is_none()
+                {
                     self.modal = None;
                     self.enabling_automatic = false;
                 }
                 Task::none()
+            }
+            Message::Escape => {
+                if self.confirmation.is_some()
+                    || self.health_editor.is_some()
+                    || self.quick_login.is_some()
+                    || self.modal.is_some()
+                {
+                    return self.update(Message::Cancel);
+                }
+                match self.window {
+                    Some(id) if self.tray.as_ref().is_some_and(tray::Tray::is_available) => {
+                        self.update(Message::WindowCloseRequested(id))
+                    }
+                    _ => Task::none(),
+                }
+            }
+            Message::KeyboardEnter => {
+                if matches!(
+                    self.confirmation,
+                    Some(Confirmation::TemporaryLogin { .. } | Confirmation::VerifyAccount { .. })
+                ) {
+                    self.update(Message::Confirm)
+                } else {
+                    self.update(Message::HistoryToggleSelection)
+                }
+            }
+            Message::MoveFocus(previous) => {
+                if previous {
+                    iced::widget::operation::focus_previous()
+                } else {
+                    iced::widget::operation::focus_next()
+                }
             }
             Message::DismissNotice => {
                 self.clear_notice();
                 Task::none()
             }
             Message::UsernameChanged(value) => {
-                self.account.username = value;
+                self.login_draft_mut().username = value;
                 Task::none()
             }
             Message::PasswordChanged(value) => {
-                self.account.password.zeroize();
-                self.account.password = value;
+                let draft = self.login_draft_mut();
+                draft.password.zeroize();
+                draft.password = value;
                 Task::none()
             }
             Message::AccountEdit(id) => {
@@ -1159,47 +1453,16 @@ impl App {
                 self.account = AccountDraft::default();
                 Task::none()
             }
-            Message::AccountSave => {
+            Message::OpenQuickLogin => {
                 if self.busy || !self.snapshot_current {
                     return Task::none();
                 }
-                let username = self.account.username.trim().to_owned();
-                if username.is_empty() || self.account.password.is_empty() {
-                    self.error(AppError::new(ErrorCode::InvalidInput, self.t("请输入账号和新密码；保存的密码不会回显", "Enter an account and a new password; saved passwords are never displayed")));
-                    return Task::none();
-                }
-                let Some(snapshot) = &self.snapshot else {
-                    return Task::none();
-                };
-                if !snapshot
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability == "verify_account")
-                {
-                    self.show_notice(
-                        true,
-                        self.t(
-                            "请先更新认证引擎，再验证并保存账户。",
-                            "Update the authentication engine to verify and save accounts.",
-                        )
-                        .into(),
-                    );
-                    return Task::none();
-                }
-                if bitnet_runtime::engine::uses_system_authentication(snapshot) {
-                    self.show_notice(true, self.t("BIT-mobile 由系统登录。请在使用校园门户的网络上验证账户。", "Your system signs in to BIT-mobile. Verify this account on a campus portal network.").into());
-                    return Task::none();
-                }
-                let Some((expected_network, adapter)) = confirmation_target(snapshot) else {
-                    self.show_notice(true, self.t("请先连接校园认证网络，或在「网络与规则」中选择网卡。", "Connect to the campus portal network or choose an adapter in Network and rules.").into());
-                    return Task::none();
-                };
                 self.clear_notice();
-                self.confirmation = Some(Confirmation::VerifyAccount {
-                    expected_network,
-                    username,
-                    adapter,
-                });
+                self.quick_login = Some(AccountDraft::default());
+                iced::widget::operation::focus("quick-login-username")
+            }
+            Message::TemporaryLogin | Message::AccountSave => {
+                self.prepare_login_confirmation(matches!(message, Message::TemporaryLogin));
                 Task::none()
             }
             Message::LanguageChanged(language) => {
@@ -1734,7 +1997,9 @@ impl App {
             Message::WindowCloseRequested(id) => {
                 self.window = None;
                 self.account = AccountDraft::default();
-                if self.tray.is_some() {
+                self.quick_login = None;
+                self.confirmation = None;
+                if self.tray.as_ref().is_some_and(tray::Tray::is_available) {
                     window::close(id)
                 } else {
                     iced::exit()
@@ -1886,6 +2151,35 @@ fn write_history_export(
         .map_err(|error| error.kind())
 }
 
+fn open_release_page() -> Task<Message> {
+    const RELEASES: &str = "https://github.com/KJH-x/bitnet/releases";
+    #[cfg(windows)]
+    let launcher = match std::env::var_os("SystemRoot") {
+        Some(root) => std::path::PathBuf::from(root).join("explorer.exe"),
+        None => return Task::done(Message::ReleasePageOpened(false)),
+    };
+    #[cfg(target_os = "macos")]
+    let launcher = "/usr/bin/open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let launcher = "xdg-open";
+    let (sender, receiver) = iced::futures::channel::oneshot::channel();
+    let _ = std::thread::Builder::new().spawn(move || {
+        let opened = std::process::Command::new(launcher)
+            .arg(RELEASES)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            // Explorer may exit with code 1 after forwarding the URL.
+            .is_ok_and(|status| cfg!(windows) || status.success());
+        let _ = sender.send(opened);
+    });
+    Task::perform(
+        async move { receiver.await.unwrap_or(false) },
+        Message::ReleasePageOpened,
+    )
+}
+
 fn account_label(account: &AccountInfo) -> String {
     format!("{}  ·  {}", account.username, account.id)
 }
@@ -1916,6 +2210,7 @@ mod tests {
             language: Language::Chinese,
             appearance: Appearance::System,
             account: AccountDraft::default(),
+            quick_login: None,
             rule: RuleDraft::default(),
             profile_id: String::new(),
             profile_name: String::new(),
@@ -1946,7 +2241,7 @@ mod tests {
             busy: false,
             pending_settings: false,
             pending_account_settings: None,
-            verifying_account: false,
+            credential_request: None,
             settings_epoch: 0,
             saved_epoch: 0,
             request_epoch: 0,
@@ -2045,8 +2340,7 @@ mod tests {
         assert_eq!(app.draft.settings.revision, 7);
         assert_eq!(app.snapshot.as_ref().unwrap().settings.revision, 9);
     }
-    #[test]
-    fn account_save_waits_for_confirmation_and_failure_keeps_the_account_draft() {
+    fn login_fixture() -> App {
         let mut app = fixture();
         let mut snapshot = Snapshot::new(Scope::User);
         let adapter = bitnet_core::NetworkInterface {
@@ -2063,8 +2357,16 @@ mod tests {
         };
         snapshot.active_binding = adapter.binding();
         snapshot.interfaces.push(adapter);
-        snapshot.capabilities.push("verify_account".into());
+        snapshot
+            .capabilities
+            .extend(["verify_account".into(), "login_once".into()]);
         app.apply_snapshot(snapshot);
+        app
+    }
+
+    #[test]
+    fn account_save_waits_for_confirmation_and_failure_keeps_the_account_draft() {
+        let mut app = login_fixture();
         app.account.id = Some("existing".into());
         app.account.username = "test-user".into();
         app.account.password = "incorrect".into();
@@ -2080,7 +2382,7 @@ mod tests {
 
         let _ = app.update(Message::AccountSave);
         let _ = app.update(Message::Confirm);
-        assert!(app.verifying_account);
+        assert!(app.credential_request == Some(CredentialRequest::VerifyAccount));
         assert!(app.account.password.is_empty());
         let _ = app.update(Message::Completed(Err(AppError::new(
             ErrorCode::Credentials,
@@ -2094,6 +2396,35 @@ mod tests {
                 .map(|(err, message)| (*err, message.as_str())),
             Some((true, "Login failed"))
         );
+    }
+    #[test]
+    fn quick_login_uses_explicit_consent_without_changing_account_draft() {
+        let mut app = login_fixture();
+        app.account.username = "saved-draft".into();
+        app.account.password = "draft-secret".into();
+        let _ = app.update(Message::OpenQuickLogin);
+        let _ = app.update(Message::UsernameChanged("one-time".into()));
+        let _ = app.update(Message::PasswordChanged("one-time-secret".into()));
+        let _ = app.update(Message::TemporaryLogin);
+        assert!(matches!(
+            app.confirmation,
+            Some(Confirmation::TemporaryLogin { .. })
+        ));
+        assert!(!app.busy);
+
+        let _ = app.update(Message::Escape);
+        assert!(app.quick_login.is_some());
+        assert!(!app.busy);
+        let _ = app.update(Message::TemporaryLogin);
+        let _ = app.update(Message::KeyboardEnter);
+        assert!(app.credential_request == Some(CredentialRequest::TemporaryLogin));
+        assert!(app.quick_login.as_ref().unwrap().password.is_empty());
+        let _ = app.update(Message::Completed(Ok(ReplyData::Snapshot(Box::new(
+            Snapshot::new(Scope::User),
+        )))));
+        assert!(app.quick_login.is_none());
+        assert_eq!(app.account.username, "saved-draft");
+        assert_eq!(app.account.password, "draft-secret");
     }
     #[test]
     fn a_save_reply_does_not_discard_edits_made_while_saving() {
@@ -2157,7 +2488,7 @@ mod tests {
         );
         app.busy = false;
         app.connecting = true;
-        let _ = app.update(Message::Maintain(MaintenanceAction::ServiceInstall));
+        let _ = app.maintain(MaintenanceAction::ServiceInstall);
         assert!(
             !app.busy,
             "Maintenance waits until pending startup completes"

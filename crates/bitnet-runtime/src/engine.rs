@@ -69,6 +69,7 @@ impl Engine {
         snapshot.service = bitnet_platform::service::status();
         snapshot.capabilities.push("enable_automatic".into());
         snapshot.capabilities.push("verify_account".into());
+        snapshot.capabilities.push("login_once".into());
         let (vault, accounts) = if simulation {
             snapshot.capabilities.push("simulation".into());
             (
@@ -723,7 +724,7 @@ impl Engine {
         if ignored_network(&self.snapshot.settings, active_interface(&self.snapshot)) {
             return Err(AppError::new(
                 ErrorCode::InvalidInput,
-                "当前网络已设置为忽略，无法验证校园账户",
+                "当前网络已设置为忽略，无法进行此项认证",
             ));
         }
         if network_fingerprint(&self.snapshot).as_deref() != Some(expected_network) {
@@ -750,6 +751,60 @@ impl Engine {
             return Ok(self.simulation_session.clone());
         }
         observe_verification(gateway.status(Some(binding)), changes).await
+    }
+
+    async fn login_once(
+        &mut self,
+        username: String,
+        password: Secret,
+        expected_network: &str,
+    ) -> Result<(), AppError> {
+        GatewayClient::validate_credentials(&username, password.expose())
+            .map_err(|error| error.into_app_error())?;
+        let binding = self.verification_binding(expected_network, None).await?;
+        let mut config = self.snapshot.settings.gateway.clone();
+        config.timeout_secs = self
+            .snapshot
+            .settings
+            .request_timeout_secs
+            .min(VERIFICATION_STEP_TIMEOUT_SECS);
+        let gateway = GatewayClient::new(config).map_err(|error| error.into_app_error())?;
+        let current = self
+            .verification_status(&gateway, &binding, &mut None)
+            .await?;
+        if current.auth != AuthState::Unauthenticated {
+            return Err(AppError::new(
+                ErrorCode::ConfirmationRequired,
+                "请确认校园网当前未登录，再使用仅本次登录",
+            ));
+        }
+        self.verification_binding(expected_network, Some(&binding))
+            .await?;
+        let candidate = AccountSecret {
+            id: String::new(),
+            username,
+            password,
+        };
+        let session = if self.simulation {
+            self.simulate_login(&candidate)?
+        } else {
+            gateway
+                .verify_credentials(
+                    &candidate.username,
+                    candidate.password.expose(),
+                    Some(&binding),
+                )
+                .await
+                .map_err(|error| error.into_app_error())?
+        };
+        self.verification_binding(expected_network, Some(&binding))
+            .await?;
+        self.snapshot.session = session;
+        self.snapshot.last_success_at = Some(now_secs());
+        self.snapshot.last_error = None;
+        self.reconcile_auth(false).await?;
+        self.event("login_success", "仅本次登录成功", None, None);
+        Ok(())
     }
 
     async fn verify_account(
@@ -1238,6 +1293,14 @@ impl Engine {
                 self.login_selected(account_id.as_deref()).await?;
                 self.snapshot.verification_hold = false;
             }
+            Command::LoginOnce {
+                username,
+                password,
+                expected_network,
+            } => {
+                self.login_once(username, password, &expected_network)
+                    .await?;
+            }
             Command::Logout { confirmed } => {
                 if !confirmed {
                     return Err(AppError::new(
@@ -1692,6 +1755,10 @@ async fn ipv6_health(targets: &[String], timeout_secs: u64) -> Health {
                 continue;
             }
             let Some(host) = url.host_str() else { continue };
+            let host = match host.strip_prefix('[') {
+                Some(literal) => literal.strip_suffix(']').unwrap_or(literal),
+                None => host,
+            };
             let Some(port) = url.port_or_known_default() else {
                 continue;
             };
@@ -1785,7 +1852,13 @@ pub fn network_fingerprint(snapshot: &Snapshot) -> Option<String> {
         &octets[..3],
     ))
     .ok()?;
-    Some(format!("{:x}", Sha256::digest(context)))
+    let mut hash = Sha256::new();
+    hash.update(context);
+    let gateway = &snapshot.settings.gateway;
+    if gateway.request_ip.is_some() || gateway.dumb_terminal {
+        hash.update(serde_json::to_vec(&(gateway.request_ip, gateway.dumb_terminal)).ok()?);
+    }
+    Some(format!("{:x}", hash.finalize()))
 }
 
 pub fn resolve_account(
@@ -1892,17 +1965,18 @@ pub async fn run(scope: Scope, simulation: bool) -> Result<(), AppError> {
                 let Some(envelope)=envelope else{break};
                 let request_id=envelope.request.request_id;
                 let verification=matches!(&envelope.request.command,Command::VerifyAccount{..});
-                if verification {
+                let fresh_credentials=verification || matches!(&envelope.request.command,Command::LoginOnce{..});
+                if fresh_credentials {
                     if envelope.answer.is_closed() {
                         continue;
                     }
                     if envelope.queued_at.elapsed() > Duration::from_secs(3) {
-                        let result = Err(AppError::new(ErrorCode::Busy, "认证后台正忙，账户验证尚未开始，请重试"));
+                        let result = Err(AppError::new(ErrorCode::Busy, "认证后台正忙，本次操作尚未开始，请重试"));
                         let _ = envelope.answer.send(Reply { api_version: API_VERSION, request_id, result });
                         continue;
                     }
                 }
-                let network_command=matches!(&envelope.request.command,Command::Check|Command::Login{..}|Command::Logout{..}|Command::EnableAutomatic{..});
+                let network_command=matches!(&envelope.request.command,Command::Check|Command::Login{..}|Command::LoginOnce{..}|Command::Logout{..}|Command::EnableAutomatic{..});
                 let mut event=changes.receiver.clone();event.borrow_and_update();
                 let result=if network_command&&network_events_open&&!simulation{
                     tokio::select!{result=engine.execute(envelope.request.command,&envelope.caller)=>result,_=event.changed()=>{engine.next_check=now_secs()+2;Err(AppError::new(ErrorCode::Cancelled,"网络已变化，旧操作已取消；请先查看当前状态"))}}
@@ -2005,6 +2079,30 @@ mod tests {
             owner: true,
             administrator: false,
         }
+    }
+
+    #[tokio::test]
+    async fn one_time_login_keeps_settings_and_cannot_replace_an_online_session() {
+        let (mut engine, _) = isolated("one-time-login");
+        engine.check(false).await.unwrap();
+        let before = engine.snapshot.settings.clone();
+        let count = engine.accounts.len();
+        let expected_network = network_fingerprint(&engine.snapshot).unwrap();
+        let command = |username: &str| Command::LoginOnce {
+            username: username.into(),
+            password: Secret::new("synthetic"),
+            expected_network: expected_network.clone(),
+        };
+        engine.execute(command("once"), &owner()).await.unwrap();
+        assert_eq!(engine.snapshot.session.username.as_deref(), Some("once"));
+        let error = engine
+            .execute(command("second"), &owner())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ConfirmationRequired);
+        assert_eq!(engine.snapshot.session.username.as_deref(), Some("once"));
+        assert_eq!(engine.snapshot.settings, before);
+        assert_eq!(engine.accounts.len(), count);
     }
 
     #[tokio::test]
@@ -2626,7 +2724,7 @@ mod tests {
             listener.accept().await.unwrap();
         });
         assert_eq!(
-            ipv6_health(&[format!("http://localhost:{}", address.port())], 3).await,
+            ipv6_health(&[format!("http://{address}")], 3).await,
             Health::Healthy
         );
         accepted.await.unwrap();

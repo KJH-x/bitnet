@@ -12,7 +12,11 @@
 | `BITNET_UPDATE_FEED` | HTTPS manifest 的完整地址，例如自有域名的 `/releases/latest.json` |
 | `BITNET_UPDATE_ALLOWED_ORIGINS` | 可选的逗号分隔 HTTPS origin；默认只允许 feed 自身 origin |
 
-没有 feed 或公钥时，更新明确返回未配置；没有公钥时，Windows 离线服务安装也拒绝执行。项目没有内置开发用公钥或虚构更新源。生产签名私钥不放仓库、不放安装包，并应离线备份。更换信任公钥需要发布包含新公钥的可信客户端。
+缺少 feed 或公钥时，桌面版可从固定的 GitHub Releases API 查询正式版本，并在发现新版时提供手动下载入口。GitHub 元数据仅用于提示。自动或手动启动安装器仍要求签名更新清单和公钥。关闭「允许检查新版本」可停止定时查询。Windows 离线服务安装同样需要公钥。
+
+生产签名私钥独立保管。更换信任公钥需要发布包含新公钥的可信客户端。
+
+回退到 0.1.2 之前的版本时，先清除活动网关和已保存环境中的请求 IP 和哑终端注销选项。维护工具检测到不兼容配置时会停止回退。
 
 建议 Pages 提供 canonical HTTPS manifest，R2 自定义域名提供无需重定向的包下载。更新器拒绝 HTTP、代理、URL 用户名/密码、fragment，以及所有 HTTP 重定向。GitHub Releases 可作为人工下载镜像；其会跳转的浏览器下载链接不能直接用作当前自动更新地址。公开 HTTPS 文件托管即可，无需在线业务服务。
 

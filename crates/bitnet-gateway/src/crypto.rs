@@ -69,6 +69,14 @@ pub(crate) fn checksum(
     format!("{:x}", hash.finalize())
 }
 
+pub(crate) fn terminal_logout_signature(time: &str, username: &str, ip: &str) -> String {
+    let mut hash = Sha1::new();
+    for part in [time, username, ip, "1", time] {
+        hash.update(part.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
 pub(crate) fn valid_challenge(token: &str) -> bool {
     (16..=256).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_hexdigit())
 }

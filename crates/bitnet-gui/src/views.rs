@@ -253,7 +253,10 @@ impl App {
         let health_editor = self.health_editor.as_deref();
         let mut layers = stack([layer(
             content,
-            self.modal.is_some() || confirmation.is_some() || health_editor.is_some(),
+            self.modal.is_some()
+                || self.quick_login.is_some()
+                || confirmation.is_some()
+                || health_editor.is_some(),
         )]);
         if let Some(page) = self.modal {
             let content = match page {
@@ -263,7 +266,7 @@ impl App {
             };
             if let Some(content) = content {
                 layers = layers.push(layer(
-                    self.dialog(page.label(self.english()), content, Message::Cancel),
+                    self.dialog(page.label(self.english()), content, Message::Cancel, 880),
                     confirmation.is_some() || health_editor.is_some(),
                 ));
             }
@@ -271,6 +274,17 @@ impl App {
         if let Some(entries) = health_editor {
             layers = layers.push(layer(
                 self.health_editor_view(entries),
+                confirmation.is_some(),
+            ));
+        }
+        if let Some(draft) = &self.quick_login {
+            layers = layers.push(layer(
+                self.dialog(
+                    self.t("登录校园网", "Campus sign-in"),
+                    self.quick_login_view(draft),
+                    Message::Cancel,
+                    480,
+                ),
                 confirmation.is_some(),
             ));
         }
@@ -285,6 +299,7 @@ impl App {
         title: &'a str,
         content: Element<'a, Message>,
         close: Message,
+        max_width: u32,
     ) -> Element<'a, Message> {
         let heading = row![
             text(title).size(23).width(Length::Fill),
@@ -299,7 +314,7 @@ impl App {
             dialog = dialog.push(banner);
         }
         let body = smooth_scroll::vertical(content).scrollbar_spacing(8.0);
-        container(card(dialog.push(body)).max_width(880))
+        container(card(dialog.push(body)).max_width(max_width))
             .padding(24)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
@@ -370,6 +385,7 @@ impl App {
                     .on_press_maybe(
                         self.tray
                             .as_ref()
+                            .filter(|tray| tray.is_available())
                             .and(self.window)
                             .map(Message::WindowCloseRequested),
                     )
@@ -412,7 +428,7 @@ impl App {
                 .style(container::danger),
             );
         }
-        if self.modal.is_none() && self.health_editor.is_none() {
+        if self.modal.is_none() && self.health_editor.is_none() && self.quick_login.is_none() {
             if let Some(banner) = self.notice_banner() {
                 content = content.push(banner);
             }
@@ -483,6 +499,7 @@ impl App {
             AuthState::Unauthenticated => self.t("尚未认证", "Not authenticated"),
             AuthState::Unknown => self.t("状态待确认", "Authentication unknown"),
         };
+        let offline = snapshot.session.auth != AuthState::Authenticated;
         let state = card(
             column![
                 text(self.state_label(&snapshot.state)).size(34),
@@ -534,10 +551,15 @@ impl App {
                     "The campus gateway defines the accounting period; these totals are not the duration or usage of this connection.",
                 )).size(12),
                 row![
-                    button(self.t("登录", "Connect")).on_press_maybe(
-                        (portal_controls && !snapshot.accounts.is_empty())
-                            .then_some(Self::login_message(snapshot))
+                    button(self.t("登录…", "Sign in…")).on_press_maybe(
+                        (portal_controls && offline).then_some(Message::OpenQuickLogin)
                     ),
+                    button(self.t("使用已保存账户", "Use saved account"))
+                        .on_press_maybe(
+                            (portal_controls && offline && !snapshot.accounts.is_empty())
+                                .then_some(Self::login_message(snapshot))
+                        )
+                        .style(action_style),
                     button(self.t("注销…", "Disconnect…"))
                         .on_press_maybe(portal_controls.then_some(Message::Ask(Confirmation::Logout)))
                         .style(action_style),
@@ -695,7 +717,42 @@ impl App {
         .into()
     }
 
+    fn quick_login_view<'a>(&'a self, draft: &'a AccountDraft) -> Element<'a, Message> {
+        let editable = !self.busy;
+        let can_submit = editable
+            && self.snapshot_current
+            && !draft.username.trim().is_empty()
+            && !draft.password.is_empty();
+        column![
+            text_input(self.t("校园账号", "Campus username"), &draft.username)
+                .id("quick-login-username")
+                .on_input_maybe(editable.then_some(Message::UsernameChanged))
+                .on_submit_maybe(editable.then_some(Message::MoveFocus(false)))
+                .padding(10),
+            text_input(
+                self.t("校园网密码", "Campus network password"),
+                &draft.password
+            )
+            .secure(true)
+            .on_input_maybe(editable.then_some(Message::PasswordChanged))
+            .on_submit_maybe(can_submit.then_some(Message::TemporaryLogin))
+            .padding(10),
+            row![
+                button(self.t("仅登录本次…", "Sign in once…"))
+                    .on_press_maybe(can_submit.then_some(Message::TemporaryLogin)),
+                button(self.t("验证并保存…", "Verify and save…"))
+                    .on_press_maybe(can_submit.then_some(Message::AccountSave))
+                    .style(action_style),
+            ]
+            .spacing(10)
+            .wrap(),
+        ]
+        .spacing(13)
+        .into()
+    }
+
     fn accounts_view(&self) -> Element<'_, Message> {
+        let verifying = self.credential_request == Some(CredentialRequest::VerifyAccount);
         let mut content = column![text(self.t(
             "保存的密码只允许覆盖，不会显示或导出。",
             "Saved passwords can be replaced, never displayed or exported."
@@ -766,17 +823,21 @@ impl App {
                     self.t("校园账号", "Campus username"),
                     &self.account.username
                 )
-                .on_input_maybe((!self.verifying_account).then_some(Message::UsernameChanged))
+                .on_input_maybe((!verifying).then_some(Message::UsernameChanged))
+                .on_submit_maybe((!verifying).then_some(Message::MoveFocus(false)))
                 .padding(12),
                 text_input(
                     self.t("输入新的密码", "Enter a new password"),
                     &self.account.password
                 )
                 .secure(true)
-                .on_input_maybe((!self.verifying_account).then_some(Message::PasswordChanged))
+                .on_input_maybe((!verifying).then_some(Message::PasswordChanged))
+                .on_submit_maybe(
+                    (!self.busy && self.snapshot_current).then_some(Message::AccountSave)
+                )
                 .padding(12),
                 row![
-                    button(if self.verifying_account {
+                    button(if verifying {
                         self.t("正在验证登录…", "Verifying sign-in…")
                     } else {
                         self.t("验证并保存…", "Verify and save…")
@@ -785,7 +846,7 @@ impl App {
                         (!self.busy && self.snapshot_current).then_some(Message::AccountSave)
                     ),
                     button(self.t("清空 / 取消", "Clear / cancel"))
-                        .on_press_maybe((!self.verifying_account).then_some(Message::AccountCancel))
+                        .on_press_maybe((!verifying).then_some(Message::AccountCancel))
                         .style(action_style)
                 ]
                 .spacing(10),
@@ -1249,7 +1310,7 @@ impl App {
         if self.mode == Mode::System {
             preferences = preferences.push(text(self.t("个人登录启动项请切换到“自动选择”模式修改；该模式仍优先连接已安装的系统服务。", "Switch to Automatic mode to edit your personal login items. Automatic mode still prefers the installed system service.")).size(12));
         }
-        if self.tray.is_none() {
+        if !self.tray.as_ref().is_some_and(tray::Tray::is_available) {
             preferences = preferences.push(text(self.t("当前桌面未提供系统托盘；隐藏启动时将保留可访问窗口。", "No system tray is available on this desktop; hidden startup keeps an accessible window.")).size(12));
         }
         let mut advanced =
@@ -1446,6 +1507,7 @@ impl App {
             self.t("编辑健康探测地址", "Edit health check URLs"),
             content.into(),
             Message::CancelHealthEditor,
+            880,
         )
     }
 
@@ -1900,7 +1962,9 @@ impl App {
         column![card(column![text(self.t("版本与更新", "Version and updates")).size(24),
             pair(self.t("桌面客户端", "Desktop client"), APP_VERSION), pair(self.t("当前后台引擎", "Connected engine"), engine_version),
             pair(self.t("接口版本", "API version"), self.snapshot.as_ref().map(|s| s.api_version.to_string()).unwrap_or_else(|| "—".into())),
-            row![button(self.t("检查更新", "Check for updates")).on_press_maybe((!self.busy).then_some(Message::Maintain(MaintenanceAction::CheckUpdate))),
+            row![button(self.t("检查更新", "Check for updates")).on_press_maybe((!self.busy && !preview_only()).then_some(Message::CheckUpdates)),
+                button(self.t("发布说明与下载", "Release notes and downloads"))
+                    .on_press(Message::OpenReleasePage).style(action_style),
                 button(self.t("安装已验证更新…", "Install a verified update…"))
                     .on_press_maybe((!self.busy).then_some(Message::Ask(Confirmation::Maintenance(MaintenanceAction::InstallUpdate)))).style(button::secondary),
                 button(self.t("恢复上一已验证版本…", "Restore the previous verified version…"))
@@ -1921,6 +1985,7 @@ impl App {
         let (title, detail) = match confirmation {
             Confirmation::DeleteProfile(_) => (self.t("删除保存的认证环境？", "Delete this authentication profile?"), self.t("删除该环境快照，不删除账户密码。实际使用的认证目标和当前会话由引擎按统一规则处理。", "Remove this saved profile without deleting account passwords. The engine applies its shared rules to the active configuration and session.")),
             Confirmation::LoginOnce => (self.t("只在当前网络登录一次？", "Connect once on this untrusted network?"), self.t("确认当前网络和认证目标由你信任。本次操作会发送认证材料，但不会保存长期网络信任；后续自动认证仍需明确“信任当前网络”。HTTP 门户无法提供加密的服务器身份保证。", "Confirm that you trust this network and authentication endpoint. This sends authentication material once without saving network trust. Automatic authentication still requires trusting the network. An HTTP portal provides no cryptographic server identity guarantee.")),
+            Confirmation::TemporaryLogin { .. } => (self.t("确认仅登录本次？", "Confirm this one-time sign-in?"), self.t("请确认下方网卡和网关属于校园网。凭据只用于此次登录。", "Confirm the adapter and gateway belong to the campus network. Your credentials are used for this sign-in only.")),
             Confirmation::TrustNetwork => (self.t("信任当前网络？", "Trust this network?"), self.t("确认这是校园认证网络。信任后，BitNet 可在此网络自动使用已保存的账号登录。", "Confirm that this is the campus authentication network. Once trusted, BitNet can use your saved account to sign in automatically on this network.")),
             Confirmation::EnableAutomatic { .. } => (self.t("信任当前网络并启用自动认证？", "Trust this network and enable automatic authentication?"), self.t("确认这是校园认证网络。启用后，BitNet 会在已信任的网络自动登录。", "Confirm that this is the campus authentication network. BitNet will then sign in automatically on trusted networks.")),
             Confirmation::VerifyAccount { .. } => (self.t("验证这个校园账户？", "Verify this campus account?"), self.t("请确认这是校园认证网络。如果当前已登录，BitNet 会先退出该会话，再用新凭据尝试登录。网络可能短暂中断，验证通过后会保存并选中这个账户。", "Confirm that this network uses the campus portal. BitNet will sign out of any active session, then try the new credentials. The connection may drop briefly. A successful test saves and selects this account.")),
@@ -1950,6 +2015,17 @@ impl App {
         {
             contents = contents.push(text(format!("{username} · {adapter}")).size(18));
         }
+        if let Confirmation::TemporaryLogin {
+            username,
+            adapter,
+            gateway,
+            ..
+        } = confirmation
+        {
+            contents = contents
+                .push(text(format!("{username} · {adapter}")).size(18))
+                .push(text(gateway.clone()));
+        }
         container(
             card(
                 contents
@@ -1959,18 +2035,19 @@ impl App {
                             button(self.t("取消", "Cancel"))
                                 .on_press(Message::Cancel)
                                 .style(button::secondary),
-                            button(
-                                if matches!(confirmation, Confirmation::VerifyAccount { .. }) {
-                                    self.t("确认并验证", "Verify sign-in")
-                                } else {
-                                    self.t("确认继续", "Confirm")
-                                }
-                            )
+                            button(match confirmation {
+                                Confirmation::VerifyAccount { .. } =>
+                                    self.t("确认并验证", "Verify sign-in"),
+                                Confirmation::TemporaryLogin { .. } =>
+                                    self.t("确认登录", "Sign in"),
+                                _ => self.t("确认继续", "Confirm"),
+                            })
                             .on_press_maybe(
                                 (!self.busy
                                     && (!matches!(
                                         confirmation,
                                         Confirmation::VerifyAccount { .. }
+                                            | Confirmation::TemporaryLogin { .. }
                                     ) || self.snapshot_current))
                                     .then_some(Message::Confirm)
                             )

@@ -38,14 +38,24 @@ async fn fixture(
     ac_id: Option<&str>,
     timeout_secs: u64,
 ) -> (GatewayClient, JoinHandle<Vec<Url>>) {
+    fixture_with_config(
+        steps,
+        GatewayConfig {
+            ac_id: ac_id.map(str::to_owned),
+            timeout_secs,
+            ..GatewayConfig::default()
+        },
+    )
+    .await
+}
+async fn fixture_with_config(
+    steps: Vec<Step>,
+    mut config: GatewayConfig,
+) -> (GatewayClient, JoinHandle<Vec<Url>>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
-    let client = GatewayClient::new(GatewayConfig {
-        base_url: format!("http://{address}"),
-        ac_id: ac_id.map(str::to_owned),
-        timeout_secs,
-    })
-    .unwrap();
+    config.base_url = format!("http://{address}");
+    let client = GatewayClient::new(config).unwrap();
     let server = tokio::spawn(async move {
         let mut observed = Vec::new();
         for step in steps {
@@ -81,6 +91,46 @@ async fn finish(server: JoinHandle<Vec<Url>>) -> Vec<Url> {
         .await
         .expect("fixture did not receive expected requests")
         .unwrap()
+}
+
+#[tokio::test]
+async fn terminal_logout_requires_the_observed_session_and_confirms_offline() {
+    let (client, server) = fixture_with_config(
+        vec![
+            step("/cgi-bin/rad_user_info", ONLINE),
+            step("/cgi-bin/rad_user_dm", OK),
+            step("/cgi-bin/rad_user_info", OFFLINE),
+        ],
+        GatewayConfig {
+            request_ip: Some(Ipv4Addr::new(10, 1, 2, 3)),
+            dumb_terminal: true,
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        client.logout("fixture-user", None).await.unwrap().auth,
+        AuthState::Unauthenticated
+    );
+    let requests = finish(server).await;
+    assert!(requests[1]
+        .query_pairs()
+        .any(|(key, value)| key == "sign" && value.len() == 40));
+
+    let (client, server) = fixture_with_config(
+        vec![step("/cgi-bin/rad_user_info", ONLINE)],
+        GatewayConfig {
+            request_ip: Some(Ipv4Addr::new(10, 1, 2, 4)),
+            dumb_terminal: true,
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        client.logout("fixture-user", None).await.unwrap_err(),
+        GatewayError::InvalidBinding
+    );
+    assert_eq!(finish(server).await.len(), 1);
 }
 
 #[test]

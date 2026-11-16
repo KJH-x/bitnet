@@ -1,10 +1,20 @@
 name: Build and package
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      production:
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
   windows:
     runs-on: windows-2022
+    environment: ${{ inputs.production && 'release' || 'development' }}
     strategy:
       fail-fast: false
       matrix:
@@ -24,13 +34,28 @@ jobs:
         run: cargo test --workspace
       - run: ./scripts/bootstrap-tools.ps1
       - run: ./scripts/build-wix-source.ps1 -PlatformToolset v143
-      - run: ./scripts/package-windows.ps1 -Arch ${{ matrix.arch }} -Development
+      - if: inputs.production
+        run: python scripts/prepare-ci-signing.py
+        env:
+          BITNET_SIGNING_SECRET: ${{ secrets.BITNET_SIGNING_SECRET }}
+          BITNET_SIGNING_PUBLIC: ${{ vars.BITNET_SIGNING_PUBLIC }}
+      - if: inputs.production
+        run: ./scripts/package-windows.ps1 -Arch ${{ matrix.arch }}
+        env:
+          BITNET_UPDATE_FEED: ${{ vars.BITNET_UPDATE_FEED }}
+      - if: '!inputs.production'
+        run: ./scripts/package-windows.ps1 -Arch ${{ matrix.arch }} -Development
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-${{ matrix.arch }}-development
+          name: windows-${{ matrix.arch }}-${{ inputs.production && 'production' || 'development' }}
           path: dist/windows-${{ matrix.arch }}/
   linux:
     runs-on: ${{ matrix.runner }}
+    environment: ${{ inputs.production && 'release' || 'development' }}
+    env:
+      OPENSSL_STATIC: '1'
+      DEVELOPMENT: ${{ inputs.production && '0' || '1' }}
+      BITNET_UPDATE_FEED: ${{ inputs.production && vars.BITNET_UPDATE_FEED || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -42,20 +67,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libx11-dev libxkbcommon-dev libwayland-dev libfontconfig1-dev minisign
-      - run: sh scripts/prepare-signing.sh --development && cat .local/release-keys/public.env >> "$GITHUB_ENV"
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libx11-dev libxkbcommon-dev libwayland-dev libfontconfig1-dev minisign rpm squashfs-tools
+      - if: inputs.production
+        run: python3 scripts/prepare-ci-signing.py
+        env:
+          BITNET_SIGNING_SECRET: ${{ secrets.BITNET_SIGNING_SECRET }}
+          BITNET_SIGNING_PUBLIC: ${{ vars.BITNET_SIGNING_PUBLIC }}
+      - if: '!inputs.production'
+        run: sh scripts/prepare-signing.sh --development && cat .local/release-keys/public.env >> "$GITHUB_ENV"
+      - run: sh scripts/bootstrap-appimage.sh >> "$GITHUB_ENV"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: python3 scripts/fingerprint-source.py --write .local/build-source-before.json
       - run: cargo build --release --workspace --bins
       - run: python3 scripts/fingerprint-source.py --check .local/build-source-before.json --write target/release/bitnet-build-source.json
-      - run: DEVELOPMENT=1 ARCH=${{ matrix.arch }} sh scripts/package-linux.sh
+      - run: EXTRA_FORMATS=1 ARCH=${{ matrix.arch }} sh scripts/package-linux.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-${{ matrix.arch }}-development
+          name: linux-${{ matrix.arch }}-${{ inputs.production && 'production' || 'development' }}
           path: dist/linux-${{ matrix.arch }}/
   linux-i386:
+    if: '!inputs.production'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -82,6 +115,10 @@ jobs:
           path: dist/linux-i386/
   macos:
     runs-on: ${{ matrix.runner }}
+    environment: ${{ inputs.production && 'release' || 'development' }}
+    env:
+      DEVELOPMENT: ${{ inputs.production && '0' || '1' }}
+      BITNET_UPDATE_FEED: ${{ inputs.production && vars.BITNET_UPDATE_FEED || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -94,15 +131,21 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: brew install minisign
-      - run: sh scripts/prepare-signing.sh --development && cat .local/release-keys/public.env >> "$GITHUB_ENV"
+      - if: inputs.production
+        run: python3 scripts/prepare-ci-signing.py
+        env:
+          BITNET_SIGNING_SECRET: ${{ secrets.BITNET_SIGNING_SECRET }}
+          BITNET_SIGNING_PUBLIC: ${{ vars.BITNET_SIGNING_PUBLIC }}
+      - if: '!inputs.production'
+        run: sh scripts/prepare-signing.sh --development && cat .local/release-keys/public.env >> "$GITHUB_ENV"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: python3 scripts/fingerprint-source.py --write .local/build-source-before.json
       - run: cargo build --release --workspace --bins
       - run: python3 scripts/fingerprint-source.py --check .local/build-source-before.json --write target/release/bitnet-build-source.json
-      - run: DEVELOPMENT=1 ARCH=${{ matrix.arch }} sh scripts/package-macos.sh
+      - run: ARCH=${{ matrix.arch }} sh scripts/package-macos.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.arch }}-development
+          name: macos-${{ matrix.arch }}-${{ inputs.production && 'production' || 'development' }}
           path: dist/macos-${{ matrix.arch }}/

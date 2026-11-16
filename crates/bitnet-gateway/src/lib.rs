@@ -10,7 +10,7 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use std::{
     fmt,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     time::Duration,
 };
 use tokio::{
@@ -24,6 +24,8 @@ const MAX_BODY: usize = 64 * 1024;
 const MAX_LOCATION: usize = 4096;
 const CONFIRM_ATTEMPTS: usize = 4;
 const CONFIRM_INTERVAL: Duration = Duration::from_millis(250);
+const CAMPUS_ORIGIN: &str = "http://10.0.0.55/";
+const CAPTIVE_HOST: &str = "www.bit.edu.cn";
 
 /// Only static messages are exposed: transport errors and response bodies may
 /// contain credentials or complete authentication URLs.
@@ -90,6 +92,8 @@ pub struct GatewayClient {
     address: SocketAddrV4,
     configured_ac_id: Option<String>,
     timeout: Duration,
+    request_ip: Option<Ipv4Addr>,
+    dumb_terminal: bool,
 }
 impl fmt::Debug for GatewayClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -116,6 +120,9 @@ impl GatewayClient {
             || ip.is_broadcast()
             || !(1..=60).contains(&config.timeout_secs)
             || config.ac_id.as_ref().is_some_and(|id| !valid_ac_id(id))
+            || config
+                .request_ip
+                .is_some_and(|ip| ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast())
         {
             return Err(GatewayError::InvalidConfiguration);
         }
@@ -127,6 +134,8 @@ impl GatewayClient {
             origin,
             configured_ac_id: config.ac_id,
             timeout: Duration::from_secs(config.timeout_secs),
+            request_ip: config.request_ip,
+            dumb_terminal: config.dumb_terminal,
         })
     }
 
@@ -244,7 +253,7 @@ impl GatewayClient {
                 Err(GatewayError::AccountMismatch)
             };
         }
-        let ip = current.ip.ok_or(GatewayError::InvalidResponse)?.to_string();
+        let ip = self.portal_ip(&current, binding)?.to_string();
         // Deliberately rediscovered for every operation: ac_id belongs to a
         // network, not to the process. Explicit administrative override is stable.
         let ac_id = self.discover_ac_id(binding).await?;
@@ -300,23 +309,60 @@ impl GatewayClient {
         if current.username.as_deref() != Some(username) {
             return Err(GatewayError::AccountMismatch);
         }
-        let ip = current.ip.ok_or(GatewayError::InvalidResponse)?.to_string();
-        let ac_id = self.discover_ac_id(binding).await?;
-        let url = self.endpoint(
-            "/cgi-bin/srun_portal",
-            &[
-                ("callback", "jsonp"),
-                ("action", "logout"),
-                ("username", username),
-                ("ac_id", &ac_id),
-                ("ip", &ip),
-            ],
-        )?;
+        let ip = self.portal_ip(&current, binding)?.to_string();
+        let url = if self.dumb_terminal {
+            // This mode only targets the session the gateway just confirmed.
+            if current.ip.map(|address| address.to_string()).as_deref() != Some(ip.as_str()) {
+                return Err(GatewayError::InvalidBinding);
+            }
+            let time = bitnet_core::now_secs().to_string();
+            let sign = crypto::terminal_logout_signature(&time, username, &ip);
+            self.endpoint(
+                "/cgi-bin/rad_user_dm",
+                &[
+                    ("callback", "jsonp"),
+                    ("username", username),
+                    ("ip", &ip),
+                    ("time", &time),
+                    ("unbind", "1"),
+                    ("sign", &sign),
+                ],
+            )?
+        } else {
+            let ac_id = self.discover_ac_id(binding).await?;
+            self.endpoint(
+                "/cgi-bin/srun_portal",
+                &[
+                    ("callback", "jsonp"),
+                    ("action", "logout"),
+                    ("username", username),
+                    ("ac_id", &ac_id),
+                    ("ip", &ip),
+                ],
+            )?
+        };
         let result = self.request(&url, binding).await.and_then(|r| {
             r.ensure_success()?;
             parse_portal(&r.body)
         });
         self.confirm(username, false, result, binding).await
+    }
+
+    fn portal_ip(
+        &self,
+        session: &GatewaySession,
+        binding: Option<&NetworkBinding>,
+    ) -> Result<Ipv4Addr, GatewayError> {
+        let observed = session.ip.ok_or(GatewayError::InvalidResponse)?;
+        match self.request_ip {
+            Some(ip)
+                if ip == observed || binding.is_some_and(|binding| binding.source_ip == ip) =>
+            {
+                Ok(ip)
+            }
+            Some(_) => Err(GatewayError::InvalidBinding),
+            None => Ok(observed),
+        }
     }
 
     async fn confirm(
@@ -360,7 +406,57 @@ impl GatewayClient {
         if let Some(id) = &self.configured_ac_id {
             return Ok(id.clone());
         }
-        let mut url = self.origin.clone();
+        let result = self.discover_from(self.origin.clone(), binding).await;
+        if matches!(
+            result,
+            Err(GatewayError::DiscoveryFailed | GatewayError::HttpStatus(404))
+        ) && self.origin.as_str() == CAMPUS_ORIGIN
+        {
+            if let Some(binding) = binding {
+                return self.discover_captive(binding).await;
+            }
+        }
+        result
+    }
+
+    async fn discover_captive(&self, binding: &NetworkBinding) -> Result<String, GatewayError> {
+        // A fixed, credential-free probe. Only its Location may feed the
+        // normal discovery flow, and only when it points to our gateway.
+        let address = tokio::net::lookup_host((CAPTIVE_HOST, 80))
+            .await
+            .map_err(|_| GatewayError::DiscoveryFailed)?
+            .find_map(|address| match address {
+                SocketAddr::V4(address)
+                    if !address.ip().is_unspecified()
+                        && !address.ip().is_multicast()
+                        && !address.ip().is_broadcast()
+                        && !address.ip().is_loopback() =>
+                {
+                    Some(address)
+                }
+                _ => None,
+            })
+            .ok_or(GatewayError::DiscoveryFailed)?;
+        let url =
+            Url::parse("http://www.bit.edu.cn/").map_err(|_| GatewayError::InvalidConfiguration)?;
+        let response = Self::request_at(address, &url, Some(binding)).await?;
+        if !response.status.is_redirection() {
+            return Err(GatewayError::DiscoveryFailed);
+        }
+        let next = url
+            .join(&response.location.ok_or(GatewayError::DiscoveryFailed)?)
+            .map_err(|_| GatewayError::DiscoveryFailed)?;
+        if let Some(id) = self.discovery_target(&next)? {
+            return Ok(id);
+        }
+        self.discover_from(next, Some(binding)).await
+    }
+
+    async fn discover_from(
+        &self,
+        mut url: Url,
+        binding: Option<&NetworkBinding>,
+    ) -> Result<String, GatewayError> {
         for _ in 0..4 {
             let response = self.request(&url, binding).await?;
             if response.status.is_redirection() {
@@ -368,39 +464,8 @@ impl GatewayClient {
                 let next = url
                     .join(&location)
                     .map_err(|_| GatewayError::DiscoveryFailed)?;
-                if !self.same_origin(&next) {
-                    return Err(GatewayError::RedirectRejected);
-                }
-                let ids: Vec<_> = next
-                    .query_pairs()
-                    .filter(|(name, _)| name == "ac_id")
-                    .map(|(_, value)| value.into_owned())
-                    .collect();
-                if ids.len() > 1 {
-                    return Err(GatewayError::InvalidResponse);
-                }
-                if let Some(id) = ids.into_iter().next() {
-                    return if valid_ac_id(&id) {
-                        Ok(id)
-                    } else {
-                        Err(GatewayError::DiscoveryFailed)
-                    };
-                }
-                // Discovery must never be turned into a login/logout request
-                // by a redirect. Only fixed presentation pages may be visited;
-                // a Location containing ac_id is inspected, not requested.
-                if ![
-                    "/",
-                    "/index.html",
-                    "/index_1.html",
-                    "/srun_portal_pc",
-                    "/srun_portal",
-                    "/srun_portal_success",
-                    "/portal",
-                ]
-                .contains(&next.path())
-                {
-                    return Err(GatewayError::RedirectRejected);
+                if let Some(id) = self.discovery_target(&next)? {
+                    return Ok(id);
                 }
                 url = next;
             } else {
@@ -409,6 +474,39 @@ impl GatewayClient {
             }
         }
         Err(GatewayError::DiscoveryFailed)
+    }
+
+    fn discovery_target(&self, next: &Url) -> Result<Option<String>, GatewayError> {
+        if !self.same_origin(next) {
+            return Err(GatewayError::RedirectRejected);
+        }
+        let mut ids = next.query_pairs().filter(|(name, _)| name == "ac_id");
+        if let Some((_, id)) = ids.next() {
+            if ids.next().is_some() {
+                return Err(GatewayError::InvalidResponse);
+            }
+            return if valid_ac_id(&id) {
+                Ok(Some(id.into_owned()))
+            } else {
+                Err(GatewayError::DiscoveryFailed)
+            };
+        }
+        // Follow fixed portal presentation pages only. A Location containing
+        // ac_id is inspected without fetching it.
+        if ![
+            "/",
+            "/index.html",
+            "/index_1.html",
+            "/srun_portal_pc",
+            "/srun_portal",
+            "/srun_portal_success",
+            "/portal",
+        ]
+        .contains(&next.path())
+        {
+            return Err(GatewayError::RedirectRejected);
+        }
+        Ok(None)
     }
 
     fn same_origin(&self, url: &Url) -> bool {
@@ -437,6 +535,14 @@ impl GatewayClient {
         if !self.same_origin(url) {
             return Err(GatewayError::RedirectRejected);
         }
+        Self::request_at(self.address, url, binding).await
+    }
+
+    async fn request_at(
+        address: SocketAddrV4,
+        url: &Url,
+        binding: Option<&NetworkBinding>,
+    ) -> Result<Response, GatewayError> {
         let socket = TcpSocket::new_v4().map_err(|_| GatewayError::Transport)?;
         if let Some(binding) = binding {
             binding::apply(&socket, binding)?;
@@ -445,7 +551,7 @@ impl GatewayClient {
             .set_nodelay(true)
             .map_err(|_| GatewayError::Transport)?;
         let stream = socket
-            .connect(self.address.into())
+            .connect(address.into())
             .await
             .map_err(|_| GatewayError::Transport)?;
         let (mut sender, connection) = http1::Builder::new()

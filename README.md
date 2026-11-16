@@ -4,6 +4,8 @@
 
 **当前为开发版本。** 各平台的实现进度见 [实现与验证状态](docs/STATUS.md)。
 
+公开分发入口为 [GitHub Releases](https://github.com/KJH-x/bitnet/releases)。桌面端可在连接页仅登录本次，也可验证并保存账户。Windows、macOS 和支持 StatusNotifierItem 的 Linux 桌面可用 `--silent` 启动至托盘。
+
 ## 使用方式
 
 - `bitnet-gui`：桌面界面，提供连接状态、账户管理、后台服务和软件设置。网卡、网络规则及日志在窗口内打开。

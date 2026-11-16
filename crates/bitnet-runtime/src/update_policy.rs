@@ -1,6 +1,7 @@
 //! Personal GUI update scheduling. Authentication and Status never await it.
 use crate::maintenance::updates::UpdateConfig;
 use bitnet_core::{AppError, ErrorCode, Scope, Settings};
+use std::time::Duration;
 
 pub const STARTUP_DELAY_SECS: u64 = 30;
 pub const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
@@ -9,6 +10,9 @@ pub const FAILURE_BACKOFF_SECS: u64 = 60 * 60;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateOutcome {
     Available {
+        version: String,
+    },
+    PublicRelease {
         version: String,
     },
     NoUpdate,
@@ -66,6 +70,14 @@ impl UpdatePolicy {
             FAILURE_BACKOFF_SECS
         });
     }
+
+    pub fn begin_manual(&mut self) -> bool {
+        if self.in_flight {
+            return false;
+        }
+        self.in_flight = true;
+        true
+    }
 }
 
 /// Run as an independent GUI task, never on the authentication state machine.
@@ -91,6 +103,76 @@ pub async fn check(scope: Scope, auto_update: bool) -> Result<UpdateOutcome, App
     Ok(UpdateOutcome::Available {
         version: manifest.version,
     })
+}
+
+/// Public metadata can prompt a manual download. Signed manifests are the
+/// only inputs accepted by the installer.
+pub async fn check_desktop(scope: Scope, auto_update: bool) -> Result<UpdateOutcome, AppError> {
+    const LATEST: &str = "https://api.github.com/repos/KJH-x/bitnet/releases/latest";
+    const MAX_BYTES: usize = 256 * 1024;
+    if UpdateConfig::configured() {
+        return check(scope, auto_update).await;
+    }
+    let fail = || AppError::new(ErrorCode::Unavailable, "无法查询 BitNet 发布版本");
+    let mut response = reqwest::Client::builder()
+        .https_only(true)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| fail())?
+        .get(LATEST)
+        .header(reqwest::header::USER_AGENT, "BitNet")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|_| fail())?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(UpdateOutcome::NoUpdate);
+    }
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|size| size > MAX_BYTES as u64)
+    {
+        return Err(fail());
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| fail())? {
+        if chunk.len() > MAX_BYTES - data.len() {
+            return Err(fail());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    let release: PublicReleaseInfo = serde_json::from_slice(&data).map_err(|_| fail())?;
+    Ok(public_release_outcome(release, bitnet_core::APP_VERSION))
+}
+
+#[derive(serde::Deserialize)]
+struct PublicReleaseInfo {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+}
+
+fn public_release_outcome(release: PublicReleaseInfo, current: &str) -> UpdateOutcome {
+    use semver::Version;
+    if !release.draft && !release.prerelease {
+        if let (Some(candidate), Ok(current)) = (
+            release
+                .tag_name
+                .strip_prefix('v')
+                .and_then(|tag| Version::parse(tag).ok()),
+            Version::parse(current),
+        ) {
+            if candidate.pre.is_empty() && candidate > current {
+                return UpdateOutcome::PublicRelease {
+                    version: candidate.to_string(),
+                };
+            }
+        }
+    }
+    UpdateOutcome::NoUpdate
 }
 
 fn auto_install_allowed(
@@ -205,5 +287,37 @@ mod tests {
                 UpdateOutcome::Unconfigured
             );
         }
+    }
+
+    #[test]
+    fn public_release_metadata_can_only_offer_manual_download() {
+        for (tag, draft, prerelease) in [
+            ("v0.1.2", false, false),
+            ("v0.1.3", true, false),
+            ("v0.1.3", false, true),
+            ("v0.1.3-rc.1", false, false),
+            ("https://example.test/download", false, false),
+        ] {
+            let info = PublicReleaseInfo {
+                tag_name: tag.into(),
+                draft,
+                prerelease,
+            };
+            assert_eq!(
+                public_release_outcome(info, "0.1.2"),
+                UpdateOutcome::NoUpdate
+            );
+        }
+        let info = PublicReleaseInfo {
+            tag_name: "v0.1.3".into(),
+            draft: false,
+            prerelease: false,
+        };
+        assert_eq!(
+            public_release_outcome(info, "0.1.2"),
+            UpdateOutcome::PublicRelease {
+                version: "0.1.3".into()
+            }
+        );
     }
 }

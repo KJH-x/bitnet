@@ -2,7 +2,7 @@
 # Build-only: never executes maintainer scripts, starts services, or installs packages.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-version=${VERSION:-0.1.1}
+version=${VERSION:-0.1.2}
 arch=${ARCH:-$(dpkg --print-architecture)}
 glibc_min=${GLIBC_MIN:-$(getconf GNU_LIBC_VERSION | awk '{print $2}')}
 case "$arch" in amd64|arm64|i386) ;; *) echo 'Supported package architectures: amd64 arm64 i386' >&2; exit 2;; esac
@@ -27,7 +27,9 @@ test -n "${BITNET_RELEASE_PUBLIC_KEY:-}"; test -f "$secret"; test -f "$public"
 if [ -n "${BITNET_UPDATE_FEED:-}" ]; then
     grep -aF "$BITNET_RELEASE_PUBLIC_KEY" "$bin/bitmaint" >/dev/null || { echo 'Rebuild bitmaint with this public key' >&2; exit 2; }
 fi
-out=$root/dist/linux-$arch
+suffix=${OUTPUT_SUFFIX:-}
+case "$suffix" in *[!a-z0-9-]*) echo 'Invalid package output suffix' >&2; exit 2;; esac
+out=$root/dist/linux-$arch${suffix:+-$suffix}
 target=$(case "$arch" in amd64) printf x86_64-unknown-linux-gnu;; arm64) printf aarch64-unknown-linux-gnu;; i386) printf i686-unknown-linux-gnu;; esac)
 licenses=$root/build/licenses/linux-$arch
 mkdir -p "$licenses/native"
@@ -44,6 +46,7 @@ mkdir -p "$root/build"
 stage=${BUILD_DIR:-$(mktemp -d "$root/build/linux-$arch.XXXXXXXX")}
 test -d "$stage" || mkdir -p "$stage"
 mkdir -p "$stage/core/DEBIAN" "$stage/core/usr/bin" "$stage/core/usr/libexec/bitnet" "$stage/core/usr/lib/bitnet/templates" "$stage/core/lib/systemd/system" "$stage/gui/DEBIAN" "$stage/gui/usr/bin" "$stage/gui/usr/share/applications" "$stage/portable/bitnet-$version"
+mkdir -p "$stage/gui/usr/share/icons/hicolor/scalable/apps"
 for name in bitengine bitctl bitmaint; do install -m 0755 "$bin/$name" "$stage/core/usr/bin/$name"; done
 install -m 0755 "$bin/bitmaint" "$stage/core/usr/libexec/bitnet/bitmaint"
 install -m 0755 "$bin/bitnet-gui" "$stage/gui/usr/bin/bitnet-gui"
@@ -51,6 +54,7 @@ install -m 0644 "$root/installers/linux/bitnet.service" "$stage/core/lib/systemd
 install -m 0644 "$root/installers/linux/bitnet.service" "$stage/core/usr/lib/bitnet/templates/bitnet.service"
 for script in postinst prerm postrm; do install -m 0755 "$root/installers/linux/$script" "$stage/core/DEBIAN/$script"; done
 install -m 0644 "$root/installers/linux/bitnet.desktop" "$stage/gui/usr/share/applications/bitnet.desktop"
+install -m 0644 "$root/installers/linux/bitnet.svg" "$stage/gui/usr/share/icons/hicolor/scalable/apps/bitnet.svg"
 for package in core gui; do
     docs=$stage/$package/usr/share/doc/bitnet-$package
     mkdir -p "$docs"
@@ -92,10 +96,16 @@ mkdir -p "$stage/portable/bitnet-$version/licenses"
 cp "$root/crates/bitnet-gateway/NOTICE" "$stage/portable/bitnet-$version/licenses/GATEWAY-NOTICE.txt"
 cp "$licenses/THIRD-PARTY-NOTICES.txt" "$licenses/THIRD-PARTY-NOTICES.json" "$stage/portable/bitnet-$version/licenses/"
 python3 "$root/scripts/build-user-tar.py" "$stage/portable/bitnet-$version" "$out/bitnet-user-$version-linux-$arch.tar.gz"
-for asset in "$out"/*.deb "$out"/*.tar.gz; do
+set -- "$out/bitnet-core_${version}_${arch}.deb" "$out/bitnet-gui_${version}_${arch}.deb" "$out/bitnet-user-$version-linux-$arch.tar.gz"
+if [ "${EXTRA_FORMATS:-0}" = 1 ]; then
+    sh "$root/scripts/package-linux-extras.sh" "$stage" "$out" "$version" "$arch" "$glibc_min"
+    case "$arch" in amd64) rpmarch=x86_64;; arm64) rpmarch=aarch64;; esac
+    set -- "$@" "$out/BitNet-$version-linux-$arch.AppImage" "$out/bitnet-$version-1.$rpmarch.rpm"
+fi
+for asset do
     "$minisign" -S -s "$secret" -m "$asset" -x "$asset.minisig" >/dev/null 2>&1
     "$minisign" -V -p "$public" -m "$asset" -x "$asset.minisig" >/dev/null 2>&1
 done
-(cd "$out" && sha256sum ./*.deb ./*.tar.gz > SHA256SUMS)
+for asset do (cd "$out" && sha256sum "${asset##*/}"); done > "$out/SHA256SUMS"
 printf 'Built packages in %s; nothing was installed.\n' "$out"
 if [ -f "$bin/bitnet-build-source.json" ]; then cp "$bin/bitnet-build-source.json" "$out/build-source.json"; fi

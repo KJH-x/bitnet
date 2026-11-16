@@ -295,6 +295,23 @@ async fn execute_inner(
             scope == Scope::System || cfg!(not(windows)),
         )?;
         let previous = cache.previous(&config, bitnet_core::APP_VERSION)?;
+        let version = semver::Version::parse(&previous.release.manifest.version)
+            .map_err(|_| err(ErrorCode::Incompatible, "Invalid cached version"))?;
+        if version < semver::Version::new(0, 1, 2) {
+            let paths = bitnet_platform::paths(scope)?;
+            let settings = crate::persistence::read_settings(&paths.config_file)?;
+            let has_extended_gateway_settings = |gateway: &bitnet_core::GatewayConfig| {
+                gateway.request_ip.is_some() || gateway.dumb_terminal
+            };
+            if has_extended_gateway_settings(&settings.gateway)
+                || settings
+                    .profiles
+                    .iter()
+                    .any(|profile| has_extended_gateway_settings(&profile.gateway))
+            {
+                return Err(err(ErrorCode::Incompatible, "Clear the request IP and terminal logout options in the active gateway and saved profiles before rolling back below 0.1.2"));
+            }
+        }
         let assets = previous.release.manifest.assets_for_install(scope)?;
         let mut packages = Vec::new();
         for (asset, source) in assets.iter().zip(&previous.packages) {

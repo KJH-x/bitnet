@@ -104,6 +104,13 @@ pub struct GatewayConfig {
     pub base_url: String,
     pub ac_id: Option<String>,
     pub timeout_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_ip: Option<Ipv4Addr>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub dumb_terminal: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !value
 }
 impl Default for GatewayConfig {
     fn default() -> Self {
@@ -111,6 +118,8 @@ impl Default for GatewayConfig {
             base_url: "http://10.0.0.55".into(),
             ac_id: None,
             timeout_secs: 10,
+            request_ip: None,
+            dumb_terminal: false,
         }
     }
 }
@@ -420,6 +429,11 @@ pub enum Command {
         account_id: Option<String>,
         force: bool,
         confirmed: bool,
+    },
+    LoginOnce {
+        username: String,
+        password: Secret,
+        expected_network: String,
     },
     Logout {
         confirmed: bool,

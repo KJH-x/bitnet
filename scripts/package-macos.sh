@@ -3,7 +3,7 @@
 set -eu
 test "$(uname -s)" = Darwin || { echo 'macOS packaging requires a macOS build host' >&2; exit 2; }
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-version=${VERSION:-0.1.1}; arch=${ARCH:-$(uname -m)}
+version=${VERSION:-0.1.2}; arch=${ARCH:-$(uname -m)}
 case "$arch" in x86_64|aarch64|arm64) ;; *) exit 2;; esac
 bin=${BIN_DIR:-$root/target/release}; stage=$root/build/macos-$arch; out=$root/dist/macos-$arch
 python3 "$root/scripts/fingerprint-source.py" --check "$bin/bitnet-build-source.json" >/dev/null
@@ -82,10 +82,12 @@ cp "$service" "$stage/dmg/Install Background Service.pkg"
 cp "$service.minisig" "$stage/dmg/Install Background Service.pkg.minisig"
 ln -s /Applications "$stage/dmg/Applications"
 hdiutil create -quiet -volname BitNet -srcfolder "$stage/dmg" -format UDZO "$out/BitNet-$version-macos-$arch.dmg"
-for asset in "$client" "$pkg" "$out/BitNet-$version-macos-$arch.dmg"; do
+app_archive=$out/BitNet-$version-macos-$arch.app.tar.gz
+tar -czf "$app_archive" -C "$stage/payload/Applications" BitNet.app
+for asset in "$client" "$pkg" "$out/BitNet-$version-macos-$arch.dmg" "$app_archive"; do
     "$minisign" -S -s "$secret" -m "$asset" -x "$asset.minisig" >/dev/null 2>&1
     "$minisign" -V -p "$public" -m "$asset" -x "$asset.minisig" >/dev/null 2>&1
 done
-(cd "$out" && shasum -a 256 ./*.pkg ./*.dmg > SHA256SUMS)
+(cd "$out" && shasum -a 256 ./*.pkg ./*.dmg ./*.app.tar.gz > SHA256SUMS)
 if [ -f "$bin/bitnet-build-source.json" ]; then cp "$bin/bitnet-build-source.json" "$out/build-source.json"; fi
 printf 'Built and project-signature-checked %s. Apple Gatekeeper may require manual approval.\n' "$out"

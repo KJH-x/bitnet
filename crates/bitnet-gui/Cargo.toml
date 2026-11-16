@@ -19,7 +19,9 @@ notify-rust = { version = "=4.17.0", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio", "advanced", "advanced-shaping", "x11", "wayland", "linux-theme-detection"] }
+ksni = "0.3.7"
 notify-rust = { version = "=4.17.0", default-features = false, features = ["z-with-tokio"] }
+tokio.workspace = true
 
 [[bin]]
 name = "bitnet-gui"

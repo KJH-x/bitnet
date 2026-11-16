@@ -1,6 +1,8 @@
 The SRUN protocol encoding in src/crypto.rs is adapted from:
 https://github.com/so1ve/bitgateway/tree/39da1f51dd91690612b5fa6200030ebe59915873/crates/bitgateway-client/src
 Upstream crypto.rs and xencode.rs; upstream credits spencerwooo/bitsrun-rs.
+Terminal logout compatibility follows BITERNET's SRUN client:
+https://github.com/bitoolkit/biternet/blob/557c704bd1d516b8d4e9c14ac68f0b252ab8a5fe/crates/biternet-client/src/crypto.rs
 
 MIT License
 

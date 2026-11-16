@@ -1,0 +1,106 @@
+name: Publish signed BitNet release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          with open("Cargo.toml", "rb") as file:
+              version = tomllib.load(file)["workspace"]["package"]["version"]
+          if os.environ["GITHUB_REF"] != f"refs/tags/v{version}" or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              raise SystemExit("Select the exact v<workspace version> tag")
+          PY
+  build:
+    needs: validate
+    uses: ./.github/workflows/build.yml
+    with:
+      production: true
+    secrets: inherit
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    concurrency:
+      group: bitnet-release-${{ github.ref_name }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-production'
+          path: packages
+      - run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Collect signed files
+        env:
+          BITNET_SIGNING_PUBLIC: ${{ vars.BITNET_SIGNING_PUBLIC }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import re
+          import shutil
+          from pathlib import Path
+          kinds = (".rpm", ".deb", ".AppImage", ".tar.gz", ".dmg", ".pkg", ".msi", ".exe", ".zip")
+          target = Path("release")
+          target.mkdir()
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          packages = Path("packages")
+          expected = {"windows-x64", "windows-x86", "windows-arm64",
+                      "linux-amd64", "linux-arm64", "macos-x86_64", "macos-arm64"}
+          if {path.name for path in packages.iterdir()} != {name + "-production" for name in expected}:
+              raise SystemExit("Incomplete production build matrix")
+          for directory in sorted(packages.iterdir()):
+              if not directory.is_dir() or not re.fullmatch(r"(windows|linux|macos)-[a-z0-9_]+-production", directory.name):
+                  raise SystemExit("Unexpected build artifact")
+              platform = directory.name.removesuffix("-production")
+              for package in sorted(directory.iterdir()):
+                  if not package.is_file() or not package.name.endswith(kinds):
+                      continue
+                  signed = package.with_name(package.name + ".minisig")
+                  if not signed.is_file():
+                      raise SystemExit(f"Signature missing for {package}")
+                  name = package.name
+                  if name in {"Client.msi", "Service.msi", "Client.pkg", "Service.pkg"}:
+                      name = f"BitNet-{version}-{platform}-{name}"
+                  for source, filename in ((package, name), (signed, name + ".minisig")):
+                      dest = target / filename
+                      if dest.exists():
+                          raise SystemExit(f"Artifact name collision: {filename}")
+                      shutil.copyfile(source, dest)
+          lines = [line.strip() for line in os.environ["BITNET_SIGNING_PUBLIC"].splitlines()
+                   if line.strip() and not line.startswith("untrusted comment:")]
+          if len(lines) != 1 or not re.fullmatch(r"[A-Za-z0-9+/=]{56}", lines[0]):
+              raise SystemExit("Missing release public key")
+          if not any(target.iterdir()):
+              raise SystemExit("No signed artifacts to publish")
+          (target / "bitnet-public.minisign.pub").write_text(
+              "untrusted comment: BitNet release public key\n" + lines[0] + "\n", encoding="ascii"
+          )
+          with (target / "SHA256SUMS").open("w", encoding="ascii") as sums:
+              for file in sorted(target.iterdir()):
+                  if file.name != "SHA256SUMS":
+                      with file.open("rb") as data:
+                          sums.write(f"{hashlib.file_digest(data, 'sha256').hexdigest()}  {file.name}\n")
+          PY
+      - name: Verify signatures
+        run: |
+          for signature in release/*.minisig; do
+            minisign -Vm "${signature%.minisig}" -x "$signature" -p release/bitnet-public.minisign.pub
+          done
+      - name: Publish
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes release/*

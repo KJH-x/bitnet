@@ -47,6 +47,29 @@ Ubuntu 24.04 等较新系统可由管理员将主密钥转为 `systemd-creds --w
 
 无需管理员的个人模式使用 `bitnet-user-*.tar.gz`，同目录启动 `bitnet-gui` 或 `bitctl`。账号加密主密钥放入桌面 Secret Service，需要 `libsecret-tools` 和已解锁的提供程序，例如 GNOME Keyring 或启用 Secret Service 的 KeePassXC。它不能代替无人登录时的系统服务模式；缺少密钥环时明确报错，绝不降级明文。
 
+## 其他安装方式
+
+- Windows 的 `BitNetPortable-<版本>-windows-<架构>.exe` 双击运行，在当前用户的本地应用数据目录展开独立引擎与桌面程序。支持 `--silent`。需要离线系统服务时使用安装器或完整 ZIP。
+- Linux AppImage 解压到用户私有数据目录的版本子目录，保障 GUI 退出后个人引擎和启动项仍可用。通常直接运行，WSL 或无 FUSE 环境可使用 `--appimage-extract-and-run`。追加 `--cli` 可调用同包 CLI，如 `./BitNet.AppImage --cli status`。
+- Linux RPM 将 GUI、CLI 与个人引擎安装至系统路径，需要 Fedora 等 RPM 发行版的桌面依赖和 Secret Service 提供程序。系统服务仍通过支持该路径的 DEB 分发。
+- Cargo 安装面向具备平台编译依赖的个人模式。连用下面三条命令，确保四个程序安装到同一个 Cargo bin 目录。
+
+```sh
+cargo install --locked --git https://github.com/KJH-x/bitnet bitnet-runtime --bins
+cargo install --locked --git https://github.com/KJH-x/bitnet bitnet-cli
+cargo install --locked --git https://github.com/KJH-x/bitnet bitnet-gui
+```
+
+Linux x86_64 和 aarch64 用户可执行 `nix run github:KJH-x/bitnet`。NixOS 或 Home Manager 的 flake 可分别导入 `inputs.bitnet.nixosModules.default` 或 `inputs.bitnet.homeManagerModules.default`。模块管理个人图形会话：
+
+```nix
+services.bitnet = {
+  enable = true;
+  autoStart = true;
+  silentStart = true;
+};
+```
+
 ## macOS
 
 DMG 内可拖拽 `BitNet.app` 运行个人模式；CLI 在 app 的 `Contents/MacOS/bitctl`。需要开机无人值守时安装 DMG 内 Service PKG，安装器请求管理员授权。App 自带同一签名 Service.pkg 缓存；首装缺少维护 helper 时界面打开系统安装器，并提示完成安装后刷新，打开安装器不等于安装成功。Client.pkg 仅更新 App，Service.pkg 仅更新后台，个人模式更新不会顺带开启服务；完整组合 PKG 供明确选择完整安装时使用。

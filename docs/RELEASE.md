@@ -39,6 +39,10 @@ DEVELOPMENT=1 sh scripts/package-linux.sh
 
 macOS 最后一行改为 `DEVELOPMENT=1 sh scripts/package-macos.sh`。使用自定义 Cargo target 目录时，相应调整凭据输出位置及 `BIN_DIR`。
 
+Linux amd64 和 arm64 可额外生成 AppImage 和 RPM。准备 `squashfs-tools` 与 `rpm`，执行 `sh scripts/bootstrap-appimage.sh`，将输出的 `APPIMAGE_RUNTIME` 导出后以 `EXTRA_FORMATS=1` 执行相同的 Linux 打包命令。建议构建 AppImage 时使用 `OPENSSL_STATIC=1`。AppImage 使用固定的 [AppImage type-2 运行时 20251108](https://github.com/AppImage/type2-runtime/releases/tag/20251108)，按架构校验 SHA-256。
+
+AppImage 内包含运行时的 [MIT 许可和静态依赖声明](../installers/linux/appimage-runtime.LICENSE)。运行时源码与构建配置位于 [AppImage/type2-runtime 20251108](https://github.com/AppImage/type2-runtime/tree/20251108)。
+
 macOS 同样原生构建，并额外生成 platform 的 `bitkeychain`。执行 `DEVELOPMENT=1 sh scripts/package-macos.sh` 生成 DMG+PKG。`CODESIGN_IDENTITY` 与 `INSTALLER_SIGN_IDENTITY` 分别控制可选程序与安装包签名。当前按免费分发约束保留项目 Minisign、自持签名与用户 Gatekeeper 手动允许路径，不承诺已获 Apple 信誉。Developer ID、公证和 stapling 是未来可选渠道；脚本不会绕过 Gatekeeper。
 
 Linux 使用项目 `build/` 内唯一 stage；macOS stage 已存在时拒绝覆盖。不会递归删除计算路径。打包调用许可收集器，在各包和个人压缩包中保留项目 LICENSE、gateway 原始 NOTICE、依赖原许可全文和 JSON 审计记录；Linux 静态 OpenSSL 还包含库本身的原始版权及 Apache 协议。
@@ -62,6 +66,8 @@ python scripts/release-manifest.py --spec release-assets.json --version 0.1.0 --
 `manifest.json.minisig` 和每个安装包的 `.minisig` 必须与原字节一起发布。SHA256SUMS 便于人工核验，更新信任根仍为编译公钥。更换信任公钥需要先通过可信渠道分发含新公钥的客户端。
 
 分发可使用 GitHub Releases 供人工下载，并用自有域名提供固定 HTTPS 更新清单及安装包。更新客户端拒绝重定向，GitHub 常见下载跳转不能直接作为自动更新源；Pages 放小清单、R2 自定义域名放大文件是合适的静态方案。配置最终 feed、允许的镜像 origin 与公钥后重新编译，当前没有部署任何站点或桶。
+
+GitHub 的 `release.yml` 仅在精确匹配工作区版本的 `v<版本>` 标签执行。配置受保护的 `release` environment，设置 `BITNET_SIGNING_SECRET` 为供该环境使用的 Minisign 私钥，变量 `BITNET_SIGNING_PUBLIC` 为配套公钥，可选 `BITNET_UPDATE_FEED` 为正式 HTTPS 清单地址。构建任务签名并上传产物，发布任务汇总跨平台文件、签名、公钥及 SHA256SUMS。平台覆盖 Windows x64/x86/ARM64、Linux amd64/arm64 和 macOS Intel/Apple Silicon。普通分支 CI 继续使用开发密钥，仅上传 Actions artifacts。
 
 ## 现有证据与待验收
 
