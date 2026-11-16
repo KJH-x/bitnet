@@ -1,7 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod notifications;
-mod smooth_scroll;
 mod tray;
 mod views;
 
@@ -33,15 +32,15 @@ fn main() -> iced::Result {
 fn default_font() -> Font {
     #[cfg(target_os = "windows")]
     {
-        Font::with_name("Microsoft YaHei UI")
+        Font::new("Microsoft YaHei UI")
     }
     #[cfg(target_os = "macos")]
     {
-        Font::with_name("PingFang SC")
+        Font::new("PingFang SC")
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        Font::with_name("Noto Sans CJK SC")
+        Font::new("Noto Sans CJK SC")
     }
 }
 
@@ -1874,7 +1873,8 @@ impl App {
             }
             Message::CopyHistory => iced::clipboard::write(
                 serde_json::to_string_pretty(&self.history).unwrap_or_default(),
-            ),
+            )
+            .discard(),
             Message::OpenHistoryExport => {
                 self.history_export_path = Some(String::new());
                 Task::none()
@@ -1988,8 +1988,8 @@ impl App {
                     }
                 }
             }
-            Message::CopyExport => iced::clipboard::write(self.exported.clone()),
-            Message::CopyDiagnostics => iced::clipboard::write(self.diagnostics.clone()),
+            Message::CopyExport => iced::clipboard::write(self.exported.clone()).discard(),
+            Message::CopyDiagnostics => iced::clipboard::write(self.diagnostics.clone()).discard(),
             Message::WindowOpened(id) => {
                 self.window = Some(id);
                 Task::none()

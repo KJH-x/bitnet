@@ -3,13 +3,14 @@ name = "bitnet-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.93"
 description = "BitNet software-rendered desktop interface"
 
 [dependencies]
 bitnet-core.workspace = true
 bitnet-runtime.workspace = true
-iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio", "advanced", "advanced-shaping"] }
+# Use Iced's native wheel animation; switch to the registry when 0.15 is released.
+iced = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34", default-features = false, features = ["tiny-skia", "tokio", "advanced", "advanced-shaping"] }
 serde_json.workspace = true
 zeroize.workspace = true
 
@@ -18,7 +19,7 @@ tray-icon = "0.21"
 notify-rust = { version = "=4.17.0", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio", "advanced", "advanced-shaping", "x11", "wayland", "linux-theme-detection"] }
+iced = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34", default-features = false, features = ["x11", "wayland", "linux-theme-detection"] }
 ksni = "0.3.7"
 notify-rust = { version = "=4.17.0", default-features = false, features = ["z-with-tokio"] }
 tokio.workspace = true

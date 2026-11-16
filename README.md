@@ -34,7 +34,7 @@ bitctl service status
 
 ## 开发与安全演示
 
-需要 Rust 1.88 或更新工具链和各平台原生编译工具；用户安装包不需要 Rust、Python、Node 或 WebView。
+构建桌面端和完整工作区需要 Rust 1.93 或更新工具链，以及平台原生编译工具。桌面端的滚轮动画由固定到上游提交的 Iced 0.15 开发版提供。用户安装包不需要 Rust、Python、Node 或 WebView。
 
 ```text
 cargo test --workspace

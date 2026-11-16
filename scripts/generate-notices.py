@@ -148,7 +148,23 @@ def selected_packages(metadata: dict[str, Any]) -> set[str]:
     return selected
 
 
-def vcs_info(package_root: Path) -> dict[str, str] | None:
+def vcs_info(package_root: Path, source: str) -> dict[str, str] | None:
+    if source.startswith("git+"):
+        commit = source.rpartition("#")[2]
+        if not re.fullmatch(r"[a-f0-9]{40}", commit):
+            return None
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel", "HEAD"], cwd=package_root,
+            capture_output=True, timeout=30, check=False,
+        )
+        checkout = result.stdout.decode("utf-8").splitlines()
+        if result.returncode or len(checkout) != 2 or checkout[1] != commit:
+            return None
+        root = Path(checkout[0]).resolve()
+        if not inside(package_root, root):
+            return None
+        relative = package_root.relative_to(root)
+        return {"commit": commit, "path_in_vcs": relative.as_posix() if relative.parts else ""}
     path = package_root / ".cargo_vcs_info.json"
     if not path.is_file():
         return None
@@ -225,7 +241,7 @@ def collect(metadata: dict[str, Any], target: str, extras: list[str]) -> dict[st
         entry: dict[str, Any] = {
             "name": package["name"], "version": package["version"], "source": source,
             "spdx": package.get("license"), "workspace": workspace,
-            "repository": package.get("repository"), "vcs": vcs_info(package_root),
+            "repository": package.get("repository"), "vcs": vcs_info(package_root, source),
             "features": sorted(nodes[package["id"]]["features"]),
             "license_files": [], "warnings": [],
         }

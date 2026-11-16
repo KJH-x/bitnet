@@ -96,7 +96,7 @@ jobs:
         run: |
           docker run --rm --platform linux/386 -v "$PWD:/work" -w /work i386/debian:12 sh -ec '
             apt-get update
-            apt-get install -y curl ca-certificates build-essential pkg-config libssl-dev libx11-dev libxkbcommon-dev libwayland-dev libfontconfig1-dev minisign python3
+            apt-get install -y curl ca-certificates git build-essential pkg-config libssl-dev libx11-dev libxkbcommon-dev libwayland-dev libfontconfig1-dev minisign python3
             curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
             sh /tmp/rustup.sh -y --profile minimal --component rustfmt --component clippy
             . /root/.cargo/env

@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
@@ -95,6 +96,24 @@ class NoticeTests(unittest.TestCase):
         self.assertEqual(same["license_files"][0]["provenance"]["kind"], "same-repository-commit-root-license")
         self.assertEqual(different["license_files"], [])
         self.assertEqual(other_license["license_files"], [])
+
+    def test_git_dependency_recognizes_only_the_locked_checkout_commit(self):
+        package = self.root / "widget"
+        package.mkdir()
+        git = ["git", "-c", "core.hooksPath=" + str(self.root / "no-hooks")]
+        subprocess.run([*git, "init", "--quiet"], cwd=self.root, check=True)
+        subprocess.run(
+            [*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+             "commit", "--allow-empty", "--no-gpg-sign", "--quiet", "-m", "Fixture"],
+            cwd=self.root, check=True,
+        )
+        commit = subprocess.check_output([*git, "rev-parse", "HEAD"], cwd=self.root, text=True).strip()
+        source = f"git+https://example.invalid/fixture?rev={commit}#"
+        self.assertEqual(
+            NOTICES.vcs_info(package, source + commit),
+            {"commit": commit, "path_in_vcs": "widget"},
+        )
+        self.assertIsNone(NOTICES.vcs_info(package, source + "0" * 40))
 
     def test_recorded_upstream_text_requires_hash_and_exact_source(self):
         original_project = NOTICES.PROJECT

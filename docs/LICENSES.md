@@ -17,7 +17,7 @@ python scripts/generate-notices.py --target x86_64-pc-windows-msvc --output-dir 
 
 ## 没随 crate 打包的上游许可
 
-对于同仓库子 crate，只有仓库 URL、`.cargo_vcs_info.json` 的完整提交和 SPDX 表达式完全一致，才关联到本地缓存中该仓库根 crate 所携带的根许可。报告记录来源 crate、提交及原文哈希。不同提交不会沿用这个关联。
+对于同仓库子 crate，只有仓库 URL、完整提交和 SPDX 表达式一致，才关联根 crate 随包携带的许可。注册表依赖从 `.cargo_vcs_info.json` 读取提交，Git 依赖用本地 `git` 核对缓存 checkout 的 HEAD 和 Cargo 锁定的提交。报告记录来源 crate、提交及原文哈希。
 
 若原 crate 包未带原文，人工读取官方仓库对应完整提交的许可文本，可保留在 `docs/licenses/`，在 `upstream-provenance.json` 登记依赖名称/版本、仓库、提交、准确原文 URL、文件名和 SHA256。生成器始终离线，只在这些字段与当前 Cargo 依赖逐项一致且本地文件哈希相符时使用；不匹配便保留缺项。不得用默认分支或仅同名协议冒充该版本的许可。
 

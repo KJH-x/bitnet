@@ -8,7 +8,14 @@ rustPlatform.buildRustPackage {
     src = lib.cleanSource ../.;
     filter = path: _: !(builtins.elem (baseNameOf path) [ ".local" "target" "build" "dist" ]);
   };
-  cargoLock.lockFile = ../Cargo.lock;
+  cargoLock = {
+    lockFile = ../Cargo.lock;
+    outputHashes = {
+      "cosmic-text-0.19.0" = "sha256-TJ5QXLPOxjoaelH/1TPD01OvTAXcow6bvgI4EVE18vs=";
+      "iced-0.15.0-dev" = "sha256-nC7JZHcodgZu6uzkuaHvDpsj+cFUibgKOKgcR6UD6xg=";
+      "winit-0.30.8" = "sha256-pQn1lCFSJMkjUfHoggEzMHnm5k+Chnzi5JEDjahnjUA=";
+    };
+  };
   nativeBuildInputs = [ pkg-config makeWrapper ];
   buildInputs = [ openssl fontconfig libxkbcommon xorg.libX11 wayland ];
   postPatch = ''

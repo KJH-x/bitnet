@@ -3,19 +3,19 @@ use iced::{
     advanced::{layout, mouse, renderer, widget::Tree, Layout, Widget},
     alignment,
     widget::{
-        button, checkbox, column, container, pick_list, row, rule, stack, text, text_editor,
-        text_input, Space,
+        button, checkbox, column, container, pick_list, row, rule, scrollable, stack, text,
+        text_editor, text_input, Space,
     },
     Color, Length, Rectangle, Size,
 };
 
 pub(super) fn action_style(theme: &Theme, status: button::Status) -> button::Style {
     let mut style = button::secondary(theme, status);
-    let primary = theme.extended_palette().primary;
+    let primary = theme.palette().primary;
     match status {
         button::Status::Active => {
             style.background = None;
-            style.text_color = theme.extended_palette().background.base.text;
+            style.text_color = theme.palette().background.base.text;
             style.border = style.border.color(primary.base.color).width(1);
         }
         button::Status::Hovered | button::Status::Pressed => {
@@ -52,12 +52,8 @@ impl Widget<Message, Theme, iced::Renderer> for Inactive<'_> {
         self.content.as_widget().size()
     }
 
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.content)]
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        tree.diff_children(&[&self.content]);
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
     }
 
     fn layout(
@@ -103,7 +99,6 @@ impl Widget<Message, Theme, iced::Renderer> for Inactive<'_> {
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         renderer: &iced::Renderer,
-        clipboard: &mut dyn iced::advanced::Clipboard,
         shell: &mut iced::advanced::Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
@@ -114,7 +109,6 @@ impl Widget<Message, Theme, iced::Renderer> for Inactive<'_> {
                 layout,
                 cursor,
                 renderer,
-                clipboard,
                 shell,
                 viewport,
             );
@@ -125,6 +119,7 @@ impl Widget<Message, Theme, iced::Renderer> for Inactive<'_> {
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
+        viewport: &Rectangle,
         renderer: &iced::Renderer,
         operation: &mut dyn iced::advanced::widget::Operation,
     ) {
@@ -132,6 +127,7 @@ impl Widget<Message, Theme, iced::Renderer> for Inactive<'_> {
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout,
+                viewport,
                 renderer,
                 operation,
             );
@@ -166,9 +162,10 @@ impl Widget<Message, Theme, iced::Renderer> for Inactive<'_> {
         renderer: &iced::Renderer,
         viewport: &Rectangle,
         translation: iced::Vector,
-    ) -> Option<iced::advanced::overlay::Element<'a, Message, Theme, iced::Renderer>> {
+        window: Size,
+    ) -> Vec<iced::advanced::overlay::Element<'a, Message, Theme, iced::Renderer>> {
         if self.inactive {
-            None
+            Vec::new()
         } else {
             self.content.as_widget_mut().overlay(
                 &mut tree.children[0],
@@ -176,6 +173,7 @@ impl Widget<Message, Theme, iced::Renderer> for Inactive<'_> {
                 renderer,
                 viewport,
                 translation,
+                window,
             )
         }
     }
@@ -313,8 +311,8 @@ impl App {
         if let Some(banner) = self.notice_banner() {
             dialog = dialog.push(banner);
         }
-        let body = smooth_scroll::vertical(content).scrollbar_spacing(8.0);
-        container(card(dialog.push(body)).max_width(max_width))
+        let body = scrollable(content).spacing(8).smooth_scroll(true);
+        container(card(dialog.push(body)).width(Length::Fill.max(max_width)))
             .padding(24)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
@@ -397,10 +395,11 @@ impl App {
             text(self.page.label(self.english())).size(27),
             Space::new().width(Length::Fill),
             pick_list(
-                [Mode::User, Mode::System],
                 Some(self.mode),
-                Message::ModeChanged
+                [Mode::User, Mode::System],
+                ToString::to_string,
             )
+            .on_select(Message::ModeChanged)
             .width(225),
             button(self.t("刷新", "Refresh"))
                 .on_press_maybe(
@@ -464,7 +463,8 @@ impl App {
                 .height(Length::Fill)
                 .padding(16)
                 .style(container::rounded_box),
-            smooth_scroll::vertical(container(content).padding(20).width(Length::Fill))
+            scrollable(container(content).padding(20).width(Length::Fill))
+                .smooth_scroll(true)
                 .height(Length::Fill)
                 .width(Length::Fill)
         ]
@@ -1037,7 +1037,7 @@ impl App {
                             .size(17)
                             .wrapping(text::Wrapping::WordOrGlyph)
                     )
-                    .max_width(320),
+                    .width(Length::Fit.max(320)),
                     button(self.t("使用此网卡", "Use this adapter"))
                         .on_press_maybe(
                             (!self.busy
@@ -1237,28 +1237,31 @@ impl App {
             row![
                 text(self.t("日志级别", "Log level")).width(180),
                 pick_list(
-                    ["error", "warning", "info", "debug"],
                     Some(self.draft.settings.log_level.as_str()),
-                    |level| Message::LogLevelChanged(level.to_string())
+                    ["error", "warning", "info", "debug"],
+                    ToString::to_string,
                 )
+                .on_select(|level| Message::LogLevelChanged(level.to_string())),
             ]
             .spacing(12),
             row![
                 text(self.t("界面语言", "Language")).width(180),
                 pick_list(
-                    [Language::Chinese, Language::English],
                     Some(self.language),
-                    Message::LanguageChanged
+                    [Language::Chinese, Language::English],
+                    ToString::to_string,
                 )
+                .on_select(Message::LanguageChanged),
             ]
             .spacing(12),
             row![
                 text(self.t("主题", "Theme")).width(180),
                 pick_list(
-                    [Appearance::System, Appearance::Light, Appearance::Dark],
                     Some(self.appearance),
-                    Message::AppearanceChanged
+                    [Appearance::System, Appearance::Light, Appearance::Dark],
+                    ToString::to_string,
                 )
+                .on_select(Message::AppearanceChanged),
             ]
             .spacing(12),
         ]
@@ -1422,8 +1425,11 @@ impl App {
                 button(self.t("复制导出", "Copy export")).on_press_maybe((!self.exported.is_empty()).then_some(Message::CopyExport)).style(button::secondary)].spacing(10),
         ].spacing(12);
         if !self.exported.is_empty() {
-            transfer =
-                transfer.push(smooth_scroll::vertical(text(&self.exported).size(12)).height(150));
+            transfer = transfer.push(
+                scrollable(text(&self.exported).size(12))
+                    .smooth_scroll(true)
+                    .height(150),
+            );
         }
         transfer = transfer
             .push(
@@ -2057,7 +2063,7 @@ impl App {
                     )
                     .spacing(20),
             )
-            .max_width(640),
+            .width(Length::Fill.max(640)),
         )
         .center_x(Length::Fill)
         .center_y(Length::Fill)
