@@ -9,8 +9,8 @@ description = "BitNet software-rendered desktop interface"
 [dependencies]
 bitnet-core.workspace = true
 bitnet-runtime.workspace = true
-# Use Iced's native wheel animation; switch to the registry when 0.15 is released.
-iced = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34", default-features = false, features = ["tiny-skia", "tokio", "advanced", "advanced-shaping"] }
+# Experimental software renderer from Iced PR #3306.
+iced = { git = "https://github.com/iced-rs/iced.git", rev = "3ad0fe9402166474cbe8217b439e4901f63bc124", default-features = false, features = ["vello-cpu", "tokio", "advanced", "advanced-shaping"] }
 serde_json.workspace = true
 zeroize.workspace = true
 
@@ -19,7 +19,7 @@ tray-icon = "0.21"
 notify-rust = { version = "=4.17.0", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-iced = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34", default-features = false, features = ["x11", "wayland", "linux-theme-detection"] }
+iced = { git = "https://github.com/iced-rs/iced.git", rev = "3ad0fe9402166474cbe8217b439e4901f63bc124", default-features = false, features = ["x11", "wayland", "linux-theme-detection"] }
 ksni = "0.3.7"
 notify-rust = { version = "=4.17.0", default-features = false, features = ["z-with-tokio"] }
 tokio.workspace = true
