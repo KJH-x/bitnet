@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -13,6 +13,7 @@ bitnet-core = { path = "crates/bitnet-core" }
 bitnet-gateway = { path = "crates/bitnet-gateway" }
 bitnet-platform = { path = "crates/bitnet-platform" }
 bitnet-runtime = { path = "crates/bitnet-runtime" }
+bitnet-launcher = { path = "crates/bitnet-launcher" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

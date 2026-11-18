@@ -13,6 +13,18 @@ function Property($Database,[string]$Name) {
 if((Property $client 'UpgradeCode') -ne '{81E2553E-095D-49AF-A95A-B0FD47A3E61E}' -or (Property $service 'UpgradeCode') -ne '{7FBA8135-7341-4F91-A39E-615190032EA2}') {throw 'MSI UpgradeCode mismatch'}
 if((Property $client 'ALLUSERS') -ne '' -or (Property $service 'ALLUSERS') -ne '1') {throw 'Client/service installation scope mismatch'}
 if((Property $client 'ProductCode') -eq (Property $service 'ProductCode')) {throw 'Client/service ProductCode must be independent'}
+$clientFiles=@{}
+$serviceFiles=@{}
+foreach($entry in @(@{Database=$client; Files=$clientFiles},@{Database=$service; Files=$serviceFiles})) {
+    $view=$entry.Database.OpenView('SELECT `FileName` FROM `File`'); $view.Execute()
+    while($record=$view.Fetch()) {
+        $fileName=([string]$record.StringData(1) -split '\|')[-1]
+        $entry.Files[$fileName]=$true
+    }
+}
+foreach($fileName in @('bitnet-tui.exe','bitnet-web.exe','FONT-OFL.txt')) {
+    if(-not $clientFiles.ContainsKey($fileName) -or $serviceFiles.ContainsKey($fileName)) {throw "Unexpected MSI ownership: $fileName"}
+}
 $view=$service.OpenView('SELECT `Name`,`Arguments`,`StartName` FROM `ServiceInstall`'); $view.Execute(); $record=$view.Fetch()
 if(-not $record -or $record.StringData(1) -ne 'BitNet' -or $record.StringData(2) -ne '--service' -or $record.StringData(3) -ne 'NT SERVICE\BitNet') {throw 'SCM service identity/arguments mismatch'}
 $view=$service.OpenView('SELECT `Action` FROM `InstallExecuteSequence` WHERE `Action` = ''MsiConfigureServices''')

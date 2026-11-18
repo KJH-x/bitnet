@@ -25,10 +25,10 @@ install -m 0644 "$payload/LICENSE" "$app/usr/lib/bitnet/licenses/LICENSE"
 install -m 0644 "$payload"/licenses/* "$app/usr/lib/bitnet/licenses/"
 install -m 0644 "$root/installers/linux/appimage-runtime.LICENSE" \
     "$app/usr/lib/bitnet/licenses/APPIMAGE-RUNTIME.txt"
-for program in bitengine bitctl bitmaint bitnet-gui; do
+for program in bitengine bitctl bitmaint bitnet-gui bitnet-tui bitnet-web; do
     install -m 0755 "$payload/$program" "$app/usr/lib/bitnet/$program"
 done
-(cd "$app/usr/lib/bitnet" && sha256sum bitengine bitctl bitmaint bitnet-gui > SHA256SUMS)
+(cd "$app/usr/lib/bitnet" && sha256sum bitengine bitctl bitmaint bitnet-gui bitnet-tui bitnet-web > SHA256SUMS)
 # A type-2 image consists of the runtime ELF followed by the SquashFS.
 mksquashfs "$app" "$work/payload.squashfs" -noappend -all-root -no-xattrs -comp zstd -processors 2
 cat "$runtime" "$work/payload.squashfs" > "$work/BitNet.AppImage"

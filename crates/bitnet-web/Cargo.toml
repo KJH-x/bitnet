@@ -1,0 +1,25 @@
+[package]
+name = "bitnet-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "On-demand local BitNet history viewer"
+
+[dependencies]
+bitnet-core.workspace = true
+bitnet-platform.workspace = true
+bitnet-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+fs2 = "0.4"
+getrandom = "0.2"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+subtle = "2"
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

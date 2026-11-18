@@ -1,7 +1,7 @@
 //! The only installation/startup/update entry point shared by GUI and CLI.
 #[path = "updates.rs"]
 pub mod updates;
-use bitnet_core::{AppError, ErrorCode, Scope};
+use bitnet_core::{AppError, ErrorCode, NetworkInterface, Scope};
 use fs2::FileExt;
 use serde_json::json;
 use std::io::Read;
@@ -26,6 +26,71 @@ pub enum MaintenanceAction {
     RollbackUpdate,
     SetAutostart { enabled: bool },
     SetGuiAutostart { enabled: bool },
+    EnableIpv6 { interface: InterfaceTarget },
+    DisableIpv6 { interface: InterfaceTarget },
+    ResetIpv6 { interface: InterfaceTarget },
+}
+
+/// Native Windows adapter identity. Alias, address and display name are never
+/// used as a privileged operation's selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceTarget {
+    guid: String,
+    index: u32,
+}
+
+impl InterfaceTarget {
+    pub fn from_interface(interface: &NetworkInterface) -> Result<Self, AppError> {
+        Self::new(&interface.id, interface.index)
+    }
+
+    pub fn parse(selector: &str) -> Result<Self, AppError> {
+        let (guid, index) = selector
+            .split_once('@')
+            .ok_or_else(|| err(ErrorCode::InvalidInput, "Expected adapter GUID@index"))?;
+        let index = index
+            .parse()
+            .map_err(|_| err(ErrorCode::InvalidInput, "Invalid Windows interface index"))?;
+        Self::new(guid, index)
+    }
+
+    fn new(guid: &str, index: u32) -> Result<Self, AppError> {
+        let guid = guid
+            .strip_prefix('{')
+            .and_then(|guid| guid.strip_suffix('}'))
+            .unwrap_or(guid);
+        if index == 0
+            || guid.len() != 36
+            || !guid.bytes().enumerate().all(|(position, byte)| {
+                if matches!(position, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+            || guid == "00000000-0000-0000-0000-000000000000"
+        {
+            return Err(err(
+                ErrorCode::InvalidInput,
+                "A current Windows adapter GUID and nonzero index are required",
+            ));
+        }
+        Ok(Self {
+            guid: guid.to_ascii_lowercase(),
+            index,
+        })
+    }
+}
+
+impl MaintenanceAction {
+    pub fn ipv6_target(&self) -> Option<&InterfaceTarget> {
+        match self {
+            Self::EnableIpv6 { interface }
+            | Self::DisableIpv6 { interface }
+            | Self::ResetIpv6 { interface } => Some(interface),
+            _ => None,
+        }
+    }
 }
 #[derive(Debug, Clone)]
 pub struct MaintenanceResult {
@@ -56,13 +121,44 @@ pub fn action_name(action: &MaintenanceAction) -> &'static str {
         MaintenanceAction::SetAutostart { enabled: false } => "autostart-off",
         MaintenanceAction::SetGuiAutostart { enabled: true } => "gui-autostart-on",
         MaintenanceAction::SetGuiAutostart { enabled: false } => "gui-autostart-off",
+        MaintenanceAction::EnableIpv6 { .. } => "ipv6-enable",
+        MaintenanceAction::DisableIpv6 { .. } => "ipv6-disable",
+        MaintenanceAction::ResetIpv6 { .. } => "ipv6-reset",
     }
 }
+
 pub fn parse_action(name: &str, purge: bool) -> Result<MaintenanceAction, AppError> {
+    parse_action_with_interface(name, purge, None)
+}
+
+pub fn parse_action_with_interface(
+    name: &str,
+    purge: bool,
+    interface: Option<InterfaceTarget>,
+) -> Result<MaintenanceAction, AppError> {
     if purge && name != "service-remove" {
         return Err(err(
             ErrorCode::InvalidInput,
             "Purge is valid only for service removal",
+        ));
+    }
+    if matches!(name, "ipv6-enable" | "ipv6-disable" | "ipv6-reset") {
+        let interface = interface.ok_or_else(|| {
+            err(
+                ErrorCode::InvalidInput,
+                "IPv6 maintenance requires --interface GUID@index",
+            )
+        })?;
+        return Ok(match name {
+            "ipv6-enable" => MaintenanceAction::EnableIpv6 { interface },
+            "ipv6-disable" => MaintenanceAction::DisableIpv6 { interface },
+            _ => MaintenanceAction::ResetIpv6 { interface },
+        });
+    }
+    if interface.is_some() {
+        return Err(err(
+            ErrorCode::InvalidInput,
+            "--interface is valid only for IPv6 maintenance",
         ));
     }
     Ok(match name {
@@ -205,6 +301,20 @@ async fn execute_inner(
     action: MaintenanceAction,
     interactive: bool,
 ) -> Result<MaintenanceResult, AppError> {
+    if action.ipv6_target().is_some() {
+        if !cfg!(windows) {
+            return Err(err(
+                ErrorCode::Unavailable,
+                "Managing IPv6 bindings is currently supported on Windows",
+            ));
+        }
+        if scope != Scope::System {
+            return Err(err(
+                ErrorCode::InvalidInput,
+                "IPv6 maintenance requires system scope",
+            ));
+        }
+    }
     if matches!(action, MaintenanceAction::InstallUpdate) {
         // A build without an authenticated feed never prompts for privileges.
         let _ = updates::UpdateConfig::embedded()?;
@@ -228,6 +338,10 @@ async fn execute_inner(
             return Err(err(ErrorCode::PermissionDenied,"Administrator authorization is required; noninteractive maintenance cannot elevate"));
         }
         return elevate(scope, action).await;
+    }
+    #[cfg(windows)]
+    if let Some(interface) = action.ipv6_target() {
+        return ipv6_action(&action, interface).await;
     }
     match action {
         MaintenanceAction::SetAutostart { enabled } if scope == Scope::User => {
@@ -1584,6 +1698,60 @@ fn system_plan(program: &str, args: &[&str], seconds: u64) -> Result<Plan, AppEr
     p.program = PathBuf::from(OsString::from_wide(&value[..n])).join(program);
     Ok(p)
 }
+
+#[cfg(windows)]
+async fn ipv6_action(
+    action: &MaintenanceAction,
+    interface: &InterfaceTarget,
+) -> Result<MaintenanceResult, AppError> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let command = format!(
+        "$interfaceGuid = '{}'\n$interfaceIndex = {}\n$action = '{}'\n{}",
+        interface.guid,
+        interface.index,
+        action_name(action),
+        include_str!("ipv6_binding.ps1"),
+    );
+    let encoded = STANDARD.encode(
+        command
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let plan = system_plan(
+        r"WindowsPowerShell\v1.0\powershell.exe",
+        &["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded],
+        120,
+    )?;
+    match run_exit_code(plan).await? {
+        0 => {
+            let enabled = !matches!(action, MaintenanceAction::DisableIpv6 { .. });
+            Ok(MaintenanceResult {
+                message: if enabled {
+                    "Verified IPv6 enabled on the selected network adapter"
+                } else {
+                    "Verified IPv6 disabled on the selected network adapter"
+                }
+                .into(),
+                details: json!({"ipv6_enabled":enabled,"reboot_required":false}),
+            })
+        }
+        2 => Err(err(
+            ErrorCode::Unavailable,
+            "The selected Windows network adapter changed or is unavailable",
+        )),
+        3 => Err(err(
+            ErrorCode::Busy,
+            "Another IPv6 operation is running on this adapter",
+        )),
+        _ => Err(err(
+            ErrorCode::Unavailable,
+            "Windows could not change and verify the IPv6 binding",
+        )),
+    }
+}
+
 #[cfg(windows)]
 fn program_data() -> Result<PathBuf, AppError> {
     use windows_sys::Win32::{
@@ -1792,7 +1960,7 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
                 "The installed maintenance helper is missing",
             ));
         }
-        let arguments = format!(
+        let mut arguments = format!(
             "--scope {} --action {} --elevated{}",
             if scope == Scope::System {
                 "system"
@@ -1806,6 +1974,15 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
                 ""
             }
         );
+        let ipv6_enabled = action.ipv6_target().map(|interface| {
+            use std::fmt::Write as _;
+            let _ = write!(
+                arguments,
+                " --interface {}@{}",
+                interface.guid, interface.index
+            );
+            !matches!(action, MaintenanceAction::DisableIpv6 { .. })
+        });
         tokio::task::spawn_blocking(move || {
             use windows_sys::Win32::{
                 Foundation::*,
@@ -1848,8 +2025,25 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
                     "Elevated maintenance did not finish in time",
                 ));
             }
-            if code != 0 && code != 3010 {
+            if code != 0 && (code != 3010 || ipv6_enabled.is_some()) {
+                if ipv6_enabled.is_some() && code == ErrorCode::Busy.exit_code() as u32 {
+                    return Err(err(
+                        ErrorCode::Busy,
+                        "Another IPv6 operation is running on this adapter",
+                    ));
+                }
                 return Err(err(ErrorCode::Unavailable, "Elevated maintenance failed"));
+            }
+            if let Some(enabled) = ipv6_enabled {
+                return Ok(MaintenanceResult {
+                    message: if enabled {
+                        "Verified IPv6 enabled on the selected network adapter"
+                    } else {
+                        "Verified IPv6 disabled on the selected network adapter"
+                    }
+                    .into(),
+                    details: json!({"ipv6_enabled":enabled,"reboot_required":false}),
+                });
             }
             Ok(MaintenanceResult {
                 message: "Authorized maintenance completed".into(),

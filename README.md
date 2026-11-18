@@ -1,6 +1,6 @@
 # BitNet
 
-北京理工大学校园网认证与连接管理器。Rust 核心、独立 Iced 软件渲染 GUI、CLI 与系统后台共用同一认证逻辑。
+北京理工大学校园网认证与连接管理器。Rust 引擎为桌面界面、终端界面、命令行和系统后台提供同一套认证逻辑。
 
 **当前为开发版本。** 各平台的实现进度见 [实现与验证状态](docs/STATUS.md)。
 
@@ -8,7 +8,9 @@
 
 ## 使用方式
 
-- `bitnet-gui`：桌面界面，提供连接状态、账户管理、后台服务和软件设置。网卡、网络规则及日志在窗口内打开。
+- `bitnet-gui`：桌面界面，侧栏包含连接、账户、网络、后台服务和软件设置。连接区提供状态、详情、统计和诊断。详细日志通过「软件设置 → 日志」在浏览器中打开。Windows 可以双击托盘图标切换窗口显示。
+- `bitnet-tui`：在当前终端查看状态和日志、管理认证。可用 `bitctl tui` 启动，按 `Tab` 切换状态与日志，按 `p` 切换 IP 地址显示。IP 地址默认隐藏。
+- `bitnet-web`：按需启动的本机日志查看器，可筛选、分页、查看详情及导出 JSON。用 `bitctl web start`、`bitctl web stop` 或软件设置控制。
 - `bitctl`：交互式与自动化管理。密码通过隐藏输入或标准输入提交，不接受命令行密码参数。
 - `bitengine`：独立后台，用户模式或系统服务模式。GUI 退出不必终止认证引擎。
 - `bitmaint`：安装、修复、启动项和更新维护。系统操作按需授权，不常驻。
@@ -24,6 +26,9 @@ bitctl config set automatic true
 bitctl trust-network --yes
 bitctl profile save --id campus --name Campus
 bitctl history --limit 100
+bitctl tui
+bitctl web start
+bitctl web stop
 bitctl diagnose --output report.json
 bitctl service status
 ```
@@ -65,6 +70,7 @@ target/debug/bitctl.exe --data-dir $env:BITNET_DATA_DIR stop
 - [CLI 与 GUI 的统一接口](docs/CONTRACT.md)
 - [原始需求](docs/REQUIREMENTS.original.zh-CN.md)
 - [实现与验证状态](docs/STATUS.md)
+- [桌面布局、终端和日志查看器](docs/FRONTENDS.md)
 - [200 项需求覆盖矩阵](docs/FEATURE-MATRIX.md)
 - [依赖许可与来源](docs/LICENSES.md)
 

@@ -11,9 +11,12 @@
     <StandardDirectory Id="LocalAppDataFolder"><Directory Id="ProgramsFolder" Name="Programs"><Directory Id="ClientDir" Name="BitNet">
       <Component Id="ClientGui" Guid="*"><File Id="GuiExe" Source="$(var.Stage)\bitnet-gui.exe" KeyPath="yes" /></Component>
       <Component Id="ClientCli" Guid="*"><File Source="$(var.Stage)\bitctl.exe" KeyPath="yes" /></Component>
+      <Component Id="ClientTui" Guid="*"><File Id="TuiExe" Source="$(var.Stage)\bitnet-tui.exe" KeyPath="yes" /></Component>
+      <Component Id="ClientWeb" Guid="*"><File Id="WebExe" Source="$(var.Stage)\bitnet-web.exe" KeyPath="yes" /></Component>
       <Component Id="UserEngine" Guid="*"><File Source="$(var.Stage)\bitengine.exe" KeyPath="yes" /></Component>
       <Component Id="ClientMaintenance" Guid="*"><File Source="$(var.Stage)\bitmaint.exe" KeyPath="yes" /></Component>
       <Directory Id="ClientLicenses" Name="licenses">
+        <Component Id="ClientFontLicense" Guid="*"><File Source="$(var.FontLicense)" Name="FONT-OFL.txt" KeyPath="yes" /></Component>
         <Component Id="ClientProjectLicense" Guid="*"><File Source="$(var.ProjectLicense)" Name="LICENSE" KeyPath="yes" /></Component>
         <Component Id="ClientGatewayNotice" Guid="*"><File Source="$(var.GatewayNotice)" Name="GATEWAY-NOTICE.txt" KeyPath="yes" /></Component>
         <Component Id="ClientThirdPartyNotices" Guid="*"><File Source="$(var.ThirdPartyNotices)" Name="THIRD-PARTY-NOTICES.txt" KeyPath="yes" /></Component>
@@ -36,6 +39,8 @@
       </Component>
     </Directory></StandardDirectory>
     <Feature Id="Client" Title="BitNet desktop and command line" Level="1">
+      <ComponentRef Id="ClientFontLicense"/>
+      <ComponentRef Id="ClientTui"/><ComponentRef Id="ClientWeb"/>
       <ComponentRef Id="ClientGui"/><ComponentRef Id="ClientCli"/><ComponentRef Id="UserEngine"/><ComponentRef Id="ClientMaintenance"/><ComponentRef Id="ClientProjectLicense"/><ComponentRef Id="ClientGatewayNotice"/><ComponentRef Id="ClientThirdPartyNotices"/><ComponentRef Id="ClientThirdPartyMetadata"/><ComponentRef Id="OfflineService"/><ComponentRef Id="OfflineSignature"/><ComponentRef Id="UserShortcuts"/><ComponentRef Id="UserNotificationIdentity"/>
     </Feature>
   </Package>

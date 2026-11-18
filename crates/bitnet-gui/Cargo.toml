@@ -9,8 +9,10 @@ description = "BitNet software-rendered desktop interface"
 [dependencies]
 bitnet-core.workspace = true
 bitnet-runtime.workspace = true
+bitnet-launcher.workspace = true
 # Use Iced's native wheel animation; switch to the registry when 0.15 is released.
-iced = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34", default-features = false, features = ["tiny-skia", "tokio", "advanced", "advanced-shaping"] }
+iced = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34", default-features = false, features = ["tiny-skia", "tokio", "advanced", "advanced-shaping", "canvas", "crisp"] }
+serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
 

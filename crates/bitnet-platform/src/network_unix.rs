@@ -3,6 +3,7 @@ use crate::io_error;
 use std::{
     collections::BTreeMap,
     ffi::CStr,
+    net::Ipv6Addr,
     ptr,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -45,19 +46,41 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                 virtual_adapter: a.ifa_flags & libc::IFF_LOOPBACK as u32 != 0
                     || super::is_tunnel(&name),
                 alternate_adapter: false,
+                dns: Vec::new(),
+                ipv6: Vec::new(),
+                ipv4_mode: None,
+                ipv6_enabled: None,
             });
-            if !a.ifa_addr.is_null() && (*a.ifa_addr).sa_family as i32 == libc::AF_INET {
-                let ip = Ipv4Addr::from(
-                    (*a.ifa_addr.cast::<libc::sockaddr_in>())
-                        .sin_addr
-                        .s_addr
-                        .to_ne_bytes(),
-                );
-                if !item.ipv4.contains(&ip) {
-                    item.ipv4.push(ip);
+            if !a.ifa_addr.is_null() {
+                match (*a.ifa_addr).sa_family as i32 {
+                    libc::AF_INET => {
+                        let ip = Ipv4Addr::from(
+                            (*a.ifa_addr.cast::<libc::sockaddr_in>())
+                                .sin_addr
+                                .s_addr
+                                .to_ne_bytes(),
+                        );
+                        if !item.ipv4.contains(&ip) {
+                            item.ipv4.push(ip);
+                        }
+                    }
+                    libc::AF_INET6 => {
+                        let address = &*a.ifa_addr.cast::<libc::sockaddr_in6>();
+                        item.ipv6.push(Ipv6Addr::from(address.sin6_addr.s6_addr));
+                        item.ipv6_enabled = Some(true);
+                    }
+                    _ => {}
                 }
             }
             row = a.ifa_next;
+        }
+        for item in out.values_mut() {
+            item.ipv6.sort_unstable();
+            item.ipv6.dedup();
+            #[cfg(target_os = "linux")]
+            if let Some(enabled) = linux_ipv6_enabled(&item.name) {
+                item.ipv6_enabled = Some(enabled);
+            }
         }
         #[cfg(target_os = "linux")]
         {
@@ -88,6 +111,18 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
         Ok(out.into_values().collect())
     }
 }
+#[cfg(target_os = "linux")]
+fn linux_ipv6_enabled(name: &str) -> Option<bool> {
+    let path = std::path::Path::new("/proc/sys/net/ipv6/conf")
+        .join(name)
+        .join("disable_ipv6");
+    match std::fs::read_to_string(path).ok()?.trim() {
+        "0" => Some(true),
+        "1" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn linux_ssid(name: &str) -> Option<String> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

@@ -3,7 +3,7 @@
 set -eu
 test "$(uname -s)" = Darwin || { echo 'macOS packaging requires a macOS build host' >&2; exit 2; }
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-version=${VERSION:-0.1.2}; arch=${ARCH:-$(uname -m)}
+version=${VERSION:-0.1.4}; arch=${ARCH:-$(uname -m)}
 case "$arch" in x86_64|aarch64|arm64) ;; *) exit 2;; esac
 bin=${BIN_DIR:-$root/target/release}; stage=$root/build/macos-$arch; out=$root/dist/macos-$arch
 python3 "$root/scripts/fingerprint-source.py" --check "$bin/bitnet-build-source.json" >/dev/null
@@ -37,7 +37,10 @@ for docs in "$app/Contents/Resources/licenses" "$helpers/BitNetLicenses"; do
     install -m 0644 "$licenses/THIRD-PARTY-NOTICES.txt" "$docs/THIRD-PARTY-NOTICES.txt"
     install -m 0644 "$licenses/THIRD-PARTY-NOTICES.json" "$docs/THIRD-PARTY-NOTICES.json"
 done
-for name in bitnet-gui bitengine bitctl bitmaint; do install -m 0755 "$bin/$name" "$app/Contents/MacOS/$name"; done
+install -m 0644 "$root/crates/bitnet-gui/assets/fonts/LICENSE.txt" "$app/Contents/Resources/licenses/FONT-OFL.txt"
+for name in bitnet-gui bitengine bitctl bitmaint bitnet-tui bitnet-web; do
+    install -m 0755 "$bin/$name" "$app/Contents/MacOS/$name"
+done
 install -m 0755 "$bin/bitengine" "$helpers/top.nsapi.bitnet.engine"
 install -m 0755 "$bin/bitmaint" "$helpers/top.nsapi.bitnet.maint"
 install -m 0755 "$bin/bitkeychain" "$helpers/top.nsapi.bitnet.keychain"

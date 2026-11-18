@@ -50,6 +50,8 @@ Section
   !insertmacro RequireRegularPath "$Stage"
   SetOutPath "$Stage"
   File "${STAGE}\bitnet-gui.exe"
+  File "${STAGE}\bitnet-tui.exe"
+  File "${STAGE}\bitnet-web.exe"
   File "${STAGE}\bitengine.exe"
   File "${STAGE}\bitctl.exe"
   File "${STAGE}\bitmaint.exe"
@@ -65,6 +67,8 @@ Section
 
 releaseStage:
   Delete "$Stage\bitnet-gui.exe"
+  Delete "$Stage\bitnet-tui.exe"
+  Delete "$Stage\bitnet-web.exe"
   Delete "$Stage\bitengine.exe"
   Delete "$Stage\bitctl.exe"
   Delete "$Stage\bitmaint.exe"
@@ -77,6 +81,8 @@ releaseStage:
 launch:
   !insertmacro RequireRegularPath "$Payload"
   !insertmacro RequireRegularPath "$Payload\bitnet-gui.exe"
+  !insertmacro RequireRegularPath "$Payload\bitnet-tui.exe"
+  !insertmacro RequireRegularPath "$Payload\bitnet-web.exe"
   !insertmacro RequireRegularPath "$Payload\bitengine.exe"
   !insertmacro RequireRegularPath "$Payload\bitctl.exe"
   !insertmacro RequireRegularPath "$Payload\bitmaint.exe"

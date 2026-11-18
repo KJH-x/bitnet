@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect original distribution notices from offline Cargo metadata and cache.
+"""Collect original distribution notices from Cargo's offline target graph and cache.
 
 This is a local evidence collector, not an SPDX expression interpreter or a
 linker-level software bill of materials. It never fetches missing dependencies.
@@ -33,6 +33,27 @@ def run_json(command: list[str], cwd: Path) -> dict[str, Any]:
     if result.returncode:
         raise RuntimeError(result.stderr.decode("utf-8", errors="replace").strip())
     return json.loads(result.stdout)
+
+
+def active_cargo_packages(target: str) -> set[tuple[str, str]]:
+    result = subprocess.run(
+        ["cargo", "tree", "--offline", "--locked", "--workspace", "--target", target,
+         "--edges", "normal,build", "--prefix", "none", "--format", "{p}", "--color", "never"],
+        cwd=PROJECT, capture_output=True, timeout=120, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="replace").strip())
+    packages = set()
+    for line in result.stdout.decode("utf-8").splitlines():
+        if not line:
+            continue
+        match = re.fullmatch(r"([A-Za-z0-9_-]+) v([A-Za-z0-9.+-]+)(?: .*)?", line)
+        if match is None:
+            raise ValueError("Unexpected package line in Cargo's target dependency tree")
+        packages.add((match[1], match[2]))
+    if not packages:
+        raise ValueError("Cargo's target dependency tree is empty")
+    return packages
 
 
 def host_target() -> str:
@@ -219,10 +240,54 @@ def complete_root_licenses(entries: list[dict[str, Any]], documents: dict[str, d
             entry["license_files"].append(item)
 
 
-def collect(metadata: dict[str, Any], target: str, extras: list[str]) -> dict[str, Any]:
+def bundled_font_notices(root: Path, documents: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    folder = root / "crates/bitnet-gui/assets/fonts"
+    manifest = folder / "manifest.json"
+    if not manifest.is_file():
+        return []
+    record = json.loads(manifest.read_text(encoding="utf-8"))
+    license_document = read_document(folder / record["license_file"], folder, documents)
+    if license_document["sha256"] != record["license_sha256"]:
+        raise ValueError("Bundled font license SHA256 mismatch")
+    assets = []
+    for supplied in record["files"]:
+        path = folder / supplied["file"]
+        resolved = path.resolve(strict=True)
+        if not inside(resolved, folder.resolve()) or not resolved.is_file():
+            raise ValueError("Bundled font resolves outside its asset directory")
+        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        if digest != supplied["sha256"] or resolved.stat().st_size != supplied["bytes"]:
+            raise ValueError(f"Bundled font SHA256/size mismatch for {supplied['file']}")
+        assets.append(dict(supplied))
+    if len(assets) != 2:
+        raise ValueError("Expected the regular and medium bundled fonts")
+    license_document["provenance"] = {
+        "kind": "bundled-subset-font", "repository": record["repository"],
+        "commit": record["commit"], "url": record["license_url"],
+    }
+    return [{
+        "name": record["name"], "version": record["version"], "spdx": record["spdx"],
+        "source": record["repository"] + "#" + record["commit"],
+        "license_files": [license_document], "assets": assets,
+    }]
+
+
+def collect(
+    metadata: dict[str, Any], target: str, extras: list[str], active: set[tuple[str, str]],
+) -> dict[str, Any]:
     root = Path(metadata["workspace_root"]).resolve()
     members = set(metadata["workspace_members"])
     selected = selected_packages(metadata)
+    # Metadata can include optional dependencies reached through weak feature
+    # references. Cargo's target tree shows which packages are actually active.
+    packages = [
+        p for p in metadata["packages"]
+        if p["id"] in selected and (p["name"], p["version"]) in active
+    ]
+    missing = active - {(p["name"], p["version"]) for p in packages}
+    if missing:
+        names = ", ".join(f"{name} {version}" for name, version in sorted(missing))
+        raise ValueError(f"Active Cargo dependencies missing from metadata: {names}")
     nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
     documents: dict[str, dict[str, Any]] = {}
     entries: list[dict[str, Any]] = []
@@ -230,9 +295,7 @@ def collect(metadata: dict[str, Any], target: str, extras: list[str]) -> dict[st
     project_documents = []
     for relative in ("LICENSE", "crates/bitnet-gateway/NOTICE"):
         project_documents.append(read_document(root / relative, root, documents))
-    for package in sorted(metadata["packages"], key=lambda p: (p["name"], p["version"], p["id"])):
-        if package["id"] not in selected:
-            continue
+    for package in sorted(packages, key=lambda p: (p["name"], p["version"], p["id"])):
         package_root = Path(package["manifest_path"]).resolve().parent
         workspace = package["id"] in members
         source = package["source"]
@@ -270,7 +333,7 @@ def collect(metadata: dict[str, Any], target: str, extras: list[str]) -> dict[st
             entry["warnings"].append("No original LICENSE/COPYING/NOTICE document found in the local package")
         for warning in entry["warnings"]:
             issues.append({"package": f"{entry['name']} {entry['version']}", "detail": warning})
-    external_documents = []
+    external_documents = bundled_font_notices(root, documents)
     for value in extras:
         # LABEL=PATH is optional. A Windows drive colon is never split.
         label, supplied = value.split("=", 1) if "=" in value else (Path(value).name, value)
@@ -312,6 +375,9 @@ def render(report: dict[str, Any]) -> str:
             lines.append(f"  {item['path']} -> SHA256 {item['sha256']}")
             if item.get("provenance"):
                 lines.append("    Provenance: " + json.dumps(item["provenance"], ensure_ascii=False, sort_keys=True))
+        for asset in package.get("assets", []):
+            lines.append(f"  Bundled font: {asset['file']} -> SHA256 {asset['sha256']}")
+            lines.append(f"    Upstream: {asset['source_url']} -> SHA256 {asset['source_sha256']}")
         for warning in package.get("warnings", []):
             lines.append(f"  COLLECTION WARNING: {warning}")
     lines += ["", "COLLECTION ISSUES", "-" * 72]
@@ -345,14 +411,18 @@ def main() -> int:
     parser.add_argument("--strict", action="store_true", help="Write the report, then fail if any collection issue is found")
     arguments = parser.parse_args()
     try:
-        target = arguments.target or host_target()
+        host = host_target()
+        target = arguments.target or host
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", target):
             raise ValueError("Invalid target triple")
         output = arguments.output_dir.resolve()
         if not inside(output, PROJECT):
             raise ValueError("Output directory must be inside this project")
-        metadata = run_json(["cargo", "metadata", "--offline", "--locked", "--format-version", "1", "--filter-platform", target], PROJECT)
-        report = collect(metadata, target, arguments.extra_license)
+        command = ["cargo", "metadata", "--offline", "--locked", "--format-version", "1", "--filter-platform", target]
+        if target != host:
+            command += ["--filter-platform", host]
+        metadata = run_json(command, PROJECT)
+        report = collect(metadata, target, arguments.extra_license, active_cargo_packages(target))
         output.mkdir(parents=True, exist_ok=True)
         atomic_write(output / "THIRD-PARTY-NOTICES.txt", render(report))
         atomic_write(output / "THIRD-PARTY-NOTICES.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")

@@ -60,9 +60,12 @@ impl History {
         Ok(())
     }
     pub fn recent(&self, limit: u32) -> Result<Vec<HistoryEvent>, AppError> {
-        let mut statement=self.db.prepare("SELECT id,at,kind,message,account,duration_ms,details FROM events ORDER BY id DESC LIMIT ?1").map_err(db_error)?;
+        self.recent_before(limit, i64::MAX)
+    }
+    pub fn recent_before(&self, limit: u32, before_id: i64) -> Result<Vec<HistoryEvent>, AppError> {
+        let mut statement=self.db.prepare("SELECT id,at,kind,message,account,duration_ms,details FROM events WHERE id < ?2 ORDER BY id DESC LIMIT ?1").map_err(db_error)?;
         let rows = statement
-            .query_map([limit.clamp(1, 1000)], |r| {
+            .query_map(params![limit.clamp(1, 1000), before_id], |r| {
                 Ok(HistoryEvent {
                     id: r.get(0)?,
                     at: r.get(1)?,
@@ -102,5 +105,9 @@ mod tests {
         assert_eq!(stats.login_successes, 1);
         assert_eq!(stats.login_failures, 1);
         assert_eq!(history.recent(5).unwrap().len(), 2);
+        let latest = &history.recent(1).unwrap()[0];
+        let earlier = history.recent_before(5, latest.id).unwrap();
+        assert_eq!(earlier.len(), 1);
+        assert_eq!(earlier[0].kind, "login_success");
     }
 }

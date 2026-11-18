@@ -21,14 +21,14 @@ if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
     stage=$(mktemp -d "$base/.stage.XXXXXXXX")
     # Concurrent launchers publish once. The losing stage is never executed.
     cleanup() {
-        for program in bitengine bitctl bitmaint bitnet-gui SHA256SUMS; do
+        for program in bitengine bitctl bitmaint bitnet-gui bitnet-tui bitnet-web SHA256SUMS; do
             rm -f -- "$stage/$program"
         done
         rmdir -- "$stage"
     }
     trap cleanup EXIT
     trap 'exit 1' HUP INT TERM
-    for program in bitengine bitctl bitmaint bitnet-gui; do
+    for program in bitengine bitctl bitmaint bitnet-gui bitnet-tui bitnet-web; do
         install -m 0700 -- "$payload/$program" "$stage/$program"
     done
     install -m 0600 -- "$payload/SHA256SUMS" "$stage/SHA256SUMS"
@@ -42,7 +42,7 @@ if [ -L "$dest" ] || [ "$(stat -c '%u:%a' -- "$dest")" != "$(id -u):700" ]; then
     echo 'BitNet portable directory is not private.' >&2
     exit 1
 fi
-for program in bitengine bitctl bitmaint bitnet-gui SHA256SUMS; do
+for program in bitengine bitctl bitmaint bitnet-gui bitnet-tui bitnet-web SHA256SUMS; do
     if [ -L "$dest/$program" ] || [ ! -f "$dest/$program" ]; then
         echo 'Invalid BitNet portable payload. Remove its version directory and try again.' >&2
         exit 1
@@ -52,5 +52,7 @@ cmp -s -- "$payload/SHA256SUMS" "$dest/SHA256SUMS"
 (cd -- "$dest" && sha256sum --quiet -c SHA256SUMS)
 case "${1:-}" in
     --cli) shift; exec "$dest/bitctl" "$@" ;;
+    --tui) shift; exec "$dest/bitnet-tui" "$@" ;;
+    --web) shift; exec "$dest/bitnet-web" "$@" ;;
     *) exec "$dest/bitnet-gui" "$@" ;;
 esac

@@ -1,20 +1,21 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod design;
 mod notifications;
 mod tray;
 mod views;
 
 use bitnet_core::{
-    AccountInfo, AppError, AuthState, Command, EngineState, Environment, ErrorCode, Health,
-    HistoryEvent, NetworkRule, ReplyData, Scope, Secret, Settings, Snapshot, Statistics,
-    APP_VERSION,
+    AccountInfo, AppError, AuthState, Command, EngineState, Environment, ErrorCode, NetworkRule,
+    ReplyData, Scope, Secret, Settings, Snapshot, Statistics, APP_VERSION,
 };
+use bitnet_core::{HealthExpect, HealthTarget as ConfigHealthTarget, MAX_HEALTH_TARGETS};
+use bitnet_launcher::{LaunchError, WebAction};
 use bitnet_runtime::client::Client;
-use bitnet_runtime::maintenance::{self, MaintenanceAction, MaintenanceResult};
+use bitnet_runtime::maintenance::{self, InterfaceTarget, MaintenanceAction, MaintenanceResult};
 use bitnet_runtime::update_policy::{self, UpdateOutcome, UpdatePolicy};
 use iced::{widget::text_editor, window, Element, Font, Subscription, Task, Theme};
 use std::{
-    collections::HashSet,
     fmt,
     time::{Duration, Instant},
 };
@@ -22,26 +23,21 @@ use zeroize::Zeroize;
 
 fn main() -> iced::Result {
     iced::daemon(App::new, App::update, App::view)
+        .settings(iced::Settings {
+            font: design::family(),
+            text_size: iced::Pixels(design::get().typography.body),
+            line_height: iced::widget::text::LineHeight::Relative(
+                design::get().typography.line_height,
+            ),
+            ..iced::Settings::default()
+        })
         .title(App::title)
         .theme(App::theme)
+        .style(|_, theme| design::app_style(theme))
         .subscription(App::subscription)
-        .default_font(default_font())
+        .font(include_bytes!("../assets/fonts/BitNetHanSansSC-Regular-3755.otf").as_slice())
+        .font(include_bytes!("../assets/fonts/BitNetHanSansSC-Medium-3755.otf").as_slice())
         .run()
-}
-
-fn default_font() -> Font {
-    #[cfg(target_os = "windows")]
-    {
-        Font::new("Microsoft YaHei UI")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Font::new("PingFang SC")
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        Font::new("Noto Sans CJK SC")
-    }
 }
 
 fn preview_only() -> bool {
@@ -55,29 +51,52 @@ enum Page {
     Networks,
     Settings,
     Service,
-    History,
+    Health,
     Statistics,
     Diagnostics,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkSection {
+    Adapters,
+    Profiles,
+    Rules,
+    RuleEditor,
+}
 impl Page {
-    const ALL: [Self; 4] = [Self::Status, Self::Accounts, Self::Service, Self::Settings];
+    /// Sub-tab label inside the connection area; never equal to the area name.
+    fn tab_label(self, english: bool) -> &'static str {
+        match (self, english) {
+            (Self::Status, false) => "状态",
+            (Self::Status, true) => "Status",
+            _ => self.label(english),
+        }
+    }
+
+    const ALL: [Self; 5] = [
+        Self::Status,
+        Self::Accounts,
+        Self::Networks,
+        Self::Service,
+        Self::Settings,
+    ];
     fn label(self, english: bool) -> &'static str {
         match (self, english) {
-            (Self::Status, false) => "连接状态",
+            (Self::Status, false) => "连接",
             (Self::Status, true) => "Connection",
-            (Self::Accounts, false) => "账户管理",
+            (Self::Accounts, false) => "账户",
             (Self::Accounts, true) => "Accounts",
-            (Self::Networks, false) => "网络与规则",
-            (Self::Networks, true) => "Networks & rules",
+            (Self::Networks, false) => "网络",
+            (Self::Networks, true) => "Network",
             (Self::Settings, false) => "软件设置",
             (Self::Settings, true) => "Settings",
             (Self::Service, false) => "后台服务",
-            (Self::Service, true) => "Background service",
-            (Self::History, false) => "日志与历史",
-            (Self::History, true) => "Activity & history",
-            (Self::Statistics, false) => "运行统计",
-            (Self::Statistics, true) => "Statistics",
-            (Self::Diagnostics, false) => "网络诊断",
+            (Self::Service, true) => "Server Mode",
+            (Self::Health, false) => "详情",
+            (Self::Health, true) => "Details",
+            (Self::Statistics, false) => "统计",
+            (Self::Statistics, true) => "Stats",
+            (Self::Diagnostics, false) => "诊断",
             (Self::Diagnostics, true) => "Diagnostics",
         }
     }
@@ -87,6 +106,16 @@ impl Page {
 enum Language {
     Chinese,
     English,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    General,
+    Checks,
+    Trust,
+    Diagnostics,
+    Updates,
+    Transfer,
 }
 impl fmt::Display for Language {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -102,13 +131,16 @@ enum Appearance {
     Light,
     Dark,
 }
-impl fmt::Display for Appearance {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::System => "跟随系统 / System",
-            Self::Light => "浅色 / Light",
-            Self::Dark => "深色 / Dark",
-        })
+impl Appearance {
+    fn label(self, english: bool) -> &'static str {
+        match (self, english) {
+            (Self::System, false) => "跟随系统",
+            (Self::System, true) => "System",
+            (Self::Light, false) => "浅色",
+            (Self::Light, true) => "Light",
+            (Self::Dark, false) => "深色",
+            (Self::Dark, true) => "Dark",
+        }
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,12 +148,14 @@ enum Mode {
     User,
     System,
 }
-impl fmt::Display for Mode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::User => "自动选择 / Automatic",
-            Self::System => "系统后台 / System service",
-        })
+impl Mode {
+    fn label(self, english: bool) -> &'static str {
+        match (self, english) {
+            (Self::User, false) => "自动选择",
+            (Self::User, true) => "Automatic",
+            (Self::System, false) => "系统后台",
+            (Self::System, true) => "System service",
+        }
     }
 }
 impl From<Mode> for Scope {
@@ -158,19 +192,11 @@ enum Confirmation {
     TemporaryLogin {
         expected_network: String,
         username: String,
-        adapter: String,
-        gateway: String,
     },
-    TrustNetwork,
     EnableAutomatic {
         expected_network: String,
-        adapter: String,
     },
-    VerifyAccount {
-        expected_network: String,
-        username: String,
-        adapter: String,
-    },
+    SwitchAccount(SavedAccountTarget),
     Logout,
     ForceLogin,
     DeleteAccount(String),
@@ -178,6 +204,55 @@ enum Confirmation {
     DeleteProfile(String),
     Shutdown,
     Maintenance(MaintenanceAction),
+    ClearLogs {
+        scope: Scope,
+        bytes: u64,
+    },
+}
+
+#[derive(Clone)]
+struct NetworkPrompt {
+    fingerprint: String,
+    label: String,
+}
+
+#[derive(Clone)]
+struct SavedAccountTarget {
+    id: String,
+    username: String,
+    network: String,
+    scope: Scope,
+    revision: u64,
+}
+
+impl SavedAccountTarget {
+    fn capture(snapshot: &Snapshot, id: &str) -> Option<Self> {
+        if !snapshot
+            .capabilities
+            .iter()
+            .any(|item| item == "switch_account")
+            || bitnet_runtime::engine::uses_system_authentication(snapshot)
+        {
+            return None;
+        }
+        let account = snapshot.accounts.iter().find(|account| account.id == id)?;
+        account.has_password.then_some(Self {
+            id: id.to_owned(),
+            username: account.username.clone(),
+            network: confirmation_target(snapshot)?.0,
+            scope: snapshot.scope,
+            revision: snapshot.settings.revision,
+        })
+    }
+
+    fn matches(&self, snapshot: &Snapshot) -> bool {
+        Self::capture(snapshot, &self.id).is_some_and(|current| {
+            current.network == self.network
+                && current.scope == self.scope
+                && current.revision == self.revision
+                && current.username == self.username
+        })
+    }
 }
 
 fn is_alternate_adapter(interface: &bitnet_core::NetworkInterface) -> bool {
@@ -214,6 +289,25 @@ fn selected_binding(snapshot: &Snapshot) -> Option<&bitnet_core::NetworkBinding>
     })
 }
 
+fn ipv6_adapter(snapshot: &Snapshot) -> Option<&bitnet_core::NetworkInterface> {
+    let binding = selected_binding(snapshot)?;
+    snapshot.interfaces.iter().find(|interface| {
+        interface.id == binding.interface_id && interface.index == binding.interface_index
+    })
+}
+
+fn ipv6_maintenance_target(snapshot: &Snapshot) -> Option<InterfaceTarget> {
+    if !cfg!(windows)
+        || snapshot
+            .capabilities
+            .iter()
+            .any(|item| item == "simulation")
+    {
+        return None;
+    }
+    InterfaceTarget::from_interface(ipv6_adapter(snapshot)?).ok()
+}
+
 fn confirmation_target(snapshot: &Snapshot) -> Option<(String, String)> {
     let binding = selected_binding(snapshot)?;
     let adapter = snapshot
@@ -234,6 +328,8 @@ fn confirmation_target(snapshot: &Snapshot) -> Option<(String, String)> {
 enum Message {
     Tick,
     TrayTick,
+    #[cfg(windows)]
+    TrayToggleWindow(window::Id, bool),
     NotificationSent(Result<(), String>),
     CheckUpdates,
     UpdateChecked(Result<UpdateOutcome, AppError>, bool),
@@ -252,15 +348,20 @@ enum Message {
     AutomaticChanged(bool),
     BeginAutomatic,
     NumberChanged(NumericSetting, String),
-    ToggleAdvancedSettings,
+    SettingsTabChanged(SettingsTab),
     OpenHealthEditor,
     HealthEntryChanged(usize, String),
+    HealthEntryExpectChanged(usize, HealthCondition),
+    HealthEntryValueChanged(usize, String),
     HealthEntryAdded,
     HealthEntryRemoved(usize),
     SaveHealthEditor,
     CancelHealthEditor,
     ToggleAlternateAdapters,
-    ToggleAdvancedNetworks,
+    NetworkBack,
+    NetworkTab(NetworkSection),
+    NetworkPage(usize),
+    BeginRule,
     SaveSettings,
     RevertSettings,
     Run(Command),
@@ -274,9 +375,11 @@ enum Message {
     Refresh,
     UsernameChanged(String),
     PasswordChanged(String),
-    AccountEdit(String),
+    AccountAdd,
+    AccountPage(usize),
     AccountCancel,
-    AccountSave,
+    AccountSave(String),
+    SwitchAccount(SavedAccountTarget),
     OpenQuickLogin,
     TemporaryLogin,
     RuleNameChanged(String),
@@ -293,24 +396,23 @@ enum Message {
     RuleEdit(usize),
     RuleSave,
     RuleCancel,
-    InterfaceSelected(String),
-    HistoryFilterChanged(String),
-    HistoryDetailToggled(i64),
-    HistoryMoveSelection(bool),
-    HistoryToggleSelection,
-    HistoryLoad(bool),
-    CopyHistory,
-    OpenHistoryExport,
-    CloseHistoryExport,
-    HistoryExportPathChanged(String),
-    ExportHistory,
-    HistoryExported(Result<(), std::io::ErrorKind>),
+    InterfaceSelected(Option<(String, Option<String>)>),
+    NetworkDecision {
+        fingerprint: String,
+        allow: Option<bool>,
+    },
+    TrustPage(usize),
     ImportAction(text_editor::Action),
     ImportSettings,
     CopyExport,
     CopyDiagnostics,
+    WebLogs(WebAction),
+    WebLogsFinished(WebAction, Result<(), LaunchError>),
     WindowOpened(window::Id),
     WindowCloseRequested(window::Id),
+    TogglePassword,
+    ToggleIps,
+    RevealTick,
 }
 
 // Text-input messages may contain a freshly entered password. Never derive a
@@ -332,7 +434,6 @@ struct SettingsDraft {
     request_timeout: String,
     log_retention: String,
     history_retention: String,
-    health_targets: String,
     dirty: bool,
 }
 impl SettingsDraft {
@@ -344,36 +445,64 @@ impl SettingsDraft {
             request_timeout: settings.request_timeout_secs.to_string(),
             log_retention: settings.log_retention_days.to_string(),
             history_retention: settings.history_retention_days.to_string(),
-            health_targets: settings.health_targets.join("; "),
             settings,
             dirty: false,
         }
     }
-    fn validated(&self) -> Result<Settings, AppError> {
-        fn number<T: std::str::FromStr>(s: &str) -> Result<T, AppError> {
+    fn validated(&self, english: bool) -> Result<Settings, AppError> {
+        fn number<T: std::str::FromStr>(s: &str, english: bool) -> Result<T, AppError> {
             s.trim().parse().map_err(|_| {
                 AppError::new(
                     ErrorCode::InvalidInput,
-                    "请输入有效的整数 / Enter a valid integer",
+                    if english {
+                        "Enter a whole number"
+                    } else {
+                        "请输入整数"
+                    },
                 )
             })
         }
         let mut settings = self.settings.clone();
-        settings.status_interval_secs = number(&self.status_interval)?;
-        settings.health_interval_secs = number(&self.health_interval)?;
-        settings.retry_max_secs = number(&self.retry_maximum)?;
-        settings.request_timeout_secs = number(&self.request_timeout)?;
-        settings.log_retention_days = number(&self.log_retention)?;
-        settings.history_retention_days = number(&self.history_retention)?;
-        settings.health_targets = self
-            .health_targets
-            .split(['\n', ';'])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
+        settings.status_interval_secs = number(&self.status_interval, english)?;
+        settings.health_interval_secs = number(&self.health_interval, english)?;
+        settings.retry_max_secs = number(&self.retry_maximum, english)?;
+        settings.request_timeout_secs = number(&self.request_timeout, english)?;
+        settings.log_retention_days = number(&self.log_retention, english)?;
+        settings.history_retention_days = number(&self.history_retention, english)?;
         settings.validate()?;
         Ok(settings)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum HealthCondition {
+    #[default]
+    AnySuccess,
+    Status,
+    BodyEquals,
+    BodyContains,
+}
+
+#[derive(Clone, Default)]
+struct HealthTarget {
+    url: String,
+    condition: HealthCondition,
+    value: String,
+}
+
+impl From<ConfigHealthTarget> for HealthTarget {
+    fn from(target: ConfigHealthTarget) -> Self {
+        let (condition, value) = match target.expect {
+            HealthExpect::AnySuccess => (HealthCondition::AnySuccess, String::new()),
+            HealthExpect::Status(code) => (HealthCondition::Status, code.to_string()),
+            HealthExpect::BodyEquals(body) => (HealthCondition::BodyEquals, body),
+            HealthExpect::BodyContains(body) => (HealthCondition::BodyContains, body),
+        };
+        Self {
+            url: target.url,
+            condition,
+            value,
+        }
     }
 }
 
@@ -389,10 +518,11 @@ enum CredentialRequest {
     VerifyAccount,
     VerifyQuickLogin,
     TemporaryLogin,
+    SwitchAccount,
 }
 impl CredentialRequest {
     fn saves_account(self) -> bool {
-        self != Self::TemporaryLogin
+        matches!(self, Self::VerifyAccount | Self::VerifyQuickLogin)
     }
 }
 
@@ -423,28 +553,26 @@ struct App {
     language: Language,
     appearance: Appearance,
     account: AccountDraft,
+    account_editing: bool,
+    account_offset: usize,
     quick_login: Option<AccountDraft>,
     rule: RuleDraft,
     profile_id: String,
     profile_name: String,
-    history: Vec<HistoryEvent>,
-    history_filter: String,
-    history_selection: Option<i64>,
-    history_limit: u32,
-    history_export_path: Option<String>,
-    history_exporting: bool,
-    expanded_history: HashSet<i64>,
     statistics: Option<Statistics>,
+    log_viewer_busy: bool,
+    log_size: Option<(Scope, u64)>,
     diagnostics: String,
     exported: String,
     import_content: text_editor::Content,
     confirmation: Option<Confirmation>,
-    modal: Option<Page>,
-    advanced_settings: bool,
-    health_editor: Option<Vec<String>>,
+    network_return: Page,
+    settings_tab: SettingsTab,
+    health_editor: Option<Vec<HealthTarget>>,
     enabling_automatic: bool,
     alternate_adapters: bool,
-    advanced_networks: bool,
+    network_section: NetworkSection,
+    network_offset: usize,
     notice: Option<(bool, String)>,
     notice_until: Option<Instant>,
     connection_error: Option<AppError>,
@@ -464,6 +592,13 @@ struct App {
     notification_gate: notifications::Gate,
     pending_notification: Option<notifications::Kind>,
     update_policy: UpdatePolicy,
+    /// Wall clock until which an entered password is shown in clear text.
+    password_revealed_until: Option<Instant>,
+    /// Whether IP addresses are shown in clear text. Never persisted.
+    ips_revealed: bool,
+    network_prompt: Option<NetworkPrompt>,
+    skipped_network: Option<String>,
+    trust_offset: usize,
 }
 
 impl App {
@@ -489,28 +624,26 @@ impl App {
             language: Language::Chinese,
             appearance: Appearance::System,
             account: AccountDraft::default(),
+            account_editing: false,
+            account_offset: 0,
             quick_login: None,
             rule: RuleDraft::default(),
             profile_id: String::new(),
             profile_name: String::new(),
-            history: Vec::new(),
-            history_filter: String::new(),
-            history_selection: None,
-            history_limit: 40,
-            history_export_path: None,
-            history_exporting: false,
-            expanded_history: HashSet::new(),
             statistics: None,
+            log_viewer_busy: false,
+            log_size: None,
             diagnostics: String::new(),
             exported: String::new(),
             import_content: text_editor::Content::new(),
             confirmation: None,
-            modal: None,
-            advanced_settings: false,
+            network_return: Page::Status,
+            settings_tab: SettingsTab::General,
             health_editor: None,
             enabling_automatic: false,
             alternate_adapters: false,
-            advanced_networks: false,
+            network_section: NetworkSection::Adapters,
+            network_offset: 0,
             notice: None,
             notice_until: None,
             connection_error: None,
@@ -530,6 +663,11 @@ impl App {
             notification_gate: notifications::Gate::default(),
             pending_notification: None,
             update_policy: UpdatePolicy::new(),
+            password_revealed_until: None,
+            ips_revealed: false,
+            network_prompt: None,
+            skipped_network: None,
+            trust_offset: 0,
         };
         let connection = Self::connect(app.client.clone());
         (app, connection)
@@ -550,6 +688,19 @@ impl App {
         )
     }
 
+    fn password_visible(&self) -> bool {
+        self.password_revealed_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn reveal_password(&mut self) {
+        self.password_revealed_until = if self.password_visible() {
+            None
+        } else {
+            Some(Instant::now() + Duration::from_secs(5))
+        };
+    }
+
     fn t(&self, zh: &'static str, en: &'static str) -> &'static str {
         if self.language == Language::English {
             en
@@ -559,6 +710,12 @@ impl App {
     }
     fn english(&self) -> bool {
         self.language == Language::English
+    }
+    fn set_language(&mut self, language: Language) {
+        self.language = language;
+        if let Some(tray) = &mut self.tray {
+            tray.set_language(language == Language::English);
+        }
     }
     fn login_message(snapshot: &Snapshot) -> Message {
         if snapshot.network_trusted {
@@ -608,13 +765,14 @@ impl App {
         }
         Some(Secret::new(std::mem::take(&mut draft.password)))
     }
-    fn prepare_login_confirmation(&mut self, temporary: bool) {
+    fn prepare_login(&mut self, confirmed_network: Option<String>) -> Task<Message> {
+        let temporary = confirmed_network.is_none();
         if self.busy
             || !self.snapshot_current
             || self.confirmation.is_some()
             || (temporary && self.quick_login.is_none())
         {
-            return;
+            return Task::none();
         }
         let username = self.login_draft().username.trim().to_owned();
         if username.is_empty() || self.login_draft().password.is_empty() {
@@ -626,10 +784,10 @@ impl App {
                 )
                 .into(),
             );
-            return;
+            return Task::none();
         }
         let Some(snapshot) = &self.snapshot else {
-            return;
+            return Task::none();
         };
         if temporary && snapshot.session.auth == AuthState::Authenticated {
             self.show_notice(
@@ -640,7 +798,7 @@ impl App {
                 )
                 .into(),
             );
-            return;
+            return Task::none();
         }
         let capability = if temporary {
             "login_once"
@@ -656,7 +814,7 @@ impl App {
                 )
                 .into(),
             );
-            return;
+            return Task::none();
         }
         if bitnet_runtime::engine::uses_system_authentication(snapshot) {
             self.show_notice(
@@ -667,32 +825,82 @@ impl App {
                 )
                 .into(),
             );
-            return;
+            return Task::none();
         }
-        let Some((expected_network, adapter)) = confirmation_target(snapshot) else {
-            self.show_notice(true, self.t(
-                "请先连接校园认证网络，或在「网络与规则」中选择网卡。",
-                "Connect to the campus portal network or choose an adapter in Network and rules.",
-            ).into());
-            return;
-        };
-        let confirmation = if temporary {
-            Confirmation::TemporaryLogin {
-                expected_network,
-                username,
-                adapter,
-                gateway: snapshot.settings.gateway.base_url.clone(),
-            }
-        } else {
-            Confirmation::VerifyAccount {
-                expected_network,
-                username,
-                adapter,
-            }
+        let Some((expected_network, _)) = confirmation_target(snapshot) else {
+            self.show_notice(
+                true,
+                self.t(
+                    "请先连接校园网，或在「网络」中选择网卡。",
+                    "Connect to the campus network or choose an adapter under Network.",
+                )
+                .into(),
+            );
+            return Task::none();
         };
         self.clear_notice();
-        self.confirmation = Some(confirmation);
+        self.password_revealed_until = None;
+        if temporary {
+            self.confirmation = Some(Confirmation::TemporaryLogin {
+                expected_network,
+                username,
+            });
+            return Task::none();
+        }
+        let expected_network = confirmed_network.expect("account save supplies a network");
+        let Some(password) = self.take_confirmed_password(&username, &expected_network) else {
+            return Task::none();
+        };
+        let id = self
+            .login_draft()
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("account-{}", bitnet_core::now_ms()));
+        self.execute(Command::VerifyAccount {
+            id,
+            username,
+            password,
+            expected_network,
+        })
     }
+    fn switch_saved_account(
+        &mut self,
+        target: SavedAccountTarget,
+        confirmed: bool,
+    ) -> Task<Message> {
+        if self.busy || !self.snapshot_current {
+            return Task::none();
+        }
+        let Some(snapshot) = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| target.matches(snapshot))
+        else {
+            self.show_notice(
+                true,
+                self.t(
+                    "账户或网络已变化，请刷新后重新选择",
+                    "The account or network changed. Refresh and choose again.",
+                )
+                .into(),
+            );
+            return Task::none();
+        };
+        let disconnecting = snapshot.session.auth != AuthState::Unauthenticated
+            && snapshot.session.username.as_deref() != Some(&target.username);
+        if disconnecting && !confirmed {
+            self.confirmation = Some(Confirmation::SwitchAccount(target));
+            return self.open_window();
+        }
+        self.execute(Command::SwitchAccount {
+            id: target.id,
+            expected_network: target.network,
+            expected_scope: target.scope,
+            expected_revision: target.revision,
+            confirmed,
+        })
+    }
+
     fn title(&self, _: window::Id) -> String {
         let app = if preview_only() {
             self.t("BitNet 预览", "BitNet Preview")
@@ -704,13 +912,18 @@ impl App {
     fn theme(&self, _: window::Id) -> Option<Theme> {
         match self.appearance {
             Appearance::System => None,
-            Appearance::Light => Some(Theme::Light),
-            Appearance::Dark => Some(Theme::Dark),
+            Appearance::Light => Some(design::theme("light")),
+            Appearance::Dark => Some(design::theme("dark")),
         }
     }
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             iced::time::every(Duration::from_secs(2)).map(|_| Message::Tick),
+            if self.password_revealed_until.is_some() {
+                iced::time::every(Duration::from_millis(250)).map(|_| Message::RevealTick)
+            } else {
+                Subscription::none()
+            },
             if self.tray.is_some() {
                 iced::time::every(Duration::from_millis(250)).map(|_| Message::TrayTick)
             } else {
@@ -730,26 +943,11 @@ impl App {
                     Some(Message::MoveFocus(modifiers.shift()))
                 }
                 iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp),
-                    modifiers,
-                    ..
-                } if modifiers.is_empty() => Some(Message::HistoryMoveSelection(false)),
-                iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown),
-                    modifiers,
-                    ..
-                } if modifiers.is_empty() => Some(Message::HistoryMoveSelection(true)),
-                iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
                     modifiers,
                     repeat: false,
                     ..
                 } if modifiers.is_empty() => Some(Message::KeyboardEnter),
-                iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
-                    modifiers,
-                    ..
-                } if modifiers.is_empty() => Some(Message::HistoryToggleSelection),
                 _ => None,
             }),
         ])
@@ -768,6 +966,33 @@ impl App {
         task.map(Message::WindowOpened)
     }
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        let target = confirmation_target(&snapshot);
+        if let Some((fingerprint, _)) = &target {
+            if self
+                .skipped_network
+                .as_ref()
+                .is_some_and(|previous| previous != fingerprint)
+            {
+                self.skipped_network = None;
+            }
+        }
+        self.network_prompt = target.and_then(|(fingerprint, label)| {
+            (snapshot
+                .capabilities
+                .iter()
+                .any(|item| item == "network_permissions")
+                && snapshot.settings.automatic
+                && !snapshot.settings.paused
+                && !snapshot.verification_hold
+                && !snapshot.network_trusted
+                && !snapshot.accounts.is_empty()
+                && snapshot.environment != Environment::NonCampus
+                && snapshot.session.auth != AuthState::Unknown
+                && !bitnet_runtime::engine::uses_system_authentication(&snapshot)
+                && !bitnet_runtime::engine::network_permission_denied(&snapshot)
+                && self.skipped_network.as_ref() != Some(&fingerprint))
+            .then_some(NetworkPrompt { fingerprint, label })
+        });
         if let Some(kind) = self
             .notification_gate
             .observe(&snapshot, bitnet_core::now_secs())
@@ -802,6 +1027,24 @@ impl App {
                 snapshot.service.installed && (!self.snapshot_current || !snapshot.service.running)
             })
     }
+    fn can_read_log_size(&self) -> bool {
+        self.snapshot_current
+            && !self.busy
+            && self.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .capabilities
+                    .iter()
+                    .any(|item| item == "clear_logs")
+            })
+    }
+
+    fn current_log_size(&self) -> Option<(Scope, u64)> {
+        let (scope, bytes) = self.log_size?;
+        self.snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.scope == scope && self.snapshot_current)?;
+        Some((scope, bytes))
+    }
     fn refresh(&mut self) -> Task<Message> {
         if self.polling || self.connecting {
             return Task::none();
@@ -830,13 +1073,16 @@ impl App {
             }
             Command::VerifyAccount { .. } => Some(CredentialRequest::VerifyAccount),
             Command::LoginOnce { .. } => Some(CredentialRequest::TemporaryLogin),
+            Command::SwitchAccount { .. } => Some(CredentialRequest::SwitchAccount),
             _ => None,
         };
         if self.pending_settings {
             self.saved_epoch = self.settings_epoch;
         }
         if let (
-            Command::AccountPut { id, .. } | Command::VerifyAccount { id, .. },
+            Command::AccountPut { id, .. }
+            | Command::VerifyAccount { id, .. }
+            | Command::SwitchAccount { id, .. },
             Some(snapshot),
         ) = (&command, &self.snapshot)
         {
@@ -847,6 +1093,7 @@ impl App {
                 if self
                     .credential_request
                     .is_some_and(CredentialRequest::saves_account)
+                    || matches!(command, Command::SwitchAccount { .. })
                     || expected.selected_account.is_none()
                 {
                     expected.selected_account = Some(id.clone());
@@ -895,6 +1142,23 @@ impl App {
             );
             return Task::none();
         }
+        if let Some(target) = action.ipv6_target() {
+            let actual = self
+                .snapshot
+                .as_ref()
+                .filter(|_| self.snapshot_current)
+                .and_then(ipv6_maintenance_target);
+            if actual.as_ref() != Some(target) {
+                self.error(AppError::new(
+                    ErrorCode::Unavailable,
+                    self.t(
+                        "当前网卡已更换，请刷新后再试",
+                        "The active adapter changed. Refresh and try again.",
+                    ),
+                ));
+                return Task::none();
+            }
+        }
         self.busy = true;
         self.request_epoch = self.request_epoch.wrapping_add(1);
         let current_scope = self
@@ -906,7 +1170,10 @@ impl App {
             MaintenanceAction::ServiceInstall
             | MaintenanceAction::ServiceStart
             | MaintenanceAction::ServiceStop
-            | MaintenanceAction::ServiceRemove { .. } => Scope::System,
+            | MaintenanceAction::ServiceRemove { .. }
+            | MaintenanceAction::EnableIpv6 { .. }
+            | MaintenanceAction::DisableIpv6 { .. }
+            | MaintenanceAction::ResetIpv6 { .. } => Scope::System,
             _ => current_scope,
         };
         Task::perform(
@@ -915,7 +1182,7 @@ impl App {
         )
     }
     fn save_settings(&mut self) -> Task<Message> {
-        match self.draft.validated() {
+        match self.draft.validated(self.english()) {
             Ok(settings) => {
                 // Edits belong to the revision they started from. A later status
                 // poll must not silently turn a stale edit into a valid overwrite.
@@ -948,6 +1215,13 @@ impl App {
                 if let Some(action) = self.tray.as_ref().and_then(tray::Tray::poll) {
                     return match action {
                         tray::Action::Open => self.open_window(),
+                        #[cfg(windows)]
+                        tray::Action::Toggle => match self.window {
+                            Some(id) => window::is_minimized(id).map(move |minimized| {
+                                Message::TrayToggleWindow(id, minimized.unwrap_or(false))
+                            }),
+                            None => self.open_window(),
+                        },
                         tray::Action::Check => self.execute(Command::Check),
                         tray::Action::Pause => self.execute(Command::Pause),
                         tray::Action::Resume => self.update(Message::Run(Command::Resume)),
@@ -955,6 +1229,17 @@ impl App {
                     };
                 }
                 Task::none()
+            }
+            #[cfg(windows)]
+            Message::TrayToggleWindow(id, minimized) => {
+                if self.window != Some(id) {
+                    return Task::none();
+                }
+                if minimized {
+                    window::minimize(id, false).chain(window::gain_focus(id))
+                } else {
+                    self.update(Message::WindowCloseRequested(id))
+                }
             }
             Message::Tick => {
                 if self
@@ -1144,6 +1429,7 @@ impl App {
                                 self.quick_login = None;
                             } else {
                                 self.account = AccountDraft::default();
+                                self.account_editing = false;
                             }
                             (
                                 false,
@@ -1157,6 +1443,11 @@ impl App {
                             (
                                 false,
                                 self.t("已登录，未保存凭据", "Signed in for this session"),
+                            )
+                        } else if credential_request == Some(CredentialRequest::SwitchAccount) {
+                            (
+                                false,
+                                self.t("已切换并确认账户在线", "Account switched and connected"),
                             )
                         } else if !checked {
                             (false, self.t("操作已完成", "Operation completed"))
@@ -1185,7 +1476,21 @@ impl App {
                         self.apply_snapshot(*snapshot);
                         self.show_notice(attention, message.into());
                     }
-                    Ok(ReplyData::History(history)) => self.history = history,
+                    Ok(ReplyData::History(_)) => {}
+                    Ok(ReplyData::LogSize { scope, bytes }) => {
+                        self.log_size = Some((scope, bytes));
+                    }
+                    Ok(ReplyData::LogsCleared { scope, bytes }) => {
+                        self.log_size = Some((scope, 0));
+                        self.show_notice(
+                            false,
+                            format!(
+                                "{} · {}",
+                                self.t("已清除诊断日志", "Diagnostic logs cleared"),
+                                format_log_size(bytes)
+                            ),
+                        );
+                    }
                     Ok(ReplyData::Statistics(statistics)) => self.statistics = Some(statistics),
                     Ok(ReplyData::Diagnostics(value)) => {
                         self.diagnostics = serde_json::to_string_pretty(&value).unwrap_or_default()
@@ -1209,37 +1514,55 @@ impl App {
             }
             Message::Navigate(page) => match page {
                 Page::Networks => {
-                    self.modal = Some(page);
-                    Task::none()
-                }
-                Page::History => {
-                    self.modal = Some(page);
-                    self.history_selection = None;
-                    self.history_limit = 40;
-                    self.history.clear();
-                    self.history_export_path = None;
-                    self.execute(Command::History {
-                        limit: self.history_limit,
-                    })
-                }
-                Page::Statistics => self.execute(Command::Statistics),
-                Page::Diagnostics => {
-                    self.page = Page::Settings;
-                    Task::none()
-                }
-                _ => {
+                    if self.page != Page::Networks {
+                        self.network_return = self.page;
+                    }
                     self.page = page;
-                    if page == Page::Status && self.snapshot_current {
+                    self.network_section = NetworkSection::Adapters;
+                    self.network_offset = 0;
+                    Task::none()
+                }
+                Page::Statistics => {
+                    self.enabling_automatic = false;
+                    self.page = page;
+                    if self.snapshot_current {
                         self.execute(Command::Statistics)
                     } else {
                         Task::none()
                     }
                 }
+                Page::Diagnostics => {
+                    self.enabling_automatic = false;
+                    self.page = Page::Diagnostics;
+                    Task::none()
+                }
+                Page::Settings => {
+                    self.enabling_automatic = false;
+                    self.page = page;
+                    if self.settings_tab == SettingsTab::Diagnostics && self.can_read_log_size() {
+                        self.log_size = None;
+                        self.execute(Command::LogSize)
+                    } else {
+                        Task::none()
+                    }
+                }
+                _ => {
+                    self.enabling_automatic = false;
+                    self.page = page;
+                    Task::none()
+                }
             },
             Message::MaintenanceCompleted(result) => {
                 self.busy = false;
                 match result {
-                    Ok(result) => self.show_notice(false, result.message),
+                    Ok(result) => {
+                        let message = match result.details["ipv6_enabled"].as_bool() {
+                            Some(true) => self.t("IPv6 已启用", "IPv6 enabled").into(),
+                            Some(false) => self.t("IPv6 已关闭", "IPv6 disabled").into(),
+                            None => result.message,
+                        };
+                        self.show_notice(false, message);
+                    }
                     Err(error) => self.error(error),
                 }
                 self.refresh()
@@ -1266,11 +1589,18 @@ impl App {
                 self.connection_error = None;
                 self.quick_login = None;
                 self.confirmation = None;
-                self.history.clear();
-                self.expanded_history.clear();
-                self.history_selection = None;
-                self.history_export_path = None;
+                self.account_editing = false;
+                self.password_revealed_until = None;
+                self.network_prompt = None;
+                self.skipped_network = None;
+                self.trust_offset = 0;
+                self.account_offset = 0;
+                self.account = AccountDraft::default();
+                self.enabling_automatic = false;
+                self.network_section = NetworkSection::Adapters;
+                self.network_offset = 0;
                 self.statistics = None;
+                self.log_size = None;
                 self.diagnostics.clear();
                 self.exported.clear();
                 self.draft = SettingsDraft::new(Settings::default());
@@ -1321,32 +1651,13 @@ impl App {
                         expected_network,
                     })
                 }
-                Some(Confirmation::VerifyAccount {
-                    expected_network,
-                    username,
-                    ..
-                }) => {
-                    let Some(password) = self.take_confirmed_password(&username, &expected_network)
-                    else {
-                        return Task::none();
-                    };
-                    let id = self
-                        .login_draft()
-                        .id
-                        .clone()
-                        .unwrap_or_else(|| format!("account-{}", bitnet_core::now_ms()));
-                    self.execute(Command::VerifyAccount {
-                        id,
-                        username,
-                        password,
-                        expected_network,
-                    })
-                }
                 Some(Confirmation::EnableAutomatic {
                     expected_network, ..
                 }) => {
                     self.enabling_automatic = false;
-                    self.modal = None;
+                    if self.page == Page::Networks {
+                        self.page = self.network_return;
+                    }
                     self.execute(Command::EnableAutomatic { expected_network })
                 }
                 Some(Confirmation::LoginOnce) => self.execute(Command::Login {
@@ -1354,9 +1665,6 @@ impl App {
                     force: false,
                     confirmed: true,
                 }),
-                Some(Confirmation::TrustNetwork) => {
-                    self.execute(Command::TrustNetwork { trusted: true })
-                }
                 Some(Confirmation::Logout) => self.execute(Command::Logout { confirmed: true }),
                 Some(Confirmation::ForceLogin) => self.execute(Command::Login {
                     account_id: None,
@@ -1376,14 +1684,31 @@ impl App {
                 }
                 Some(Confirmation::Shutdown) => self.execute(Command::Shutdown),
                 Some(Confirmation::Maintenance(action)) => self.maintain(action),
+                Some(Confirmation::SwitchAccount(target)) => {
+                    self.switch_saved_account(target, true)
+                }
+                Some(Confirmation::ClearLogs { scope, .. }) => {
+                    if !self.can_read_log_size()
+                        || self.current_log_size().map(|entry| entry.0) != Some(scope)
+                    {
+                        return Task::none();
+                    }
+                    self.log_size = None;
+                    self.execute(Command::ClearLogs {
+                        expected_scope: scope,
+                    })
+                }
                 None => Task::none(),
             },
             Message::Cancel => {
+                if self.credential_request.is_some() {
+                    return Task::none();
+                }
+                self.password_revealed_until = None;
                 if self.confirmation.take().is_none()
                     && self.health_editor.take().is_none()
                     && self.quick_login.take().is_none()
                 {
-                    self.modal = None;
                     self.enabling_automatic = false;
                 }
                 Task::none()
@@ -1392,9 +1717,24 @@ impl App {
                 if self.confirmation.is_some()
                     || self.health_editor.is_some()
                     || self.quick_login.is_some()
-                    || self.modal.is_some()
                 {
                     return self.update(Message::Cancel);
+                }
+                if self.account_editing {
+                    return self.update(Message::AccountCancel);
+                }
+                if let Some(prompt) = self
+                    .network_prompt
+                    .as_ref()
+                    .filter(|_| !self.enabling_automatic)
+                {
+                    return self.update(Message::NetworkDecision {
+                        fingerprint: prompt.fingerprint.clone(),
+                        allow: None,
+                    });
+                }
+                if self.page == Page::Networks {
+                    return self.update(Message::NetworkBack);
                 }
                 match self.window {
                     Some(id) if self.tray.as_ref().is_some_and(tray::Tray::is_available) => {
@@ -1404,13 +1744,10 @@ impl App {
                 }
             }
             Message::KeyboardEnter => {
-                if matches!(
-                    self.confirmation,
-                    Some(Confirmation::TemporaryLogin { .. } | Confirmation::VerifyAccount { .. })
-                ) {
+                if matches!(self.confirmation, Some(Confirmation::TemporaryLogin { .. })) {
                     self.update(Message::Confirm)
                 } else {
-                    self.update(Message::HistoryToggleSelection)
+                    Task::none()
                 }
             }
             Message::MoveFocus(previous) => {
@@ -1419,6 +1756,23 @@ impl App {
                 } else {
                     iced::widget::operation::focus_next()
                 }
+            }
+            Message::TogglePassword => {
+                self.reveal_password();
+                Task::none()
+            }
+            Message::ToggleIps => {
+                self.ips_revealed = !self.ips_revealed;
+                Task::none()
+            }
+            Message::RevealTick => {
+                if self
+                    .password_revealed_until
+                    .is_some_and(|until| Instant::now() >= until)
+                {
+                    self.password_revealed_until = None;
+                }
+                Task::none()
             }
             Message::DismissNotice => {
                 self.clear_notice();
@@ -1434,22 +1788,25 @@ impl App {
                 draft.password = value;
                 Task::none()
             }
-            Message::AccountEdit(id) => {
-                if let Some(account) = self
-                    .snapshot
-                    .as_ref()
-                    .and_then(|s| s.accounts.iter().find(|a| a.id == id))
-                {
-                    self.account = AccountDraft {
-                        id: Some(account.id.clone()),
-                        username: account.username.clone(),
-                        password: String::new(),
-                    };
-                }
+            Message::AccountAdd => {
+                self.clear_notice();
+                self.password_revealed_until = None;
+                self.account = AccountDraft::default();
+                self.account_editing = true;
+                iced::widget::operation::focus("add-account-username")
+            }
+            Message::AccountPage(offset) => {
+                self.account_offset = offset;
                 Task::none()
             }
             Message::AccountCancel => {
+                if self.credential_request == Some(CredentialRequest::VerifyAccount) {
+                    return Task::none();
+                }
+                self.clear_notice();
+                self.password_revealed_until = None;
                 self.account = AccountDraft::default();
+                self.account_editing = false;
                 Task::none()
             }
             Message::OpenQuickLogin => {
@@ -1457,15 +1814,15 @@ impl App {
                     return Task::none();
                 }
                 self.clear_notice();
+                self.password_revealed_until = None;
                 self.quick_login = Some(AccountDraft::default());
                 iced::widget::operation::focus("quick-login-username")
             }
-            Message::TemporaryLogin | Message::AccountSave => {
-                self.prepare_login_confirmation(matches!(message, Message::TemporaryLogin));
-                Task::none()
-            }
+            Message::TemporaryLogin => self.prepare_login(None),
+            Message::AccountSave(fingerprint) => self.prepare_login(Some(fingerprint)),
+            Message::SwitchAccount(target) => self.switch_saved_account(target, false),
             Message::LanguageChanged(language) => {
-                self.language = language;
+                self.set_language(language);
                 self.draft.settings.language = if language == Language::English {
                     "en"
                 } else {
@@ -1584,8 +1941,7 @@ impl App {
                 {
                     return self.update(Message::BeginAutomatic);
                 }
-                self.modal = Some(Page::Networks);
-                Task::none()
+                self.update(Message::Navigate(Page::Networks))
             }
             Message::BeginAutomatic => {
                 if self.busy || !self.snapshot_current {
@@ -1604,11 +1960,9 @@ impl App {
                 }
                 let candidate = self.snapshot.as_ref().and_then(confirmation_target);
                 match candidate {
-                    Some((expected_network, adapter)) => {
-                        self.confirmation = Some(Confirmation::EnableAutomatic {
-                            expected_network,
-                            adapter,
-                        });
+                    Some((expected_network, _)) => {
+                        self.confirmation =
+                            Some(Confirmation::EnableAutomatic { expected_network });
                     }
                     None => self.error(AppError::new(
                         ErrorCode::Network,
@@ -1626,11 +1980,11 @@ impl App {
                     .as_ref()
                     .map(|snapshot| snapshot.settings.clone())
                     .unwrap_or_default();
-                self.language = if settings.language == "en" {
+                self.set_language(if settings.language == "en" {
                     Language::English
                 } else {
                     Language::Chinese
-                };
+                });
                 self.appearance = match settings.theme.as_str() {
                     "light" => Appearance::Light,
                     "dark" => Appearance::Dark,
@@ -1640,18 +1994,23 @@ impl App {
                 self.settings_epoch = self.settings_epoch.wrapping_add(1);
                 Task::none()
             }
-            Message::ToggleAdvancedSettings => {
-                self.advanced_settings = !self.advanced_settings;
-                Task::none()
+            Message::SettingsTabChanged(tab) => {
+                self.settings_tab = tab;
+                if tab == SettingsTab::Diagnostics && self.can_read_log_size() {
+                    self.log_size = None;
+                    self.execute(Command::LogSize)
+                } else {
+                    Task::none()
+                }
             }
             Message::OpenHealthEditor => {
+                self.clear_notice();
                 self.health_editor = Some(
                     self.draft
-                        .health_targets
-                        .split(';')
-                        .map(str::trim)
-                        .filter(|address| !address.is_empty())
-                        .map(str::to_owned)
+                        .settings
+                        .configured_health_targets()
+                        .into_iter()
+                        .map(Into::into)
                         .collect(),
                 );
                 Task::none()
@@ -1662,26 +2021,38 @@ impl App {
                     .as_mut()
                     .filter(|entries| index < entries.len())
                 {
-                    if address.contains([';', '\n', '\r']) {
-                        let pasted: Vec<_> = address
-                            .split([';', '\n', '\r'])
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_owned)
-                            .collect();
-                        if entries.len() - 1 + pasted.len() <= 8 {
-                            entries.splice(index..=index, pasted);
-                        }
-                    } else {
-                        entries[index] = address;
+                    entries[index].url = address;
+                }
+                Task::none()
+            }
+            Message::HealthEntryExpectChanged(index, condition) => {
+                if let Some(entries) = self
+                    .health_editor
+                    .as_mut()
+                    .filter(|entries| index < entries.len())
+                {
+                    let entry = &mut entries[index];
+                    if entry.condition != condition {
+                        entry.condition = condition;
+                        entry.value.clear();
                     }
+                }
+                Task::none()
+            }
+            Message::HealthEntryValueChanged(index, value) => {
+                if let Some(entries) = self
+                    .health_editor
+                    .as_mut()
+                    .filter(|entries| index < entries.len())
+                {
+                    entries[index].value = value;
                 }
                 Task::none()
             }
             Message::HealthEntryAdded => {
                 if let Some(entries) = &mut self.health_editor {
-                    if entries.len() < 8 {
-                        entries.push(String::new());
+                    if entries.len() < MAX_HEALTH_TARGETS {
+                        entries.push(HealthTarget::default());
                     }
                 }
                 Task::none()
@@ -1695,32 +2066,145 @@ impl App {
                 Task::none()
             }
             Message::SaveHealthEditor => {
-                if let Some(entries) = self.health_editor.take() {
-                    self.draft.health_targets = entries.join("; ");
-                    self.mark_settings_dirty();
+                if let Some(entries) = &self.health_editor {
+                    let mut targets = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        let expect = match entry.condition {
+                            HealthCondition::AnySuccess => HealthExpect::AnySuccess,
+                            HealthCondition::Status => {
+                                let code = entry
+                                    .value
+                                    .trim()
+                                    .parse()
+                                    .ok()
+                                    .filter(|code| (100..=599).contains(code));
+                                let Some(code) = code else {
+                                    let error = self.t(
+                                        "请输入 100 到 599 之间的 HTTP 状态码。",
+                                        "Enter an HTTP status code from 100 to 599.",
+                                    );
+                                    self.show_notice(true, error.into());
+                                    return Task::none();
+                                };
+                                HealthExpect::Status(code)
+                            }
+                            HealthCondition::BodyEquals => {
+                                HealthExpect::BodyEquals(entry.value.clone())
+                            }
+                            HealthCondition::BodyContains => {
+                                HealthExpect::BodyContains(entry.value.clone())
+                            }
+                        };
+                        targets.push(ConfigHealthTarget {
+                            url: entry.url.trim().into(),
+                            expect,
+                        });
+                    }
+                    match self.draft.settings.set_health_targets(targets) {
+                        Ok(()) => {
+                            self.health_editor = None;
+                            self.clear_notice();
+                            self.mark_settings_dirty();
+                        }
+                        Err(error) => self.error(error),
+                    }
                 }
                 Task::none()
             }
             Message::CancelHealthEditor => {
                 self.health_editor = None;
+                self.clear_notice();
                 Task::none()
             }
             Message::ToggleAlternateAdapters => {
                 self.alternate_adapters = !self.alternate_adapters;
+                self.network_offset = 0;
                 Task::none()
             }
-            Message::ToggleAdvancedNetworks => {
-                self.advanced_networks = !self.advanced_networks;
+            Message::NetworkBack => {
+                self.enabling_automatic = false;
+                self.page = self.network_return;
+                Task::none()
+            }
+            Message::NetworkTab(section) => {
+                self.network_section = section;
+                self.network_offset = 0;
+                Task::none()
+            }
+            Message::NetworkPage(offset) => {
+                self.network_offset = offset;
                 Task::none()
             }
             Message::InterfaceSelected(value) => {
                 if self.busy || !self.snapshot_current || self.draft.dirty {
                     return Task::none();
                 }
-                self.draft.settings.interface_id =
-                    if value.is_empty() { None } else { Some(value) };
+                let selected = if let Some((id, ssid)) = value {
+                    let Some(interface) = self
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| {
+                            snapshot
+                                .interfaces
+                                .iter()
+                                .find(|interface| interface.id == id && interface.ssid == ssid)
+                        })
+                        .filter(|interface| interface.binding().is_some())
+                    else {
+                        self.show_notice(
+                            true,
+                            self.t(
+                                "网卡连接已变化，请重新选择。",
+                                "The adapter connection changed. Choose again.",
+                            )
+                            .into(),
+                        );
+                        return Task::none();
+                    };
+                    Some(interface)
+                } else {
+                    None
+                };
+                self.draft.settings.interface_ssid = selected
+                    .filter(|_| {
+                        self.snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot
+                                .capabilities
+                                .iter()
+                                .any(|item| item == "network_permissions")
+                        })
+                    })
+                    .and_then(|interface| interface.ssid.clone());
+                self.draft.settings.interface_id = selected.map(|interface| interface.id.clone());
+                self.network_offset = 0;
                 self.mark_settings_dirty();
                 self.save_settings()
+            }
+            Message::NetworkDecision { fingerprint, allow } => {
+                if self.busy || !self.snapshot_current {
+                    return Task::none();
+                }
+                if self
+                    .network_prompt
+                    .as_ref()
+                    .is_none_or(|prompt| prompt.fingerprint != fingerprint)
+                {
+                    return Task::none();
+                }
+                self.network_prompt = None;
+                if let Some(allow) = allow {
+                    self.execute(Command::SetNetworkPermission {
+                        expected_network: fingerprint,
+                        allow,
+                    })
+                } else {
+                    self.skipped_network = Some(fingerprint);
+                    Task::none()
+                }
+            }
+            Message::TrustPage(offset) => {
+                self.trust_offset = offset;
+                Task::none()
             }
             Message::ProfileIdChanged(value) => {
                 self.profile_id = value;
@@ -1787,8 +2271,14 @@ impl App {
                 self.rule.ignore = value;
                 Task::none()
             }
+            Message::BeginRule => {
+                self.rule = RuleDraft::default();
+                self.network_section = NetworkSection::RuleEditor;
+                Task::none()
+            }
             Message::RuleCancel => {
                 self.rule = RuleDraft::default();
+                self.network_section = NetworkSection::Rules;
                 Task::none()
             }
             Message::RuleEdit(index) => {
@@ -1803,6 +2293,7 @@ impl App {
                         priority: rule.priority.to_string(),
                         ignore: rule.ignore,
                     };
+                    self.network_section = NetworkSection::RuleEditor;
                     self.mark_settings_dirty();
                 }
                 Task::none()
@@ -1817,6 +2308,7 @@ impl App {
                         self.draft.settings.rules.push(rule);
                     }
                     self.rule = RuleDraft::default();
+                    self.network_section = NetworkSection::Rules;
                     self.mark_settings_dirty();
                     self.save_settings()
                 }
@@ -1825,141 +2317,6 @@ impl App {
                     Task::none()
                 }
             },
-            Message::HistoryFilterChanged(value) => {
-                self.history_filter = value;
-                self.history_selection = None;
-                Task::none()
-            }
-            Message::HistoryDetailToggled(id) => {
-                self.history_selection = Some(id);
-                if !self.expanded_history.remove(&id) {
-                    self.expanded_history.insert(id);
-                }
-                Task::none()
-            }
-            Message::HistoryMoveSelection(forward) => {
-                if self.modal == Some(Page::History) && self.confirmation.is_none() {
-                    let ids: Vec<_> = self.visible_history().map(|event| event.id).collect();
-                    let index = ids
-                        .iter()
-                        .position(|id| Some(*id) == self.history_selection);
-                    self.history_selection = match index {
-                        Some(index) if forward => ids.get((index + 1).min(ids.len() - 1)),
-                        Some(index) => ids.get(index.saturating_sub(1)),
-                        None => ids.first(),
-                    }
-                    .copied();
-                }
-                Task::none()
-            }
-            Message::HistoryToggleSelection => {
-                if self.modal == Some(Page::History) && self.confirmation.is_none() {
-                    if let Some(id) = self.history_selection {
-                        return self.update(Message::HistoryDetailToggled(id));
-                    }
-                }
-                Task::none()
-            }
-            Message::HistoryLoad(older) => {
-                if self.busy || !self.snapshot_current || self.modal != Some(Page::History) {
-                    return Task::none();
-                }
-                if older {
-                    self.history_limit = (self.history_limit + 40).min(200);
-                }
-                self.execute(Command::History {
-                    limit: self.history_limit,
-                })
-            }
-            Message::CopyHistory => iced::clipboard::write(
-                serde_json::to_string_pretty(&self.history).unwrap_or_default(),
-            )
-            .discard(),
-            Message::OpenHistoryExport => {
-                self.history_export_path = Some(String::new());
-                Task::none()
-            }
-            Message::CloseHistoryExport => {
-                self.history_export_path = None;
-                Task::none()
-            }
-            Message::HistoryExportPathChanged(value) => {
-                if self.history_export_path.is_some() && !self.history_exporting {
-                    self.history_export_path = Some(value);
-                }
-                Task::none()
-            }
-            Message::ExportHistory => {
-                let Some(value) = self.history_export_path.as_deref() else {
-                    return Task::none();
-                };
-                if self.history_exporting || self.history.is_empty() {
-                    return Task::none();
-                }
-                let path = std::path::PathBuf::from(value.trim());
-                let json_extension = path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
-                if !path.is_absolute() || !json_extension {
-                    self.show_notice(
-                        true,
-                        self.t(
-                            "请输入完整的 JSON 文件路径。",
-                            "Enter the full path to a JSON file.",
-                        )
-                        .into(),
-                    );
-                    return Task::none();
-                }
-                let history = self.history.clone();
-                let (sender, receiver) = iced::futures::channel::oneshot::channel();
-                let worker = std::thread::Builder::new().spawn(move || {
-                    let _ = sender.send(write_history_export(&path, &history));
-                });
-                if worker.is_err() {
-                    self.show_notice(
-                        true,
-                        self.t("无法启动日志导出。", "Could not start log export.")
-                            .into(),
-                    );
-                    return Task::none();
-                }
-                self.history_exporting = true;
-                self.clear_notice();
-                Task::perform(
-                    async move { receiver.await.unwrap_or(Err(std::io::ErrorKind::Other)) },
-                    Message::HistoryExported,
-                )
-            }
-            Message::HistoryExported(result) => {
-                self.history_exporting = false;
-                match result {
-                    Ok(()) => {
-                        self.history_export_path = None;
-                        self.show_notice(
-                            false,
-                            self.t("已导出当前载入的记录。", "Exported the loaded activity.")
-                                .into(),
-                        );
-                    }
-                    Err(kind) => self.show_notice(
-                        true,
-                        match kind {
-                            std::io::ErrorKind::AlreadyExists => self.t(
-                                "该文件已存在，请换一个文件名。",
-                                "This file already exists. Choose another name.",
-                            ),
-                            _ => self.t(
-                                "无法保存日志，请选择可写的目录和新的文件名。",
-                                "Could not save activity. Choose a writable folder and a new name.",
-                            ),
-                        }
-                        .into(),
-                    ),
-                }
-                Task::none()
-            }
             Message::ImportAction(action) => {
                 self.import_content.perform(action);
                 Task::none()
@@ -1990,15 +2347,69 @@ impl App {
             }
             Message::CopyExport => iced::clipboard::write(self.exported.clone()).discard(),
             Message::CopyDiagnostics => iced::clipboard::write(self.diagnostics.clone()).discard(),
-            Message::WindowOpened(id) => {
-                self.window = Some(id);
+            Message::WebLogs(action) => {
+                if self.log_viewer_busy {
+                    return Task::none();
+                }
+                self.log_viewer_busy = true;
+                let client = self.client.clone();
+                let english = self.english();
+                let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                let _ = std::thread::Builder::new().spawn(move || {
+                    let _ = sender.send(bitnet_launcher::web(
+                        client.effective_scope(),
+                        action,
+                        english,
+                    ));
+                });
+                Task::perform(
+                    async move { receiver.await.unwrap_or(Err(LaunchError::Failed)) },
+                    move |result| Message::WebLogsFinished(action, result),
+                )
+            }
+            Message::WebLogsFinished(action, result) => {
+                self.log_viewer_busy = false;
+                let (error, text) = match result {
+                    Ok(()) if action == WebAction::Open => (
+                        false,
+                        self.t("已请求打开日志 Web 界面", "Requested to open web logs"),
+                    ),
+                    Ok(()) => (
+                        false,
+                        self.t("日志 Web 服务已停止", "Web log service stopped"),
+                    ),
+                    Err(LaunchError::Missing) => (
+                        true,
+                        self.t(
+                            "请先安装日志 Web 组件",
+                            "Install the web log component first",
+                        ),
+                    ),
+                    Err(LaunchError::Failed) => (
+                        true,
+                        self.t("日志 Web 服务操作失败", "Web log service operation failed"),
+                    ),
+                };
+                self.show_notice(error, text.into());
                 Task::none()
             }
+            Message::WindowOpened(id) => {
+                if self.window == Some(id) {
+                    Task::none()
+                } else {
+                    window::close(id)
+                }
+            }
             Message::WindowCloseRequested(id) => {
+                if self.window != Some(id) {
+                    return Task::none();
+                }
                 self.window = None;
                 self.account = AccountDraft::default();
+                self.account_editing = false;
                 self.quick_login = None;
                 self.confirmation = None;
+                self.password_revealed_until = None;
                 if self.tray.as_ref().is_some_and(tray::Tray::is_available) {
                     window::close(id)
                 } else {
@@ -2006,19 +2417,6 @@ impl App {
                 }
             }
         }
-    }
-
-    fn visible_history(&self) -> impl Iterator<Item = &HistoryEvent> {
-        let filter = self.history_filter.to_lowercase();
-        self.history.iter().filter(move |event| {
-            filter.is_empty()
-                || self
-                    .history_title(&event.kind)
-                    .to_lowercase()
-                    .contains(&filter)
-                || event.kind.to_lowercase().contains(&filter)
-                || event.message.to_lowercase().contains(&filter)
-        })
     }
 
     fn validated_rule(&self) -> Result<NetworkRule, AppError> {
@@ -2112,43 +2510,6 @@ impl App {
             EngineState::Stopping => self.t("正在停止", "Stopping"),
         }
     }
-    fn environment_label(&self, environment: &Environment) -> &'static str {
-        match environment {
-            Environment::Unknown => self.t("尚未确认", "Not confirmed"),
-            Environment::NoNetwork => self.t("网络未连接", "No network"),
-            Environment::NonCampus => self.t("非校园网络", "Outside campus"),
-            Environment::Campus => self.t("校园直连", "Campus connection"),
-            Environment::RoutedCampus => self.t("路由器共享网络", "Shared router connection"),
-        }
-    }
-    fn health_label(&self, health: &Health) -> &'static str {
-        match health {
-            Health::Unknown => self.t("尚未检测", "Not checked"),
-            Health::Healthy => self.t("正常", "Healthy"),
-            Health::Degraded => self.t("部分异常", "Degraded"),
-            Health::Unavailable => self.t("不可用", "Unavailable"),
-        }
-    }
-}
-
-fn write_history_export(
-    path: &std::path::Path,
-    history: &[HistoryEvent],
-) -> Result<(), std::io::ErrorKind> {
-    use std::io::{ErrorKind, Write};
-
-    let bytes = serde_json::to_vec_pretty(history).map_err(|_| ErrorKind::InvalidData)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path).map_err(|error| error.kind())?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| error.kind())
 }
 
 fn open_release_page() -> Task<Message> {
@@ -2191,6 +2552,13 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
     }
 }
+fn format_log_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
 fn format_duration(seconds: u64) -> String {
     format!("{} h {:02} min", seconds / 3600, (seconds / 60) % 60)
 }
@@ -2210,28 +2578,26 @@ mod tests {
             language: Language::Chinese,
             appearance: Appearance::System,
             account: AccountDraft::default(),
+            account_editing: false,
+            account_offset: 0,
             quick_login: None,
             rule: RuleDraft::default(),
             profile_id: String::new(),
             profile_name: String::new(),
-            history: Vec::new(),
-            history_filter: String::new(),
-            history_selection: None,
-            history_limit: 40,
-            history_export_path: None,
-            history_exporting: false,
-            expanded_history: HashSet::new(),
             statistics: None,
+            log_viewer_busy: false,
+            log_size: None,
             diagnostics: String::new(),
             exported: String::new(),
             import_content: text_editor::Content::new(),
             confirmation: None,
-            modal: None,
-            advanced_settings: false,
+            network_return: Page::Status,
+            settings_tab: SettingsTab::General,
             health_editor: None,
             enabling_automatic: false,
             alternate_adapters: false,
-            advanced_networks: false,
+            network_section: NetworkSection::Adapters,
+            network_offset: 0,
             notice: None,
             notice_until: None,
             connection_error: None,
@@ -2251,6 +2617,11 @@ mod tests {
             notification_gate: notifications::Gate::default(),
             pending_notification: None,
             update_policy: UpdatePolicy::new_at(0),
+            password_revealed_until: None,
+            ips_revealed: false,
+            network_prompt: None,
+            skipped_network: None,
+            trust_offset: 0,
         }
     }
     #[test]
@@ -2272,11 +2643,33 @@ mod tests {
     #[test]
     fn settings_draft_uses_shared_validation() {
         let mut draft = SettingsDraft::new(Settings::default());
-        assert!(draft.validated().is_ok());
+        assert!(draft.validated(false).is_ok());
         draft.status_interval = "0".into();
-        assert!(draft.validated().is_err());
+        assert!(draft.validated(false).is_err());
         draft.status_interval = "not-a-number".into();
-        assert!(draft.validated().is_err());
+        assert!(draft.validated(false).is_err());
+    }
+    #[test]
+    fn health_editor_preserves_legacy_and_custom_response_conditions() {
+        let mut app = fixture();
+        let legacy = app.draft.settings.configured_health_targets();
+        let _ = app.update(Message::OpenHealthEditor);
+        let _ = app.update(Message::SaveHealthEditor);
+        assert_eq!(app.draft.settings.configured_health_targets(), legacy);
+
+        let _ = app.update(Message::OpenHealthEditor);
+        let _ = app.update(Message::HealthEntryExpectChanged(
+            0,
+            HealthCondition::BodyContains,
+        ));
+        let _ = app.update(Message::HealthEntryValueChanged(0, "ready".into()));
+        let _ = app.update(Message::HealthEntryValueChanged(1, "202".into()));
+        let _ = app.update(Message::SaveHealthEditor);
+
+        let mut expected = legacy;
+        expected[0].expect = HealthExpect::BodyContains("ready".into());
+        expected[1].expect = HealthExpect::Status(202);
+        assert_eq!(app.draft.settings.configured_health_targets(), expected);
     }
     #[test]
     fn remote_status_preserves_unsaved_settings_and_their_base_revision() {
@@ -2311,7 +2704,7 @@ mod tests {
         reply.settings.blocked_accounts.clear();
         let _ = app.update(Message::Completed(Ok(ReplyData::Snapshot(Box::new(reply)))));
 
-        let submitted = app.draft.validated().unwrap();
+        let submitted = app.draft.validated(app.english()).unwrap();
         assert!(app.draft.dirty);
         assert!(!submitted.automatic);
         assert_eq!(submitted.revision, 8);
@@ -2354,40 +2747,86 @@ mod tests {
             ssid: None,
             virtual_adapter: false,
             alternate_adapter: false,
+            dns: Vec::new(),
+            ipv6: Vec::new(),
+            ipv4_mode: None,
+            ipv6_enabled: None,
         };
         snapshot.active_binding = adapter.binding();
         snapshot.interfaces.push(adapter);
-        snapshot
-            .capabilities
-            .extend(["verify_account".into(), "login_once".into()]);
+        snapshot.capabilities.extend([
+            "verify_account".into(),
+            "login_once".into(),
+            "switch_account".into(),
+        ]);
         app.apply_snapshot(snapshot);
         app
     }
 
     #[test]
-    fn account_save_waits_for_confirmation_and_failure_keeps_the_account_draft() {
+    fn saved_account_switch_binds_confirmation_to_the_displayed_network() {
         let mut app = login_fixture();
+        let snapshot = app.snapshot.as_mut().unwrap();
+        snapshot.session.auth = AuthState::Authenticated;
+        snapshot.session.username = Some("old-user".into());
+        snapshot.accounts.push(AccountInfo {
+            id: "other".into(),
+            username: "other-user".into(),
+            has_password: true,
+        });
+        let target = SavedAccountTarget::capture(snapshot, "other").unwrap();
+        let _ = app.update(Message::SwitchAccount(target));
+        assert!(matches!(
+            app.confirmation,
+            Some(Confirmation::SwitchAccount(_))
+        ));
+        assert!(!app.busy);
+
+        let mut replacement = app.snapshot.clone().unwrap();
+        replacement.interfaces[0].gateway = Some(std::net::Ipv4Addr::new(10, 1, 2, 254));
+        app.apply_snapshot(replacement);
+        let _ = app.update(Message::Confirm);
+        assert!(!app.busy);
+        assert!(app.notice.as_ref().is_some_and(|(error, _)| *error));
+    }
+
+    #[test]
+    fn offline_saved_account_switch_starts_without_a_disconnect_confirmation() {
+        let mut app = login_fixture();
+        let snapshot = app.snapshot.as_mut().unwrap();
+        snapshot.session.auth = AuthState::Unauthenticated;
+        snapshot.accounts.push(AccountInfo {
+            id: "other".into(),
+            username: "other-user".into(),
+            has_password: true,
+        });
+        let target = SavedAccountTarget::capture(snapshot, "other").unwrap();
+        let _ = app.update(Message::SwitchAccount(target));
+        assert!(app.confirmation.is_none());
+        assert!(app.busy);
+        assert!(app.credential_request == Some(CredentialRequest::SwitchAccount));
+    }
+
+    #[test]
+    fn account_save_confirms_in_place_and_failure_keeps_the_account_draft() {
+        let mut app = login_fixture();
+        let _ = app.update(Message::AccountAdd);
         app.account.id = Some("existing".into());
         app.account.username = "test-user".into();
         app.account.password = "incorrect".into();
 
-        let _ = app.update(Message::AccountSave);
-        assert!(matches!(
-            app.confirmation,
-            Some(Confirmation::VerifyAccount { .. })
-        ));
-        assert!(!app.busy);
-        let _ = app.update(Message::Cancel);
-        assert_eq!(app.account.password, "incorrect");
-
-        let _ = app.update(Message::AccountSave);
-        let _ = app.update(Message::Confirm);
+        let (fingerprint, _) = confirmation_target(app.snapshot.as_ref().unwrap()).unwrap();
+        let _ = app.update(Message::AccountSave(fingerprint));
+        assert!(app.confirmation.is_none());
+        assert!(app.account_editing);
+        assert!(app.busy);
         assert!(app.credential_request == Some(CredentialRequest::VerifyAccount));
         assert!(app.account.password.is_empty());
         let _ = app.update(Message::Completed(Err(AppError::new(
             ErrorCode::Credentials,
             "Login failed",
         ))));
+        assert!(app.account_editing);
         assert_eq!(app.account.username, "test-user");
         assert_eq!(app.account.id.as_deref(), Some("existing"));
         assert_eq!(
@@ -2396,6 +2835,37 @@ mod tests {
                 .map(|(err, message)| (*err, message.as_str())),
             Some((true, "Login failed"))
         );
+    }
+
+    #[test]
+    fn decisions_from_a_replaced_network_view_cannot_use_the_new_network() {
+        let mut app = login_fixture();
+        let (previous, _) = confirmation_target(app.snapshot.as_ref().unwrap()).unwrap();
+        let mut current = app.snapshot.clone().unwrap();
+        current.interfaces[0].gateway = Some(std::net::Ipv4Addr::new(10, 1, 2, 254));
+        let (fingerprint, label) = confirmation_target(&current).unwrap();
+        assert_ne!(previous, fingerprint);
+        app.apply_snapshot(current);
+        app.network_prompt = Some(NetworkPrompt {
+            fingerprint: fingerprint.clone(),
+            label,
+        });
+        let _ = app.update(Message::NetworkDecision {
+            fingerprint: previous.clone(),
+            allow: Some(true),
+        });
+        assert_eq!(
+            app.network_prompt.as_ref().unwrap().fingerprint,
+            fingerprint
+        );
+        assert!(!app.busy);
+        let _ = app.update(Message::AccountAdd);
+        app.account.username = "fixture-user".into();
+        app.account.password = "fixture-password".into();
+        let _ = app.update(Message::AccountSave(previous));
+        assert!(!app.busy);
+        assert!(app.account.password.is_empty());
+        assert!(app.notice.as_ref().is_some_and(|(error, _)| *error));
     }
     #[test]
     fn quick_login_uses_explicit_consent_without_changing_account_draft() {

@@ -1,6 +1,6 @@
 param(
     [ValidateSet('x86','x64','arm64')][string]$Arch='x64',
-    [string]$Version='0.1.2', [switch]$Development,
+    [string]$Version='0.1.4', [switch]$Development,
     [string]$SecretKey=$env:BITNET_RELEASE_SECRET_KEY_FILE,
     [string]$PublicKey=$env:BITNET_RELEASE_PUBLIC_KEY_FILE,
     [string]$Wix=$env:BITNET_WIX,
@@ -36,13 +36,14 @@ $publicLines=@(Get-Content -LiteralPath $PublicKey | Where-Object {$_ -and -not 
 if($publicLines.Count -ne 1) {throw 'Expected a Minisign public-key file'}
 $env:BITNET_RELEASE_PUBLIC_KEY=$publicLines[0]
 $triple=@{x86='i686-pc-windows-msvc';x64='x86_64-pc-windows-msvc';arm64='aarch64-pc-windows-msvc'}[$Arch]
+$clientPrograms=@('bitengine','bitctl','bitmaint','bitnet-gui','bitnet-tui','bitnet-web')
 $sourceRecord=Join-Path $root ".local\source-before-$Arch.json"
 $fingerprint=(& python "$PSScriptRoot\fingerprint-source.py" --write $sourceRecord) | ConvertFrom-Json
 if($LASTEXITCODE) {throw 'Cannot fingerprint application source'}
 if(-not $SkipBuild) {
     Push-Location $root
     try {
-        & cargo build --release --target $triple -p bitnet-runtime -p bitnet-cli -p bitnet-gui --bins
+        & cargo build --locked --release --target $triple -p bitnet-runtime -p bitnet-cli -p bitnet-gui -p bitnet-tui -p bitnet-web --bins
         if($LASTEXITCODE) {throw 'Release binary build failed'}
     } finally {Pop-Location}
     & python "$PSScriptRoot\fingerprint-source.py" --check $sourceRecord --write "$root\target\$triple\release\bitnet-build-source.json" | Out-Null
@@ -52,7 +53,7 @@ if(-not $SkipBuild) {
     if($LASTEXITCODE) {throw 'Existing binaries are not attested to the current source; rebuild without -SkipBuild'}
 }
 $stage=Join-Path $root "target\$triple\release"
-foreach($name in @('bitengine','bitctl','bitmaint','bitnet-gui')) {if(-not (Test-Path "$stage\$name.exe")) {throw "Missing release binary: $name"}}
+foreach($name in $clientPrograms) {if(-not (Test-Path "$stage\$name.exe")) {throw "Missing release binary: $name"}}
 & "$PSScriptRoot\check-windows-dependencies.ps1" -Directory $stage
 if(-not [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("$stage\bitmaint.exe")).Contains($publicLines[0])) {
     throw 'bitmaint was not compiled with this release public key; rebuild without -SkipBuild'
@@ -85,6 +86,7 @@ function ProductCode([string]$Kind) {
 $definitions+=@('-d',"ClientProductCode=$(ProductCode 'client')",'-d',"ServiceProductCode=$(ProductCode 'service')")
 $definitions+=@('-d',"UninstallActions=$root\build\windows-actions-$Arch\BitNetUninstallActions.dll")
 $definitions+=@('-d',"ProjectLicense=$root\LICENSE",'-d',"GatewayNotice=$root\crates\bitnet-gateway\NOTICE",'-d',"ThirdPartyNotices=$licenses\THIRD-PARTY-NOTICES.txt",'-d',"ThirdPartyMetadata=$licenses\THIRD-PARTY-NOTICES.json")
+$definitions+=@('-d',"FontLicense=$root\crates\bitnet-gui\assets\fonts\LICENSE.txt")
 WixBuild "$root\installers\windows\Service.wxs" $service ($definitions+@('-d',"ProgramFilesId=$programFiles",'-d',"ServiceDataSddl=$sddl"))
 & $Minisign -S -s $SecretKey -m $service -x "$service.minisig" -t "BitNet $Version Windows $Arch service" *> $null
 if($LASTEXITCODE) {throw 'Service MSI signing failed'}
@@ -97,16 +99,17 @@ $setup=Join-Path $out "BitNetSetup-$Version-windows-$Arch.exe"
 if($LASTEXITCODE) {throw 'NSIS wrapper build failed'}
 $portable=Join-Path $root "build\portable-windows-$Arch-$([Guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Force "$portable\licenses","$portable\packages" | Out-Null
-foreach($name in @('bitengine','bitctl','bitmaint','bitnet-gui')) {Copy-Item "$stage\$name.exe" $portable}
+foreach($name in $clientPrograms) {Copy-Item "$stage\$name.exe" $portable}
 Copy-Item "$root\LICENSE" "$portable\licenses\LICENSE"
 Copy-Item "$root\crates\bitnet-gateway\NOTICE" "$portable\licenses\GATEWAY-NOTICE.txt"
+Copy-Item "$root\crates\bitnet-gui\assets\fonts\LICENSE.txt" "$portable\licenses\FONT-OFL.txt"
 Copy-Item "$licenses\THIRD-PARTY-NOTICES.*" "$portable\licenses"
 Copy-Item $service "$portable\packages\Service.msi"
 Copy-Item "$service.minisig" "$portable\packages\Service.msi.minisig"
 $zip=Join-Path $out "BitNet-$Version-windows-$Arch.zip"
 Compress-Archive -Path "$portable\*" -DestinationPath $zip -CompressionLevel Optimal -Force
 $portableExe=Join-Path $out "BitNetPortable-$Version-windows-$Arch.exe"
-$payloadHashes=@('bitnet-gui','bitengine','bitctl','bitmaint') | ForEach-Object {
+$payloadHashes=$clientPrograms | ForEach-Object {
     (Get-FileHash -LiteralPath "$portable\$_.exe" -Algorithm SHA256).Hash
 }
 $payloadBytes=[Text.Encoding]::ASCII.GetBytes(($payloadHashes -join ':'))

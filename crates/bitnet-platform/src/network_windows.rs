@@ -3,9 +3,11 @@ pub(super) fn polling_only(_: &ChangeGuard) -> bool {
     false
 }
 use crate::{error, windows::wide_string};
-use bitnet_core::ErrorCode;
+use bitnet_core::{ErrorCode, Ipv4Assignment};
 use std::{
     ffi::{c_void, CStr},
+    mem::size_of,
+    net::{IpAddr, Ipv6Addr},
     ptr,
 };
 use windows_sys::Win32::{
@@ -25,6 +27,22 @@ unsafe fn ipv4(address: *const SOCKADDR) -> Option<Ipv4Addr> {
             .S_addr
             .to_ne_bytes(),
     ))
+}
+
+unsafe fn socket_ip(address: SOCKET_ADDRESS) -> Option<IpAddr> {
+    let ptr = address.lpSockaddr;
+    let len = usize::try_from(address.iSockaddrLength).ok()?;
+    if ptr.is_null() || len < size_of::<ADDRESS_FAMILY>() {
+        return None;
+    }
+    match (*ptr).sa_family {
+        AF_INET if len >= size_of::<SOCKADDR_IN>() => ipv4(ptr).map(IpAddr::V4),
+        AF_INET6 if len >= size_of::<SOCKADDR_IN6>() => {
+            let raw = (*ptr.cast::<SOCKADDR_IN6>()).sin6_addr.u.Byte;
+            Some(IpAddr::V6(Ipv6Addr::from(raw)))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
@@ -72,13 +90,35 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                     .into_owned()
             };
             let mut ips = Vec::new();
+            let mut ipv6 = Vec::new();
+            let mut dhcp_address = false;
             let mut unicast = a.FirstUnicastAddress;
             while !unicast.is_null() {
                 let u = &*unicast;
-                if let Some(ip) = ipv4(u.Address.lpSockaddr) {
-                    ips.push(ip);
+                match socket_ip(u.Address) {
+                    Some(IpAddr::V4(ip)) => {
+                        ips.push(ip);
+                        dhcp_address |= u.PrefixOrigin == IpPrefixOriginDhcp
+                            && !ip.is_unspecified()
+                            && !ip.is_link_local();
+                    }
+                    Some(IpAddr::V6(ip)) => ipv6.push(ip),
+                    None => {}
                 }
                 unicast = u.Next;
+            }
+            ipv6.sort_unstable();
+            ipv6.dedup();
+            let mut dns = Vec::new();
+            let mut server = a.FirstDnsServerAddress;
+            while !server.is_null() {
+                let entry = &*server;
+                if let Some(IpAddr::V4(ip)) = socket_ip(entry.Address) {
+                    if !dns.contains(&ip) {
+                        dns.push(ip);
+                    }
+                }
+                server = entry.Next;
             }
             let mut gateway = None;
             let mut g = a.FirstGatewayAddress;
@@ -110,6 +150,16 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                 ]
                 .iter()
                 .any(|kind| description.contains(kind));
+            let flags = a.Anonymous2.Flags;
+            let ipv4_mode = (flags & IP_ADAPTER_IPV4_ENABLED != 0).then_some({
+                if flags & IP_ADAPTER_DHCP_ENABLED == 0 {
+                    Ipv4Assignment::Manual
+                } else if dhcp_address {
+                    Ipv4Assignment::Dhcp
+                } else {
+                    Ipv4Assignment::AutoPending
+                }
+            });
             out.push(NetworkInterface {
                 id,
                 name,
@@ -124,6 +174,10 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                     IF_TYPE_TUNNEL | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_PPP
                 ) || super::is_tunnel(&description),
                 alternate_adapter,
+                dns,
+                ipv6,
+                ipv4_mode,
+                ipv6_enabled: Some(flags & IP_ADAPTER_IPV6_ENABLED != 0),
             });
             row = a.Next;
         }
