@@ -782,7 +782,12 @@ impl graphics::Compositor for Compositor {
             physical_damage(damage, viewport).collect()
         };
 
-        let screen_damage = if age <= 1 {
+        // Softbuffer's Win32 age describes its retained DIB, not the window
+        // surface. Showing an occluded or hidden HWND can invalidate the whole
+        // client area even when the DIB is unchanged. Blit it in full on every
+        // paint request just as the pinned TinySkia compositor does.
+        let full_present = cfg!(target_os = "windows");
+        let screen_damage = if full_present || age <= 1 {
             None
         } else {
             let damage = surface
@@ -797,7 +802,7 @@ impl graphics::Compositor for Compositor {
             Some(physical_damage(damage, viewport).collect())
         };
 
-        if screen_damage.as_ref().unwrap_or(&buffer_damage).is_empty() {
+        if !full_present && screen_damage.as_ref().unwrap_or(&buffer_damage).is_empty() {
             return Ok(());
         }
 
@@ -806,20 +811,25 @@ impl graphics::Compositor for Compositor {
             layers: renderer.layers().to_vec(),
         });
 
-        draw_to_buffer(
-            renderer,
-            &mut surface.renderer,
-            &mut surface.resources,
-            viewport,
-            background_color,
-            bytemuck::cast_slice_mut(&mut buffer),
-            &buffer_damage,
-        );
+        if !buffer_damage.is_empty() {
+            draw_to_buffer(
+                renderer,
+                &mut surface.renderer,
+                &mut surface.resources,
+                viewport,
+                background_color,
+                bytemuck::cast_slice_mut(&mut buffer),
+                &buffer_damage,
+            );
+        }
 
         on_pre_present();
-        buffer
-            .present_with_damage(&screen_damage.unwrap_or(buffer_damage))
-            .map_err(|_| compositor::SurfaceError::Lost)
+        let result = if full_present {
+            buffer.present()
+        } else {
+            buffer.present_with_damage(&screen_damage.unwrap_or(buffer_damage))
+        };
+        result.map_err(|_| compositor::SurfaceError::Lost)
     }
 
     fn screenshot(

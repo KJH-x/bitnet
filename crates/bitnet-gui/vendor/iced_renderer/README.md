@@ -6,4 +6,6 @@ This Cargo patch replaces the `iced_renderer` package in Iced at `bb97596ddb79c2
 - `src/vello/` is based on [Iced PR #3306 at 3ad0fe9](https://github.com/iced-rs/iced/tree/3ad0fe9402166474cbe8217b439e4901f63bc124/vello_cpu). The port fits this code to the older compositor’s surface initialization and keeps physical damage clipping in the renderer. The Vello CPU single-thread path is used, matching the upstream experiment’s default feature set.
 - Both sources are MIT licensed; see `LICENSE`.
 
+On Windows, Vello rasterizes only changed regions into the retained Softbuffer buffer, then copies the whole buffer to the window on every paint request. The window surface itself can be invalidated when restored from the tray even when the retained buffer has not changed.
+
 Run the renderer’s unit tests from the repository root with `cargo test --locked -p iced_renderer --lib`.
