@@ -2188,7 +2188,8 @@ impl App {
         let scope_actions = if attached_system || self.mode == Mode::System {
             scope_actions.push(control(
                 self.t("切回个人后台", "Switch to personal"),
-                (maintenance_ready && !self.draft.dirty).then_some(Message::SwitchPersonal),
+                (maintenance_ready && !self.mode_switch_has_pending_changes())
+                    .then_some(Message::SwitchPersonal),
                 design::flat_button,
             ))
         } else if connected.is_some_and(|snapshot| snapshot.scope == Scope::User) {

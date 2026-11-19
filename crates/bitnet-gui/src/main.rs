@@ -1182,6 +1182,9 @@ impl App {
                 service.installed && !service.running && service.detail.is_none()
             })
     }
+    fn mode_switch_has_pending_changes(&self) -> bool {
+        self.draft.dirty || !self.account.password.is_empty()
+    }
     fn observed_service(&self) -> Option<&bitnet_core::ServiceStatus> {
         self.native_service
             .as_ref()
@@ -1677,7 +1680,7 @@ impl App {
                 self.maintain(MaintenanceAction::SetAutostart { enabled })
             }
             Message::SwitchPersonal => {
-                if self.busy || self.connecting || self.draft.dirty {
+                if self.busy || self.connecting || self.mode_switch_has_pending_changes() {
                     return Task::none();
                 }
                 if self
@@ -1693,7 +1696,7 @@ impl App {
                 if self.busy || self.connecting {
                     return Task::none();
                 }
-                if self.draft.dirty || !self.account.password.is_empty() {
+                if self.mode_switch_has_pending_changes() {
                     self.error(AppError::new(
                         ErrorCode::Busy,
                         self.t(
@@ -1823,7 +1826,10 @@ impl App {
                 Some(Confirmation::Shutdown) => self.execute(Command::Shutdown),
                 Some(Confirmation::Maintenance(action)) => self.maintain(action),
                 Some(Confirmation::PersonalMode) => {
-                    self.personal_after_stop = !preview_only() && !self.busy && !self.draft.dirty;
+                    self.personal_after_stop = !preview_only()
+                        && !self.busy
+                        && !self.connecting
+                        && !self.mode_switch_has_pending_changes();
                     if self.personal_after_stop {
                         self.maintain(MaintenanceAction::ServiceStop)
                     } else {
@@ -3314,5 +3320,19 @@ mod tests {
         app.busy = true;
         let _ = app.update(Message::Refresh);
         assert!(!app.connecting);
+    }
+
+    #[test]
+    fn unsaved_password_blocks_switching_before_stopping_system_service() {
+        let mut app = fixture();
+        app.mode = Mode::System;
+        app.snapshot.as_mut().unwrap().service.running = true;
+        app.account.password = "fixture-password".into();
+        let _ = app.update(Message::SwitchPersonal);
+        assert!(app.confirmation.is_none());
+        app.confirmation = Some(Confirmation::PersonalMode);
+        let _ = app.update(Message::Confirm);
+        assert!(!app.personal_after_stop && !app.busy);
+        assert_eq!(app.mode, Mode::System);
     }
 }

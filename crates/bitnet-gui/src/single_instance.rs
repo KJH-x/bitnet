@@ -42,8 +42,9 @@ use windows_sys::Win32::{
 
 pub(crate) type Show = mpsc::Sender<()>;
 const DEADLINE: Duration = Duration::from_millis(1500);
-const RETRY: Duration = Duration::from_millis(35);
+const RETRY: Duration = Duration::from_millis(25);
 const MAX_LINE: usize = 64;
+const MAX_PENDING: usize = 16;
 const SHOW: &[u8] = b"SHOW\n";
 const PING: &[u8] = b"PING\n";
 const PONG: &[u8] = b"PONG\n";
@@ -112,16 +113,16 @@ impl Names {
         })
     }
 
-    fn create_pipe(&self) -> io::Result<NamedPipeServer> {
+    fn create_pipe(&self, first: bool) -> io::Result<NamedPipeServer> {
         let security = Descriptor::for_user(&self.sid)?;
         let mut attributes = security.attributes();
-        // A single reusable instance plus first_pipe_instance prevents another
-        // object from silently sharing the activation endpoint.
+        // Keep another listener open while answering a request; each
+        // connection owns its own I/O state.
         unsafe {
             ServerOptions::new()
-                .first_pipe_instance(true)
+                .first_pipe_instance(first)
                 .reject_remote_clients(true)
-                .max_instances(1)
+                .max_instances(MAX_PENDING + 1)
                 .in_buffer_size(MAX_LINE as u32)
                 .out_buffer_size(MAX_LINE as u32)
                 .create_with_security_attributes_raw(
@@ -167,7 +168,7 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
 fn start_server(names: Names, mutex: MutexOwner) -> io::Result<Launch> {
     let (ready, readiness) = std::sync::mpsc::sync_channel(1);
     let (stop, quit) = oneshot::channel();
-    let (show, inbox) = mpsc::channel(1);
+    let (show, inbox) = mpsc::channel(MAX_PENDING);
     let worker = thread::Builder::new()
         .name("bitnet-activation".into())
         .spawn(move || {
@@ -179,7 +180,7 @@ fn start_server(names: Names, mutex: MutexOwner) -> io::Result<Launch> {
                 }
             };
             runtime.block_on(async {
-                let pipe = match names.create_pipe() {
+                let pipe = match names.create_pipe(true) {
                     Ok(pipe) => pipe,
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -189,7 +190,7 @@ fn start_server(names: Names, mutex: MutexOwner) -> io::Result<Launch> {
                 if ready.send(Ok(())).is_ok() {
                     tokio::select! {
                         _ = quit => {}
-                        _ = serve(pipe, &show, names.session) => {}
+                        _ = serve(pipe, &show, &names) => {}
                     }
                 }
             });
@@ -213,14 +214,24 @@ fn start_server(names: Names, mutex: MutexOwner) -> io::Result<Launch> {
 }
 
 async fn serve(
-    mut pipe: NamedPipeServer,
+    mut listener: NamedPipeServer,
     show: &mpsc::Sender<Show>,
-    session: u32,
+    names: &Names,
 ) -> io::Result<()> {
+    let mut requests = tokio::task::JoinSet::new();
     loop {
-        pipe.connect().await?;
-        let _ = timeout(DEADLINE, answer(&mut pipe, show, session)).await;
-        pipe.disconnect()?;
+        tokio::select! {
+            _ = requests.join_next(), if !requests.is_empty() => {}
+            result = listener.connect(), if requests.len() < MAX_PENDING => {
+                result?;
+                let mut connected = std::mem::replace(&mut listener, names.create_pipe(false)?);
+                let show = show.clone();
+                let session = names.session;
+                requests.spawn(async move {
+                    let _ = timeout(DEADLINE, answer(&mut connected, &show, session)).await;
+                });
+            }
+        }
     }
 }
 
@@ -251,8 +262,8 @@ async fn answer(
         _ => return Err(io::ErrorKind::InvalidData.into()),
     };
     pipe.write_all(&response).await?;
-    // DisconnectNamedPipe discards unread data, so let the requesting process
-    // consume the ACK before reusing this instance. The outer deadline applies.
+    // Keep the endpoint open until the requesting process consumes the ACK.
+    // The outer deadline also covers clients that never close their end.
     let _ = pipe.read_u8().await;
     Ok(())
 }
