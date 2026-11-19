@@ -1,4 +1,4 @@
-param([string]$Version='0.1.4',[switch]$WorkingTree)
+param([string]$Version='0.1.5',[switch]$WorkingTree)
 $ErrorActionPreference='Stop'
 $root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 New-Item -ItemType Directory -Force "$root\dist\source" | Out-Null

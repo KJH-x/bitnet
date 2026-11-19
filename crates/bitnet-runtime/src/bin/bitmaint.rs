@@ -1,6 +1,6 @@
 //! A closed maintenance action CLI; never accepts a command, path, URL or secret.
 use bitnet_core::{AppError, ErrorCode, Scope};
-use bitnet_runtime::maintenance::{self, InterfaceTarget, MaintenanceAction};
+use bitnet_runtime::maintenance::{self, InterfaceTarget, MaintenanceAction, UpdateManifestId};
 fn arguments() -> Result<(Scope, MaintenanceAction, bool, bool), AppError> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     parse_arguments(&args)
@@ -12,6 +12,7 @@ fn parse_arguments(args: &[String]) -> Result<(Scope, MaintenanceAction, bool, b
     let mut elevated = false;
     let mut purge = false;
     let mut interface = None;
+    let mut manifest_sha256 = None;
     let mut seen = std::collections::HashSet::new();
     let mut index = 0;
     while index < args.len() {
@@ -45,6 +46,13 @@ fn parse_arguments(args: &[String]) -> Result<(Scope, MaintenanceAction, bool, b
                     || AppError::new(ErrorCode::InvalidInput, "Expected --interface GUID@index"),
                 )?)?);
             }
+            "--manifest-sha256" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    AppError::new(ErrorCode::InvalidInput, "Expected --manifest-sha256 SHA256")
+                })?;
+                manifest_sha256 = Some(UpdateManifestId::parse(value)?);
+            }
             "--interactive" => interactive = true,
             "--elevated" => elevated = true,
             "--purge" => purge = true,
@@ -64,6 +72,18 @@ fn parse_arguments(args: &[String]) -> Result<(Scope, MaintenanceAction, bool, b
         purge,
         interface,
     )?;
+    let action = match (action, manifest_sha256) {
+        (MaintenanceAction::InstallUpdate, Some(manifest_sha256)) => {
+            MaintenanceAction::InstallCheckedUpdate { manifest_sha256 }
+        }
+        (_, Some(_)) => {
+            return Err(AppError::new(
+                ErrorCode::InvalidInput,
+                "Manifest identifier is valid only for installing an update",
+            ))
+        }
+        (action, None) => action,
+    };
     if elevated && interactive {
         return Err(AppError::new(
             ErrorCode::InvalidInput,
@@ -84,7 +104,7 @@ fn main() {
             .nth(1)
             .is_some_and(|a| a == "--help" || a == "-h")
     {
-        println!("BitNet maintenance\nUsage: bitmaint --scope user|system --action ACTION [--interactive] [--purge] [--interface GUID@index]\nActions: service-install, service-start, service-stop, service-remove, repair,\n         check-update, install-update, rollback-update, autostart-on, autostart-off,\n         gui-autostart-on, gui-autostart-off, ipv6-enable, ipv6-disable, ipv6-reset\nIPv6 actions require Windows, system scope and --interface GUID@index.\n--purge is valid only with service-remove. Noninteractive operations never elevate.");
+        println!("BitNet maintenance\nUsage: bitmaint --scope user|system --action ACTION [--interactive] [--purge] [--interface GUID@index] [--manifest-sha256 SHA256]\nActions: service-install, service-start, service-stop, service-remove, repair,\n         check-update, install-update, rollback-update, autostart-on, autostart-off,\n         gui-autostart-on, gui-autostart-off, ipv6-enable, ipv6-disable, ipv6-reset\nIPv6 actions require Windows, system scope and --interface GUID@index.\n--purge is valid only with service-remove. --manifest-sha256 is valid only with install-update.\nNoninteractive operations never elevate.");
         return;
     }
     let outcome = (|| {
@@ -153,6 +173,25 @@ mod tests {
         ] {
             assert!(parse(&args).is_err());
         }
+    }
+
+    #[test]
+    fn manifest_identifier_is_allowed_only_for_install_update() {
+        let hash = "aB".repeat(32);
+        assert!(matches!(
+            parse(&["--action", "install-update", "--manifest-sha256", &hash])
+                .unwrap()
+                .1,
+            MaintenanceAction::InstallCheckedUpdate { .. },
+        ));
+        assert!(parse(&["--action", "check-update", "--manifest-sha256", &hash]).is_err());
+        assert!(parse(&[
+            "--action",
+            "install-update",
+            "--manifest-sha256",
+            "not-a-hash"
+        ])
+        .is_err());
     }
 
     #[test]

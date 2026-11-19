@@ -47,6 +47,7 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                     || super::is_tunnel(&name),
                 alternate_adapter: false,
                 dns: Vec::new(),
+                dns_config: None,
                 ipv6: Vec::new(),
                 ipv4_mode: None,
                 ipv6_enabled: None,

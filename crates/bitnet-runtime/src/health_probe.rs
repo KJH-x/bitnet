@@ -1,12 +1,13 @@
 use bitnet_core::{
-    is_public_ipv6, now_secs, DnsProbeObservation, DnsProbeResult, Health, HealthExpect,
-    HealthProbeExpectation, HealthProbeObservation, HealthStatus, HealthTarget,
-    Ipv6ProbeObservation, Ipv6Status, NetworkInterface, ProbeOutcome, Settings,
+    is_cernet_ipv6, is_public_ipv6, now_secs, parse_ipv6_target, DnsProbeObservation,
+    DnsProbeResult, Health, HealthExpect, HealthProbeExpectation, HealthProbeObservation,
+    HealthStatus, HealthTarget, Ipv6ProbeKind, Ipv6ProbeObservation, Ipv6Status, NetworkInterface,
+    ProbeOutcome, Settings,
 };
-use futures_util::{future::join_all, stream, StreamExt};
+use futures_util::{future::join_all, future::select_ok};
 use hyper_util::client::legacy::connect::HttpInfo;
 use std::{
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr},
     time::{Duration, Instant},
 };
 use tokio::{net, time};
@@ -14,7 +15,11 @@ use tokio::{net, time};
 const DNS_HOST: &str = "www.bit.edu.cn";
 const BODY_LIMIT: usize = 16 * 1024;
 
-pub(crate) async fn run(settings: &Settings, interface: Option<&NetworkInterface>) -> HealthStatus {
+pub(crate) async fn run(
+    settings: &Settings,
+    interface: Option<&NetworkInterface>,
+    interfaces: &[NetworkInterface],
+) -> HealthStatus {
     let targets = settings.configured_health_targets();
     let timeout = Duration::from_secs(settings.request_timeout_secs);
     let client = reqwest::Client::builder()
@@ -29,21 +34,11 @@ pub(crate) async fn run(settings: &Settings, interface: Option<&NetworkInterface
             .enumerate()
             .map(|(index, target)| http_probe(client.as_ref(), index + 1, target, interface)),
     );
-    let sources: Vec<_> = interface
-        .into_iter()
-        .flat_map(|interface| interface.ipv6.iter().copied())
-        .filter(|addr| is_public_ipv6(*addr))
-        .take(4)
-        .collect();
-    let ipv6_probes = join_all(
-        targets
-            .iter()
-            .enumerate()
-            .map(|(index, target)| ipv6_probe(target, index + 1, timeout, &sources)),
+    let (health_probes, dns_probe, ipv6_probes) = tokio::join!(
+        health_probes,
+        dns_probe(),
+        ipv6_observations(settings, interface, interfaces)
     );
-    let (health_probes, dns_probe, ipv6_probes) =
-        tokio::join!(health_probes, dns_probe(), ipv6_probes);
-    let ipv6_probes: Vec<_> = ipv6_probes.into_iter().flatten().collect();
     let detail = |zh: &str, en: &str| localized(&settings.language, zh, en);
     let (internet, internet_detail) = if health_probes
         .iter()
@@ -88,6 +83,7 @@ pub(crate) async fn run(settings: &Settings, interface: Option<&NetworkInterface
         internet,
         dns,
         checked_at: Some(now_secs()),
+        ipv6_checked_at: Some(now_secs()),
         health_probes,
         dns_probe: Some(dns_probe),
         ipv6_probes,
@@ -95,16 +91,45 @@ pub(crate) async fn run(settings: &Settings, interface: Option<&NetworkInterface
         dns_detail,
         ..HealthStatus::default()
     };
-    update_ipv6_status(&mut health, interface, &settings.language);
+    update_ipv6_status(&mut health, interface, interfaces, &settings.language);
     health
+}
+
+pub(crate) async fn run_ipv6(
+    settings: &Settings,
+    interface: Option<&NetworkInterface>,
+    interfaces: &[NetworkInterface],
+    health: &mut HealthStatus,
+) {
+    health.ipv6_probes = ipv6_observations(settings, interface, interfaces).await;
+    health.ipv6_checked_at = Some(now_secs());
+    update_ipv6_status(health, interface, interfaces, &settings.language);
 }
 
 pub(crate) fn update_ipv6_status(
     health: &mut HealthStatus,
     interface: Option<&NetworkInterface>,
+    interfaces: &[NetworkInterface],
     language: &str,
 ) {
-    let (status, zh, en) = ipv6_status(interface, &health.health_probes, &health.ipv6_probes);
+    let cernet = interfaces
+        .iter()
+        .filter(|adapter| adapter.up && adapter.ipv6_enabled != Some(false))
+        .flat_map(|adapter| adapter.ipv6.iter().copied())
+        .find(|address| is_cernet_ipv6(*address));
+    health.local_ipv6 = cernet.or_else(|| {
+        interface?
+            .ipv6
+            .iter()
+            .copied()
+            .find(|address| source_ipv6(*address))
+    });
+    health.public_ipv6 = health
+        .ipv6_probes
+        .iter()
+        .filter_map(|probe| probe.reported_address)
+        .find(|address| is_public_ipv6(*address));
+    let (status, zh, en) = ipv6_status(interface, cernet, health);
     health.ipv6_status = status;
     health.ipv6 = match status {
         Ipv6Status::Normal | Ipv6Status::GlobalNotPreferred => Health::Healthy,
@@ -114,11 +139,29 @@ pub(crate) fn update_ipv6_status(
     health.ipv6_detail = localized(language, zh, en);
 }
 
+fn source_ipv6(address: Ipv6Addr) -> bool {
+    is_public_ipv6(address) || address.is_unique_local()
+}
+
 fn ipv6_status(
     interface: Option<&NetworkInterface>,
-    http: &[HealthProbeObservation],
-    tcp: &[Ipv6ProbeObservation],
+    cernet: Option<Ipv6Addr>,
+    health: &HealthStatus,
 ) -> (Ipv6Status, &'static str, &'static str) {
+    if health.public_ipv6.is_some() {
+        return (
+            Ipv6Status::Normal,
+            "检测站点返回了公网 IPv6 地址",
+            "A probe returned a public IPv6 address",
+        );
+    }
+    if cernet.is_some() {
+        return (
+            Ipv6Status::Normal,
+            "本机已获取 CERNET IPv6 地址，公网探测结果见详情",
+            "The host has a CERNET IPv6 address. See the probe details for internet reachability.",
+        );
+    }
     let Some(interface) = interface else {
         return (
             Ipv6Status::Unknown,
@@ -136,59 +179,42 @@ fn ipv6_status(
             "No IPv6 address available",
         );
     }
-    if !interface.ipv6.iter().copied().any(is_public_ipv6) {
+    if !interface.ipv6.iter().copied().any(source_ipv6) {
         return (
             Ipv6Status::LinkLocalOnly,
-            "网卡只有本地 IPv6 地址",
-            "The adapter has only local IPv6 addresses",
+            "网卡只有链路本地 IPv6 地址",
+            "The adapter has only link-local IPv6 addresses",
         );
     }
-    let matching_http = |probe: &&HealthProbeObservation| {
-        probe.outcome == ProbeOutcome::Match && probe.on_selected_interface == Some(true)
-    };
-    if http
-        .iter()
-        .filter(matching_http)
-        .any(|probe| probe.used_ipv6 == Some(true))
-    {
-        return (
-            Ipv6Status::Normal,
-            "探测使用了 IPv6",
-            "The internet probe used IPv6",
-        );
-    }
-    let reachable = |probe: &&Ipv6ProbeObservation| probe.local_is_v6 == Some(true);
-    if tcp.iter().filter(reachable).any(|probe| {
-        http.iter().any(|http| {
-            http.outcome == ProbeOutcome::Match
-                && http.target == probe.target
-                && http.used_ipv6 == Some(false)
-        })
-    }) {
-        return (
-            Ipv6Status::GlobalNotPreferred,
-            "IPv6 可连接，探测实际使用了 IPv4",
-            "IPv6 connected and the internet probe used IPv4",
-        );
-    }
-    if tcp.iter().any(|probe| probe.local_is_v6 == Some(true)) {
+    let probes = &health.ipv6_probes;
+    if probes.is_empty() {
         return (
             Ipv6Status::Unknown,
-            "已测试 IPv6 连通，尚未确认实际使用的协议",
-            "IPv6 connected. The protocol in use is unknown",
+            "尚未测试公网 IPv6 连接",
+            "A public IPv6 connection has not been tested",
         );
     }
-    if tcp
+    if probes
+        .iter()
+        .any(|probe| probe.outcome == Some(ProbeOutcome::UnexpectedBody))
+    {
+        return (
+            Ipv6Status::Unknown,
+            "站点未回传有效的公网 IPv6 地址",
+            "The probe targets did not return a valid public IPv6 address",
+        );
+    }
+    if probes
         .iter()
         .any(|probe| probe.attempted > 0 || probe.timed_out)
     {
         return (
             Ipv6Status::GlobalUnreachable,
-            "未能建立 IPv6 连接",
-            "Could not establish an IPv6 connection",
+            "公网 IPv6 探测均未成功",
+            "No public IPv6 probe succeeded",
         );
     }
-    if tcp
+    if probes
         .iter()
         .any(|probe| probe.dns_result == Some(DnsProbeResult::LookupFailed))
     {
@@ -198,17 +224,10 @@ fn ipv6_status(
             "The IPv6 DNS lookup for the probe targets failed",
         );
     }
-    if !tcp.is_empty() && tcp.iter().all(|probe| probe.addresses == Some(0)) {
-        return (
-            Ipv6Status::Unknown,
-            "探测地址未提供 IPv6 目标",
-            "The probe targets returned no public IPv6 addresses",
-        );
-    }
     (
         Ipv6Status::Unknown,
-        "尚未测试公网 IPv6 连接",
-        "A public IPv6 connection has not been tested",
+        "探测地址未提供 IPv6 目标",
+        "The probe targets returned no public IPv6 addresses",
     )
 }
 
@@ -349,113 +368,314 @@ fn request_outcome(error: reqwest::Error) -> ProbeOutcome {
 
 async fn dns_probe() -> DnsProbeObservation {
     let started = Instant::now();
-    let (result, addresses) =
+    let (result, resolved_addresses) =
         match time::timeout(Duration::from_secs(3), net::lookup_host((DNS_HOST, 80))).await {
             Ok(Ok(addresses)) => {
-                let count = addresses.count();
-                (
-                    if count == 0 {
-                        DnsProbeResult::Empty
-                    } else {
-                        DnsProbeResult::Ok
-                    },
-                    count,
-                )
+                let addresses: Vec<_> = addresses
+                    .map(|address| address.ip())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .take(16)
+                    .collect();
+                let result = if addresses.is_empty() {
+                    DnsProbeResult::Empty
+                } else {
+                    DnsProbeResult::Ok
+                };
+                (result, addresses)
             }
-            Ok(Err(_)) => (DnsProbeResult::LookupFailed, 0),
-            Err(_) => (DnsProbeResult::Timeout, 0),
+            Ok(Err(_)) => (DnsProbeResult::LookupFailed, Vec::new()),
+            Err(_) => (DnsProbeResult::Timeout, Vec::new()),
         };
     DnsProbeObservation {
         host: DNS_HOST.to_owned(),
         result,
-        addresses,
+        addresses: resolved_addresses.len(),
+        resolved_addresses,
         elapsed_ms: elapsed_ms(started),
     }
 }
 
-async fn ipv6_probe(
-    target: &HealthTarget,
+struct Ipv6Target {
     index: usize,
+    url: url::Url,
+    kind: Ipv6ProbeKind,
+}
+
+fn ipv6_probe_targets(urls: &[String]) -> Vec<Ipv6Target> {
+    let mut targets = Vec::new();
+    let mut detailed = false;
+    for (index, configured) in urls.iter().enumerate() {
+        let Ok(url) = parse_ipv6_target(configured) else {
+            continue;
+        };
+        let is_test_ipv6 = url
+            .host_str()
+            .is_some_and(|host| host.ends_with(".test-ipv6.com"))
+            && url.path().trim_end_matches('/') == "/ip";
+        targets.push(Ipv6Target {
+            index: index + 1,
+            url: url.clone(),
+            kind: if is_test_ipv6 {
+                Ipv6ProbeKind::TestIpv6
+            } else {
+                Ipv6ProbeKind::Address
+            },
+        });
+        if is_test_ipv6 && !detailed {
+            detailed = true;
+            let mut large_packet = url.clone();
+            let parameters: Vec<_> = url
+                .query_pairs()
+                .into_owned()
+                .filter(|(key, _)| key != "size" && key != "fill")
+                .collect();
+            large_packet
+                .query_pairs_mut()
+                .clear()
+                .extend_pairs(parameters)
+                .append_pair("size", "1600");
+            targets.push(Ipv6Target {
+                index: index + 1,
+                url: large_packet,
+                kind: Ipv6ProbeKind::LargePacket,
+            });
+            targets.push(Ipv6Target {
+                index: index + 1,
+                url: url::Url::parse("http://ds.test-ipv6.com/ip/?callback=cb")
+                    .expect("fixed dual stack URL"),
+                kind: Ipv6ProbeKind::DualStack,
+            });
+        }
+    }
+    targets
+}
+
+fn client(timeout: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let target = attempt.url();
+            if attempt.previous().len() == 1
+                && same_host_https_upgrade(&attempt.previous()[0], target)
+            {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .timeout(timeout)
+        .user_agent(concat!("BitNet/", env!("CARGO_PKG_VERSION")))
+}
+
+fn same_host_https_upgrade(source: &url::Url, target: &url::Url) -> bool {
+    source.scheme() == "http"
+        && target.scheme() == "https"
+        && source.host() == target.host()
+        && source.port().is_none()
+        && target.port().is_none()
+        && target.username().is_empty()
+        && target.password().is_none()
+}
+
+fn adapter_sources<'a>(interfaces: impl Iterator<Item = &'a NetworkInterface>) -> Vec<Ipv6Addr> {
+    interfaces
+        .filter(|adapter| adapter.up && adapter.ipv6_enabled != Some(false))
+        .flat_map(|adapter| adapter.ipv6.iter().copied())
+        .filter(|address| source_ipv6(*address))
+        .take(4)
+        .collect()
+}
+
+async fn ipv6_observations(
+    settings: &Settings,
+    interface: Option<&NetworkInterface>,
+    interfaces: &[NetworkInterface],
+) -> Vec<Ipv6ProbeObservation> {
+    let mut sources = adapter_sources(interface.into_iter());
+    if sources.is_empty() {
+        // IPv4 authentication and IPv6 connectivity may use different adapters.
+        sources = adapter_sources(interfaces.iter().filter(|adapter| !adapter.virtual_adapter));
+    }
+    if sources.is_empty() {
+        return Vec::new();
+    }
+    let timeout = Duration::from_secs(settings.request_timeout_secs.min(8));
+    join_all(
+        ipv6_probe_targets(&settings.ipv6_targets)
+            .iter()
+            .map(|target| ipv6_probe(target, timeout, &sources)),
+    )
+    .await
+}
+
+#[derive(Default)]
+struct ProviderResponse {
+    status: Option<u16>,
+    reported: Option<IpAddr>,
+    local_is_v6: Option<bool>,
+}
+
+async fn provider_request(
+    client: reqwest::ClientBuilder,
+    url: url::Url,
+    probe: Ipv6ProbeKind,
+) -> Result<ProviderResponse, (ProviderResponse, ProbeOutcome)> {
+    let mut result = ProviderResponse::default();
+    let client = client
+        .build()
+        .map_err(|_| (ProviderResponse::default(), ProbeOutcome::RequestFailed))?;
+    let callback = url
+        .query_pairs()
+        .find(|(key, _)| key == "callback")
+        .map(|(_, value)| value.into_owned());
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| (ProviderResponse::default(), request_outcome(error)))?;
+    result.status = Some(response.status().as_u16());
+    result.local_is_v6 = response
+        .extensions()
+        .get::<HttpInfo>()
+        .map(|info| info.local_addr().ip().to_canonical().is_ipv6());
+    if !response.status().is_success() {
+        return Err((result, ProbeOutcome::UnexpectedStatus));
+    }
+    let mut body = Vec::new();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(chunk) => chunk,
+            Err(e) => return Err((result, request_outcome(e))),
+        };
+        let Some(chunk) = chunk else { break };
+        if body.len() + chunk.len() > BODY_LIMIT {
+            return Err((result, ProbeOutcome::BodyLimit));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    result.reported = parse_reported_ip(&body, callback.as_deref());
+    if probe != Ipv6ProbeKind::DualStack
+        && !matches!(result.reported, Some(IpAddr::V6(address)) if is_public_ipv6(address))
+    {
+        return Err((result, ProbeOutcome::UnexpectedBody));
+    }
+    if probe == Ipv6ProbeKind::DualStack && result.reported.is_none() {
+        return Err((result, ProbeOutcome::UnexpectedBody));
+    }
+    if probe == Ipv6ProbeKind::LargePacket && body.len() < 1280 {
+        return Err((result, ProbeOutcome::UnexpectedBody));
+    }
+    Ok(result)
+}
+
+fn parse_reported_ip(body: &[u8], callback: Option<&str>) -> Option<IpAddr> {
+    let text = std::str::from_utf8(body).ok()?.trim();
+    if let Ok(address) = text.parse() {
+        return Some(address);
+    }
+    // Test IPv6's endpoint returns JSONP. Only parse the JSON payload as data.
+    let json = match callback
+        .and_then(|name| text.strip_prefix(name))
+        .and_then(|rest| rest.strip_prefix('('))
+    {
+        Some(payload) => payload
+            .strip_suffix(");")
+            .or_else(|| payload.strip_suffix(')'))?,
+        None => text,
+    };
+    let reply: serde_json::Value = serde_json::from_str(json).ok()?;
+    reply.get("ip")?.as_str()?.parse().ok()
+}
+
+async fn ipv6_probe(
+    target: &Ipv6Target,
     timeout: Duration,
     sources: &[Ipv6Addr],
-) -> Option<Ipv6ProbeObservation> {
-    if sources.is_empty() {
-        return None;
-    }
-    let url = target.parsed_url().ok()?;
-    let host = url
-        .host_str()?
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    let port = url.port_or_known_default()?;
+) -> Ipv6ProbeObservation {
     let started = Instant::now();
     let mut observation = Ipv6ProbeObservation {
-        target: index,
+        target: target.index,
+        kind: target.kind,
         dns_result: None,
         addresses: None,
+        status: None,
+        outcome: None,
+        reported_address: None,
         attempted: 0,
         succeeded: 0,
         local_is_v6: None,
         timed_out: false,
         elapsed_ms: 0,
     };
-    let lookup_and_connect = async {
-        let addresses = match net::lookup_host((host, port)).await {
-            Ok(addresses) => addresses,
+    let work = async {
+        let dual_stack = target.kind == Ipv6ProbeKind::DualStack;
+        let host = target
+            .url
+            .host_str()
+            .expect("validated URL")
+            .trim_matches(['[', ']']);
+        let port = target.url.port_or_known_default().expect("HTTP(S) URL");
+        let addresses: Vec<_> = match net::lookup_host((host, port)).await {
+            Ok(addresses) => addresses
+                .filter(|address| dual_stack || address.is_ipv6())
+                .take(8)
+                .map(|mut address| {
+                    // Reqwest uses the URL port when the override leaves this unset.
+                    address.set_port(0);
+                    address
+                })
+                .collect(),
             Err(_) => {
                 observation.dns_result = Some(DnsProbeResult::LookupFailed);
                 return;
             }
         };
-        let public_source = sources.iter().copied().all(is_public_ipv6);
-        let addresses: Vec<_> = addresses
-            .filter(|address| {
-                matches!(address.ip(), IpAddr::V6(ip) if !public_source || is_public_ipv6(ip))
-            })
-            .take(2)
-            .collect();
         observation.addresses = Some(addresses.len());
-        observation.dns_result = Some(if addresses.is_empty() {
-            DnsProbeResult::Empty
-        } else {
-            DnsProbeResult::Ok
-        });
-        observation.attempted = addresses.len() * sources.len();
-        let probes = addresses.iter().flat_map(|address| {
-            sources.iter().map(move |source| async move {
-                let connect = async {
-                    let socket = net::TcpSocket::new_v6()?;
-                    socket.bind(SocketAddr::from((*source, 0)))?;
-                    socket.connect(*address).await
-                };
-                time::timeout(Duration::from_secs(2), connect).await
-            })
-        });
-        let mut results = stream::iter(probes).buffer_unordered(8);
-        while let Some(result) = results.next().await {
-            match result {
-                Ok(Ok(stream)) => {
-                    observation.succeeded += 1;
-                    if let Ok(local_addr) = stream.local_addr() {
-                        observation.local_is_v6 = Some(local_addr.is_ipv6());
-                    }
-                }
-                Ok(Err(_)) => {}
-                Err(_) => observation.timed_out = true,
-            }
+        if addresses.is_empty() {
+            observation.dns_result = Some(DnsProbeResult::Empty);
+            return;
         }
+        observation.dns_result = Some(DnsProbeResult::Ok);
+        let candidates: Vec<_> = if dual_stack {
+            vec![None]
+        } else {
+            sources.iter().copied().map(IpAddr::V6).map(Some).collect()
+        };
+        observation.attempted = candidates.len();
+        let requests = candidates.into_iter().map(|source| {
+            Box::pin(provider_request(
+                client(timeout)
+                    .local_address(source)
+                    .resolve_to_addrs(host, &addresses),
+                target.url.clone(),
+                target.kind,
+            ))
+        });
+        let response = select_ok(requests).await;
+        let (response, outcome) = match response {
+            Ok((response, _)) => (response, ProbeOutcome::Match),
+            Err((response, error)) => (response, error),
+        };
+        observation.status = response.status;
+        observation.outcome = Some(outcome);
+        observation.local_is_v6 = response.local_is_v6;
+        observation.timed_out = outcome == ProbeOutcome::Timeout;
+        observation.succeeded = usize::from(outcome == ProbeOutcome::Match);
+        observation.reported_address = match response.reported {
+            Some(IpAddr::V6(address)) if is_public_ipv6(address) => Some(address),
+            _ => None,
+        };
     };
-    if time::timeout(timeout.min(Duration::from_secs(5)), lookup_and_connect)
-        .await
-        .is_err()
-    {
+    if time::timeout(timeout, work).await.is_err() {
         observation.timed_out = true;
+        observation.outcome = Some(ProbeOutcome::Timeout);
         if observation.dns_result.is_none() {
             observation.dns_result = Some(DnsProbeResult::Timeout);
         }
     }
     observation.elapsed_ms = elapsed_ms(started);
-    Some(observation)
+    observation
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -533,79 +753,114 @@ mod tests {
         assert_eq!(observation.outcome, ProbeOutcome::RequestFailed);
     }
 
-    #[tokio::test]
-    async fn ipv6_diagnostic_proves_transport_on_a_loopback_fixture() {
-        let Ok(listener) = net::TcpListener::bind("[::1]:0").await else {
-            return;
-        };
+    async fn ipv6_fixture(
+        body: &str,
+        kind: Ipv6ProbeKind,
+        sources: &[Ipv6Addr],
+    ) -> Option<Ipv6ProbeObservation> {
+        let listener = net::TcpListener::bind("[::1]:0").await.ok()?;
         let address = listener.local_addr().unwrap();
-        let accepted = tokio::spawn(async move {
-            listener.accept().await.unwrap();
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(raw.as_bytes()).await.unwrap();
         });
         let observation = ipv6_probe(
-            &HealthTarget {
-                url: format!("http://{address}"),
-                expect: HealthExpect::AnySuccess,
+            &Ipv6Target {
+                index: 1,
+                url: url::Url::parse(&format!("http://{address}/?callback=cb")).unwrap(),
+                kind,
             },
-            1,
             Duration::from_secs(3),
-            &[Ipv6Addr::LOCALHOST],
+            sources,
+        )
+        .await;
+        server.await.unwrap();
+        Some(observation)
+    }
+
+    #[tokio::test]
+    async fn provider_proves_ipv6_and_records_echoed_address() {
+        let Some(observation) = ipv6_fixture(
+            "2001:4860::1234",
+            Ipv6ProbeKind::Address,
+            &["::2".parse().unwrap(), Ipv6Addr::LOCALHOST],
         )
         .await
-        .unwrap();
-        assert_eq!(observation.attempted, 1);
+        else {
+            return;
+        };
+        assert_eq!(observation.attempted, 2);
         assert_eq!(observation.dns_result, Some(DnsProbeResult::Ok));
         assert_eq!(observation.addresses, Some(1));
         assert_eq!(observation.succeeded, 1);
         assert_eq!(observation.local_is_v6, Some(true));
-        accepted.await.unwrap();
+        assert_eq!(
+            observation.reported_address,
+            Some("2001:4860::1234".parse().unwrap())
+        );
     }
 
     #[tokio::test]
-    async fn ipv6_uses_another_adapter_address_when_the_first_source_cannot_bind() {
-        let Ok(listener) = net::TcpListener::bind("[::1]:0").await else {
+    async fn large_packet_probe_checks_response_size_as_well_as_echoed_address() {
+        let reply = format!(
+            r#"cb({{"ip":"2001:4860::1234","fill":"{}"}});"#,
+            "a".repeat(1600)
+        );
+        let Some(observation) =
+            ipv6_fixture(&reply, Ipv6ProbeKind::LargePacket, &[Ipv6Addr::LOCALHOST]).await
+        else {
             return;
         };
-        let address = listener.local_addr().unwrap();
-        let accepted = tokio::spawn(async move { listener.accept().await.unwrap() });
-        let observation = ipv6_probe(
-            &HealthTarget {
-                url: format!("http://{address}"),
-                expect: HealthExpect::AnySuccess,
-            },
-            1,
-            Duration::from_secs(3),
-            &["::2".parse().unwrap(), Ipv6Addr::LOCALHOST],
-        )
-        .await
-        .unwrap();
-        assert_eq!(observation.attempted, 2);
-        assert_eq!(observation.succeeded, 1);
-        assert_eq!(observation.local_is_v6, Some(true));
-        accepted.await.unwrap();
-    }
+        assert_eq!(observation.outcome, Some(ProbeOutcome::Match));
 
-    #[tokio::test]
-    async fn an_ipv4_only_target_records_a_completed_empty_ipv6_lookup() {
-        let observation = ipv6_probe(
-            &HealthTarget {
-                url: "http://127.0.0.1:1/".into(),
-                expect: HealthExpect::AnySuccess,
-            },
-            1,
-            Duration::from_secs(1),
+        let malformed = ipv6_fixture(
+            r#"cb({"ip":"2001:4860::1234"});"#,
+            Ipv6ProbeKind::LargePacket,
             &[Ipv6Addr::LOCALHOST],
         )
         .await
         .unwrap();
+        assert_eq!(malformed.outcome, Some(ProbeOutcome::UnexpectedBody));
+        assert_eq!(malformed.reported_address, observation.reported_address);
+    }
+
+    #[tokio::test]
+    async fn ipv4_only_provider_records_an_empty_ipv6_lookup() {
+        let observation = ipv6_probe(
+            &Ipv6Target {
+                index: 1,
+                url: url::Url::parse("http://127.0.0.1:1/").unwrap(),
+                kind: Ipv6ProbeKind::Address,
+            },
+            Duration::from_secs(1),
+            &[Ipv6Addr::LOCALHOST],
+        )
+        .await;
         assert_eq!(observation.dns_result, Some(DnsProbeResult::Empty));
         assert_eq!(observation.addresses, Some(0));
         assert_eq!(observation.attempted, 0);
         assert!(!observation.timed_out);
     }
 
+    #[tokio::test]
+    async fn non_public_ipv6_provider_reply_does_not_establish_connectivity() {
+        let Some(observation) =
+            ipv6_fixture("fe80::1", Ipv6ProbeKind::Address, &[Ipv6Addr::LOCALHOST]).await
+        else {
+            return;
+        };
+        assert_eq!(observation.outcome, Some(ProbeOutcome::UnexpectedBody));
+        assert_eq!(observation.reported_address, None);
+    }
+
     #[test]
-    fn ipv6_status_requires_reachability_and_connection_family_evidence() {
+    fn local_cernet_and_provider_ipv6_independently_prove_connectivity() {
         let mut interface: NetworkInterface = serde_json::from_value(serde_json::json!({
             "id": "fixture",
             "name": "Fixture",
@@ -618,72 +873,100 @@ mod tests {
         }))
         .unwrap();
         let mut health = HealthStatus::default();
-        update_ipv6_status(&mut health, Some(&interface), "en");
+        update_ipv6_status(
+            &mut health,
+            Some(&interface),
+            std::slice::from_ref(&interface),
+            "en",
+        );
         assert_eq!(health.ipv6_status, Ipv6Status::Disabled);
 
         interface.ipv6_enabled = Some(true);
         interface.ipv6 = vec!["fe80::1".parse().unwrap()];
-        update_ipv6_status(&mut health, Some(&interface), "en");
+        update_ipv6_status(
+            &mut health,
+            Some(&interface),
+            std::slice::from_ref(&interface),
+            "en",
+        );
         assert_eq!(health.ipv6_status, Ipv6Status::LinkLocalOnly);
 
-        interface.ipv6.push("2600::1".parse().unwrap());
-        update_ipv6_status(&mut health, Some(&interface), "en");
-        assert_eq!(health.ipv6_status, Ipv6Status::Unknown);
-
-        health.ipv6_probes.push(Ipv6ProbeObservation {
-            target: 1,
-            dns_result: Some(DnsProbeResult::Ok),
-            addresses: Some(1),
-            attempted: 1,
-            succeeded: 0,
-            local_is_v6: None,
-            timed_out: true,
-            elapsed_ms: 1,
-        });
-        update_ipv6_status(&mut health, Some(&interface), "en");
-        assert_eq!(health.ipv6_status, Ipv6Status::GlobalUnreachable);
-
-        health.ipv6_probes[0].attempted = 0;
-        health.ipv6_probes[0].dns_result = Some(DnsProbeResult::Timeout);
-        health.ipv6_probes[0].addresses = None;
-        update_ipv6_status(&mut health, Some(&interface), "en");
-        assert_eq!(health.ipv6_status, Ipv6Status::GlobalUnreachable);
-
-        health.ipv6_probes[0].timed_out = false;
-        health.ipv6_probes[0].dns_result = Some(DnsProbeResult::Empty);
-        health.ipv6_probes[0].addresses = Some(0);
-        update_ipv6_status(&mut health, Some(&interface), "en");
-        assert_eq!(health.ipv6_status, Ipv6Status::Unknown);
-        assert!(health
-            .ipv6_detail
-            .as_deref()
-            .unwrap()
-            .contains("no public IPv6"));
-
-        health.ipv6_probes[0].local_is_v6 = Some(true);
-        health.ipv6_probes[0].succeeded = 1;
-        update_ipv6_status(&mut health, Some(&interface), "en");
-        assert_eq!(health.ipv6_status, Ipv6Status::Unknown);
-
-        health.health_probes.push(HealthProbeObservation {
-            target: 1,
-            expect: HealthProbeExpectation::Status(204),
-            outcome: ProbeOutcome::Match,
-            status: Some(204),
-            body_match: None,
-            used_ipv6: Some(false),
-            on_selected_interface: Some(false),
-            elapsed_ms: 1,
-        });
-        update_ipv6_status(&mut health, Some(&interface), "en");
-        assert_eq!(health.ipv6_status, Ipv6Status::GlobalNotPreferred);
-
-        health.health_probes[0].on_selected_interface = Some(true);
-        update_ipv6_status(&mut health, Some(&interface), "en");
-        assert_eq!(health.ipv6_status, Ipv6Status::GlobalNotPreferred);
-
-        health.health_probes[0].used_ipv6 = Some(true);
-        update_ipv6_status(&mut health, Some(&interface), "en");
+        let cernet = "2001:da8::1".parse().unwrap();
+        interface.ipv6.push(cernet);
+        // The detected CERNET address can belong to another network adapter.
+        update_ipv6_status(&mut health, None, std::slice::from_ref(&interface), "en");
         assert_eq!(health.ipv6_status, Ipv6Status::Normal);
+        assert_eq!(health.local_ipv6, Some(cernet));
+        assert_eq!(health.public_ipv6, None);
+
+        let outside_cernet = "2001:4860::1234".parse().unwrap();
+        let provider = serde_json::from_value(serde_json::json!({
+            "target": 1,
+            "attempted": 1,
+            "succeeded": 1,
+            "elapsed_ms": 1,
+            "timed_out": false,
+            "reported_address": outside_cernet
+        }))
+        .unwrap();
+        health.ipv6_probes = vec![provider];
+        update_ipv6_status(
+            &mut health,
+            Some(&interface),
+            std::slice::from_ref(&interface),
+            "en",
+        );
+        assert_eq!(health.ipv6_status, Ipv6Status::Normal);
+        assert_eq!(health.local_ipv6, Some(cernet));
+        assert_eq!(health.public_ipv6, Some(outside_cernet));
+
+        let private_address = "fd00::1234".parse().unwrap();
+        interface.ipv6 = vec![private_address];
+        update_ipv6_status(
+            &mut health,
+            Some(&interface),
+            std::slice::from_ref(&interface),
+            "en",
+        );
+        assert_eq!(health.ipv6_status, Ipv6Status::Normal);
+        assert_eq!(health.local_ipv6, Some(private_address));
+        assert_eq!(health.public_ipv6, Some(outside_cernet));
+
+        health.ipv6_probes.clear();
+        update_ipv6_status(
+            &mut health,
+            Some(&interface),
+            std::slice::from_ref(&interface),
+            "en",
+        );
+        assert_eq!(health.ipv6_status, Ipv6Status::Unknown);
+    }
+
+    #[test]
+    fn dedicated_defaults_produce_ipv6_only_and_detailed_test_ipv6_probes() {
+        let targets = ipv6_probe_targets(&Settings::default().ipv6_targets);
+        assert_eq!(
+            targets.iter().map(|target| target.kind).collect::<Vec<_>>(),
+            [
+                Ipv6ProbeKind::Address,
+                Ipv6ProbeKind::TestIpv6,
+                Ipv6ProbeKind::LargePacket,
+                Ipv6ProbeKind::DualStack
+            ]
+        );
+        assert_eq!(targets[2].index, 2);
+        assert!(targets[2]
+            .url
+            .query_pairs()
+            .any(|(key, value)| key == "size" && value == "1600"));
+        assert_eq!(targets[3].url.host_str(), Some("ds.test-ipv6.com"));
+        assert!(same_host_https_upgrade(
+            &targets[0].url,
+            &url::Url::parse("https://api-ipv6.ip.sb/ip").unwrap()
+        ));
+        assert!(!same_host_https_upgrade(
+            &targets[0].url,
+            &url::Url::parse("https://example.com/ip").unwrap()
+        ));
     }
 }

@@ -22,10 +22,14 @@
 
 ## 固定维护命令
 
+Windows 将服务运行和开机启动分别管理。停止服务保留当前开机启动设置。旧版本停用的服务在手动启动时恢复为按需启动，可另行启用开机启动。
+
 ```
 bitmaint --scope system --action service-install --interactive
 bitmaint --scope system --action service-start --interactive
 bitmaint --scope system --action service-stop --interactive
+bitmaint --scope system --action autostart-on --interactive
+bitmaint --scope system --action autostart-off --interactive
 bitmaint --scope system --action service-remove --interactive [--purge]
 bitmaint --scope system --action repair --interactive
 bitmaint --scope user --action check-update

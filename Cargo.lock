@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bitnet-core",
  "bitnet-launcher",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-gateway"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "bitnet-core",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-gui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bitnet-core",
  "bitnet-launcher",
@@ -501,6 +501,7 @@ dependencies = [
  "notify-rust",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tray-icon",
  "zeroize",
@@ -508,14 +509,14 @@ dependencies = [
 
 [[package]]
 name = "bitnet-launcher"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bitnet-core",
 ]
 
 [[package]]
 name = "bitnet-platform"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -531,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-runtime"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "bitnet-core",
@@ -561,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-tui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bitnet-core",
  "bitnet-launcher",
@@ -575,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-web"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bitnet-core",
  "bitnet-platform",

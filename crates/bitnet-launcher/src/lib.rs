@@ -23,7 +23,23 @@ impl fmt::Display for LaunchError {
 }
 
 pub fn web(scope: Scope, action: WebAction, english: bool) -> Result<(), LaunchError> {
+    launch_web(scope, action, english, false)
+}
+
+pub fn web_exact(scope: Scope, action: WebAction, english: bool) -> Result<(), LaunchError> {
+    launch_web(scope, action, english, true)
+}
+
+fn launch_web(
+    scope: Scope,
+    action: WebAction,
+    english: bool,
+    exact: bool,
+) -> Result<(), LaunchError> {
     let mut process = companion("bitnet-web", scope)?;
+    if exact {
+        process.arg("--exact-scope");
+    }
     match action {
         WebAction::Open => process.args(["--lang", if english { "en" } else { "zh" }]),
         WebAction::Stop => process.arg("--stop"),

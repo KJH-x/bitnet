@@ -3,7 +3,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::BTreeMap,
     fmt,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 use zeroize::Zeroizing;
 
@@ -62,6 +62,20 @@ pub enum Ipv4Assignment {
     Manual,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsMode {
+    Automatic,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DnsConfiguration {
+    pub servers: Vec<IpAddr>,
+    pub ipv4_mode: Option<DnsMode>,
+    pub ipv6_mode: Option<DnsMode>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkInterface {
     pub id: String,
@@ -79,6 +93,8 @@ pub struct NetworkInterface {
     /// IPv4 DNS servers in the operating system's preference order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns: Vec<Ipv4Addr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_config: Option<DnsConfiguration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ipv6: Vec<Ipv6Addr>,
     /// Configured IPv4 assignment method, when available for this adapter.
@@ -108,6 +124,11 @@ pub fn is_public_ipv6(address: Ipv6Addr) -> bool {
     first & 0xe000 == 0x2000
         && (first, second) != (0x2001, 0x0db8)
         && !(first == 0x3fff && second & 0xf000 == 0)
+}
+
+pub fn is_cernet_ipv6(address: Ipv6Addr) -> bool {
+    let [first, second, ..] = address.segments();
+    (first, second) == (0x2001, 0x0da8)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -158,6 +179,45 @@ impl Default for GatewayConfig {
 const DEFAULT_HEALTH_TEXT_URL: &str = "http://www.msftconnecttest.com/connecttest.txt";
 const DEFAULT_HEALTH_STATUS_URL: &str = "http://connectivitycheck.gstatic.com/generate_204";
 pub const MAX_HEALTH_TARGETS: usize = 8;
+pub const MAX_IPV6_TARGETS: usize = 8;
+const DEFAULT_IPV6_TARGETS: [&str; 2] = [
+    "http://api-ipv6.ip.sb/ip",
+    "http://v6.test-ipv6.com/ip/?callback=cb",
+];
+
+fn default_ipv6_targets_match(targets: &[String]) -> bool {
+    targets == DEFAULT_IPV6_TARGETS
+}
+
+pub fn parse_ipv6_target(target: &str) -> Result<url::Url, AppError> {
+    let url = url::Url::parse(target).ok().filter(|url| {
+        target.len() <= 2048
+            && matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+    });
+    url.ok_or_else(|| {
+        AppError::new(
+            ErrorCode::InvalidInput,
+            "IPv6 探测地址须为不含凭据和片段的 HTTP 或 HTTPS 地址",
+        )
+    })
+}
+
+fn validate_ipv6_targets(targets: &[String]) -> Result<(), AppError> {
+    if targets.len() > MAX_IPV6_TARGETS {
+        return Err(AppError::new(ErrorCode::InvalidInput, "IPv6 探测地址过多"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for target in targets {
+        if !seen.insert(parse_ipv6_target(target)?) {
+            return Err(AppError::new(ErrorCode::InvalidInput, "IPv6 探测地址重复"));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -265,6 +325,9 @@ pub struct Settings {
     pub auto_update: bool,
     pub notify_errors: bool,
     pub health_targets: Vec<String>,
+    // Older BitNet versions can still read otherwise compatible default settings.
+    #[serde(skip_serializing_if = "default_ipv6_targets_match")]
+    pub ipv6_targets: Vec<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub health_expectations: BTreeMap<String, HealthExpect>,
     pub rules: Vec<NetworkRule>,
@@ -305,6 +368,7 @@ impl Default for Settings {
                 DEFAULT_HEALTH_STATUS_URL.into(),
             ],
             health_expectations: BTreeMap::new(),
+            ipv6_targets: DEFAULT_IPV6_TARGETS.map(str::to_owned).into(),
             rules: Vec::new(),
         }
     }
@@ -345,6 +409,16 @@ impl Settings {
         Ok(())
     }
 
+    pub fn set_ipv6_targets(&mut self, targets: Vec<String>) -> Result<(), AppError> {
+        let targets: Vec<_> = targets
+            .into_iter()
+            .map(|url| url.trim().to_owned())
+            .collect();
+        validate_ipv6_targets(&targets)?;
+        self.ipv6_targets = targets;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), AppError> {
         if self.schema_version != 1 {
             return Err(AppError::new(ErrorCode::Incompatible, "不支持的配置版本"));
@@ -369,6 +443,7 @@ impl Settings {
         if !["error", "warning", "info", "debug"].contains(&self.log_level.as_str()) {
             return Err(AppError::new(ErrorCode::InvalidInput, "不支持的日志级别"));
         }
+        validate_ipv6_targets(&self.ipv6_targets)?;
         if self.rules.len() > 128
             || self.health_targets.len() > MAX_HEALTH_TARGETS
             || self.health_expectations.len() > MAX_HEALTH_TARGETS
@@ -572,12 +647,32 @@ pub struct DnsProbeObservation {
     pub host: String,
     pub result: DnsProbeResult,
     pub addresses: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_addresses: Vec<IpAddr>,
     pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Ipv6ProbeKind {
+    #[default]
+    Address,
+    TestIpv6,
+    DualStack,
+    LargePacket,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Ipv6ProbeObservation {
     pub target: usize,
+    #[serde(default)]
+    pub kind: Ipv6ProbeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ProbeOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_address: Option<Ipv6Addr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_result: Option<DnsProbeResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -608,6 +703,12 @@ pub struct HealthStatus {
     pub ipv6: Health,
     #[serde(default)]
     pub ipv6_status: Ipv6Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_checked_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_ipv6: Option<Ipv6Addr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_ipv6: Option<Ipv6Addr>,
     pub checked_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub health_probes: Vec<HealthProbeObservation>,
@@ -621,6 +722,21 @@ pub struct HealthStatus {
     pub dns_detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv6_detail: Option<String>,
+}
+
+impl HealthStatus {
+    pub fn redacted(&self) -> Self {
+        let mut state = self.clone();
+        state.local_ipv6 = None;
+        state.public_ipv6 = None;
+        if let Some(dns) = &mut state.dns_probe {
+            dns.resolved_addresses.clear();
+        }
+        for probe in &mut state.ipv6_probes {
+            probe.reported_address = None;
+        }
+        state
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -951,6 +1067,46 @@ mod tests {
             ..Default::default()
         };
         assert!(s.validate().is_err());
+    }
+    #[test]
+    fn ipv6_target_defaults_preserve_legacy_configuration_and_accept_explicit_overrides() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.ipv6_targets, DEFAULT_IPV6_TARGETS);
+        assert!(serde_json::to_value(&settings).unwrap()["ipv6_targets"].is_null());
+
+        settings
+            .set_ipv6_targets(vec![" https://ipv6.example/ip  ".into()])
+            .unwrap();
+        assert_eq!(settings.ipv6_targets, ["https://ipv6.example/ip"]);
+        let serialized = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            serialized["ipv6_targets"],
+            serde_json::json!(["https://ipv6.example/ip"])
+        );
+        let decoded: Settings = serde_json::from_value(serialized).unwrap();
+        assert_eq!(settings, decoded);
+
+        for invalid in [
+            vec![
+                "https://ipv6.example/ip".into(),
+                "https://ipv6.example/ip".into(),
+            ],
+            vec!["https://person@ipv6.example/ip".into()],
+            vec!["https://ipv6.example/ip#section".into()],
+            vec!["file:///tmp/ipv6".into()],
+            (0..=MAX_IPV6_TARGETS)
+                .map(|i| format!("https://ipv6.example/{i}"))
+                .collect(),
+        ] {
+            assert!(settings.set_ipv6_targets(invalid).is_err());
+            assert_eq!(settings.ipv6_targets, ["https://ipv6.example/ip"]);
+        }
+
+        settings.set_ipv6_targets(Vec::new()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["ipv6_targets"],
+            serde_json::json!([])
+        );
     }
     #[test]
     fn health_target_expectations_round_trip_without_changing_legacy_defaults() {

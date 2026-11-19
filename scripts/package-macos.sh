@@ -3,7 +3,7 @@
 set -eu
 test "$(uname -s)" = Darwin || { echo 'macOS packaging requires a macOS build host' >&2; exit 2; }
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-version=${VERSION:-0.1.4}; arch=${ARCH:-$(uname -m)}
+version=${VERSION:-0.1.5}; arch=${ARCH:-$(uname -m)}
 case "$arch" in x86_64|aarch64|arm64) ;; *) exit 2;; esac
 bin=${BIN_DIR:-$root/target/release}; stage=$root/build/macos-$arch; out=$root/dist/macos-$arch
 python3 "$root/scripts/fingerprint-source.py" --check "$bin/bitnet-build-source.json" >/dev/null

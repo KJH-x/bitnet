@@ -1,6 +1,6 @@
 param(
     [ValidateSet('x86','x64','arm64')][string]$Arch='x64',
-    [string]$Version='0.1.4', [switch]$Development,
+    [string]$Version='0.1.5', [switch]$Development,
     [string]$SecretKey=$env:BITNET_RELEASE_SECRET_KEY_FILE,
     [string]$PublicKey=$env:BITNET_RELEASE_PUBLIC_KEY_FILE,
     [string]$Wix=$env:BITNET_WIX,

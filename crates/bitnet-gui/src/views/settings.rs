@@ -1,8 +1,9 @@
 use super::{action_style, card, pair};
 use crate::design;
+use crate::settings_actions::{Action, ExportTo};
 use crate::{
-    format_log_size, preview_only, tray, App, Appearance, Confirmation, Language,
-    MaintenanceAction, Message, Mode, NumericSetting, SettingFlag, SettingsTab,
+    format_log_size, preview_only, tray, App, Appearance, Confirmation, Language, Message, Mode,
+    NumericSetting, SettingFlag, SettingsTab,
 };
 use bitnet_core::{Command, APP_VERSION};
 use bitnet_launcher::WebAction;
@@ -236,8 +237,8 @@ impl App {
         if self.mode == Mode::System {
             body = body.push(
                 text(self.t(
-                    "切换到自动模式可修改个人启动项。",
-                    "Switch to Automatic to edit personal startup options.",
+                    "切换到个人模式后可修改个人启动项。",
+                    "Switch to personal mode to edit personal startup options.",
                 ))
                 .size(12),
             );
@@ -300,23 +301,38 @@ impl App {
             ),
             setting_row(
                 target_label,
-                container(
+                setting_control(
                     button(text(self.t("修改…", "Edit…")).size(d.typography.body))
                         .on_press(Message::OpenHealthEditor)
                         .padding([d.space.xs + 2.0, d.space.md])
-                        .style(design::flat_button),
-                )
-                .width(Length::Fill)
-                .align_x(alignment::Horizontal::Right)
-                .into(),
+                        .width(Length::Fill)
+                        .style(design::flat_button)
+                        .into(),
+                ),
             ),
         ]
         .spacing(d.card.gap);
 
-        for target in targets {
+        for target in targets.iter().take(2) {
             body = body.push(sub_item(target));
         }
 
+        let ipv6_target_count = self.draft.settings.ipv6_targets.len();
+        body = body.push(setting_row(
+            if self.english() {
+                format!("Public IPv6 check URLs ({ipv6_target_count})")
+            } else {
+                format!("公网 IPv6 检测地址（{ipv6_target_count} 个）")
+            },
+            setting_control(
+                button(text(self.t("修改…", "Edit…")).size(d.typography.body))
+                    .on_press(Message::SettingsAction(Action::OpenIpv6Editor))
+                    .padding([d.space.xs + 2.0, d.space.md])
+                    .width(Length::Fill)
+                    .style(design::flat_button)
+                    .into(),
+            ),
+        ));
         body = body.push(setting_row(
             self.t("认证服务器", "Authentication endpoint").to_string(),
             container(text(endpoint).size(d.typography.body))
@@ -331,6 +347,7 @@ impl App {
 
     fn diagnostics_settings(&self) -> Element<'_, Message> {
         let d = design::get();
+        let english = self.english();
         let log_size = self.current_log_size();
         let clear = log_size
             .filter(|(_, bytes)| self.can_read_log_size() && *bytes > 0)
@@ -348,7 +365,6 @@ impl App {
         card(
             column![
                 row![
-                    Space::new().width(Length::Fill),
                     button(
                         text(self.t("打开日志 Web 界面", "Open log view")).size(d.typography.meta)
                     )
@@ -365,31 +381,37 @@ impl App {
                     )
                     .padding([d.space.xs, d.space.md])
                     .style(design::flat_button),
-                    button(text(self.t("刷新大小", "Refresh size")).size(d.typography.meta))
-                        .on_press_maybe(
-                            self.can_read_log_size()
-                                .then_some(Message::Run(Command::LogSize))
-                        )
-                        .padding([d.space.xs, d.space.md])
-                        .style(design::flat_button),
+                    Space::new().width(Length::Fill),
                     button(text(clear_label).size(d.typography.meta))
                         .on_press_maybe(clear)
                         .padding([d.space.xs, d.space.md])
                         .style(design::danger_outline),
                 ]
                 .spacing(d.space.sm)
-                .align_y(alignment::Vertical::Center)
-                .wrap(),
+                .align_y(alignment::Vertical::Center),
                 setting_row(
                     self.t("日志级别", "Log level").to_string(),
-                    pick_list(
-                        Some(self.draft.settings.log_level.as_str()),
-                        ["error", "warning", "info", "debug"],
-                        ToString::to_string,
-                    )
-                    .on_select(|level| Message::LogLevelChanged(level.to_owned()))
-                    .width(Length::Fill)
-                    .into(),
+                    setting_control(
+                        pick_list(
+                            Some(self.draft.settings.log_level.as_str()),
+                            ["error", "warning", "info", "debug"],
+                            move |level| match (*level, english) {
+                                ("error", false) => "错误",
+                                ("warning", false) => "警告",
+                                ("info", false) => "信息",
+                                ("debug", false) => "调试",
+                                ("error", true) => "Error",
+                                ("warning", true) => "Warning",
+                                ("info", true) => "Information",
+                                ("debug", true) => "Debug",
+                                (label, _) => label,
+                            }
+                            .to_owned(),
+                        )
+                        .on_select(|level| Message::LogLevelChanged(level.to_owned()))
+                        .width(Length::Fill)
+                        .into(),
+                    ),
                 ),
                 setting_number(
                     NumericSetting::LogRetention,
@@ -410,58 +432,66 @@ impl App {
 
     fn update_settings(&self) -> Element<'_, Message> {
         let engine = self.snapshot.as_ref();
-        card(
-            column![
-                pair(self.t("桌面客户端", "Desktop client"), APP_VERSION),
-                pair(
-                    self.t("当前后台引擎", "Connected engine"),
-                    engine.map_or("—", |s| s.app_version.as_str()),
-                ),
-                pair(
-                    self.t("接口版本", "API version"),
-                    engine.map_or_else(|| "—".into(), |s| s.api_version.to_string()),
-                ),
-                row![
-                    button(self.t("检查更新", "Check for updates")).on_press_maybe(
-                        (!self.busy && !preview_only()).then_some(Message::CheckUpdates)
-                    ),
-                    button(self.t("发布说明与下载", "Release notes and downloads"))
-                        .on_press(Message::OpenReleasePage)
-                        .style(action_style),
-                ]
-                .spacing(8)
-                .wrap(),
-                row![
-                    button(self.t("安装已验证更新…", "Install verified update…"))
-                        .on_press_maybe((!self.busy).then_some(Message::Ask(Confirmation::Maintenance(
-                            MaintenanceAction::InstallUpdate,
-                        ))))
-                        .style(action_style),
-                    button(self.t("恢复上一已验证版本…", "Restore previous verified version…"))
-                        .on_press_maybe((!self.busy).then_some(Message::Ask(Confirmation::Maintenance(
-                            MaintenanceAction::RollbackUpdate,
-                        ))))
-                        .style(action_style),
-                ].spacing(8).wrap(),
-                checkbox(self.draft.settings.check_updates)
-                    .label(self.t("允许检查新版本", "Allow update checks"))
-                    .on_toggle(|value| Message::FlagChanged(SettingFlag::CheckUpdates, value)),
-                checkbox(self.draft.settings.auto_update)
-                    .label(self.t("自动安装无需提权的个人版更新", "Install personal updates without elevation"))
-                    .on_toggle(|value| Message::FlagChanged(SettingFlag::AutoUpdate, value)),
-                text(self.t(
-                    "更新前验证签名。更新或回滚系统服务需要管理员确认。",
-                    "Updates require a verified signature. Service updates and rollbacks require administrator approval.",
+        let available = self.settings_actions.update_release.as_deref();
+        let mut details = column![
+            pair(self.t("桌面客户端", "Desktop client"), APP_VERSION),
+            pair(
+                self.t("当前后台引擎", "Connected engine"),
+                engine.map_or("—", |s| s.app_version.as_str()),
+            ),
+            pair(
+                self.t("接口版本", "API version"),
+                engine.map_or_else(|| "—".into(), |s| s.api_version.to_string()),
+            ),
+            checkbox(self.draft.settings.check_updates)
+                .label(self.t("允许检查新版本", "Allow update checks"))
+                .on_toggle(|value| Message::FlagChanged(SettingFlag::CheckUpdates, value)),
+            checkbox(self.draft.settings.auto_update)
+                .label(self.t(
+                    "自动安装无需提权的个人版更新",
+                    "Install personal updates without elevation"
                 ))
-                .size(12),
-            ]
-            .spacing(7),
-        )
-        .padding(10)
+                .on_toggle(|value| Message::FlagChanged(SettingFlag::AutoUpdate, value)),
+        ]
+        .spacing(7);
+        if let Some(version) = available {
+            details = details.push(pair(self.t("可用版本", "Available version"), version));
+        }
+        let (label, action) = match available {
+            Some(_) => (
+                self.t("安装更新", "Install update"),
+                Message::SettingsAction(Action::OpenInstaller),
+            ),
+            None => (
+                self.t("检查更新", "Check for updates"),
+                Message::CheckUpdates,
+            ),
+        };
+        let checking = self.settings_actions.checking_update();
+        column![
+            card(details).padding(10),
+            container(
+                button(if checking {
+                    self.t("正在检查…", "Checking…")
+                } else {
+                    label
+                })
+                .on_press_maybe(
+                    (!self.busy && !self.connecting && !preview_only() && !checking)
+                        .then_some(action),
+                )
+                .style(action_style),
+            )
+            .width(Length::Fill)
+            .align_x(alignment::Horizontal::Right),
+        ]
+        .spacing(8)
         .into()
     }
 
     fn transfer_settings(&self) -> Element<'_, Message> {
+        let export_enabled =
+            !self.busy && self.snapshot_current && !self.settings_actions.export_pending;
         card(
             column![
                 text(self.t(
@@ -470,14 +500,17 @@ impl App {
                 ))
                 .size(12),
                 row![
-                    button(self.t("生成导出内容", "Prepare export"))
-                        .on_press_maybe(
-                            (!self.busy && self.snapshot_current)
-                                .then_some(Message::Run(Command::ExportSettings))
-                        )
-                        .style(action_style),
                     button(self.t("复制导出", "Copy export"))
-                        .on_press_maybe((!self.exported.is_empty()).then_some(Message::CopyExport))
+                        .on_press_maybe(export_enabled.then_some(Message::SettingsAction(
+                            Action::Export(ExportTo::Clipboard),
+                        )))
+                        .style(action_style),
+                    button(self.t("导出到文件…", "Export to file…"))
+                        .on_press_maybe(
+                            export_enabled.then_some(Message::SettingsAction(Action::Export(
+                                ExportTo::File
+                            ),))
+                        )
                         .style(action_style),
                 ]
                 .spacing(8)
@@ -499,10 +532,123 @@ impl App {
         .padding(10)
         .into()
     }
+
+    pub(super) fn settings_extra_dialog(&self) -> Option<Element<'_, Message>> {
+        let d = design::get();
+        if let Some(targets) = &self.settings_actions.ipv6_editor {
+            let mut content = column![].spacing(d.space.sm);
+            for (index, value) in targets.iter().enumerate() {
+                content = content.push(
+                    row![
+                        text_input("http://…", value)
+                            .on_input(move |value| Message::SettingsAction(
+                                Action::Ipv6TargetChanged(index, value)
+                            ))
+                            .width(Length::Fill),
+                        button(self.t("移除", "Remove"))
+                            .on_press(Message::SettingsAction(Action::RemoveIpv6Target(index)))
+                            .style(design::flat_button),
+                    ]
+                    .spacing(d.space.sm)
+                    .align_y(alignment::Vertical::Center),
+                );
+            }
+            content = content.push(
+                row![
+                    button(self.t("添加地址", "Add address"))
+                        .on_press_maybe(
+                            (targets.len() < bitnet_core::MAX_IPV6_TARGETS)
+                                .then_some(Message::SettingsAction(Action::AddIpv6Target))
+                        )
+                        .style(design::flat_button),
+                    Space::new().width(Length::Fill),
+                    button(self.t("保存", "Save"))
+                        .on_press(Message::SettingsAction(Action::SaveIpv6Targets))
+                        .style(design::solid),
+                ]
+                .spacing(d.space.sm),
+            );
+            return Some(self.dialog(
+                self.t("公网 IPv6 检测地址", "Public IPv6 check URLs"),
+                content.into(),
+                Message::SettingsAction(Action::CloseIpv6Editor),
+                660,
+            ));
+        }
+        let install = self.settings_actions.update_install.as_ref()?;
+        let (detail, verified) = match &install.result {
+            None => (
+                self.t(
+                    "正在检查新版本和安装包签名…",
+                    "Checking the release and installer signature…",
+                )
+                .to_owned(),
+                false,
+            ),
+            Some(Ok(Some(update))) => (
+                format!(
+                    "{} {}",
+                    self.t("可下载安装的版本", "Verified update"),
+                    update.version
+                ),
+                true,
+            ),
+            Some(Ok(None)) => (
+                self.t(
+                    "当前没有新版可安装",
+                    "No newer update is available to install",
+                )
+                .to_owned(),
+                false,
+            ),
+            Some(Err(error)) => (
+                format!(
+                    "{} · {}",
+                    self.t("无法确认安装包", "Could not verify the installer"),
+                    error.message
+                ),
+                false,
+            ),
+        };
+        let content = column![
+            text(detail).size(d.typography.body),
+            container(
+                button(self.t("下载并安装", "Download and install"))
+                    .style(|theme, status| {
+                        let mut style = design::solid(theme, status);
+                        if status != button::Status::Disabled {
+                            style.background = Some(design::success(theme).into());
+                            style.text_color = iced::Color::BLACK;
+                        }
+                        style
+                    })
+                    .on_press_maybe(
+                        (verified && !self.busy && !self.connecting)
+                            .then_some(Message::SettingsAction(Action::InstallVerifiedUpdate))
+                    )
+            )
+            .width(Length::Fill)
+            .align_x(alignment::Horizontal::Right),
+        ]
+        .spacing(d.card.gap);
+        Some(self.dialog(
+            self.t("安装更新", "Install update"),
+            content.into(),
+            Message::SettingsAction(Action::CloseInstaller),
+            560,
+        ))
+    }
 }
 
 const SETTING_LABEL_WIDTH: f32 = 220.0;
-const SETTING_CONTROL_WIDTH: f32 = 320.0;
+const SETTING_CONTROL_WIDTH: f32 = 148.0;
+
+fn setting_control(control: Element<'_, Message>) -> Element<'_, Message> {
+    container(container(control).width(Length::Fill.max(SETTING_CONTROL_WIDTH)))
+        .width(Length::Fill)
+        .align_x(alignment::Horizontal::Right)
+        .into()
+}
 
 /// Two-column settings grid: every row shares the same label / control columns
 /// so inputs, pickers and buttons line up.
@@ -539,14 +685,13 @@ fn setting_number<'a>(
 ) -> Element<'a, Message> {
     setting_row(
         label.to_string(),
-        container(
+        setting_control(
             text_input("", value)
                 .on_input(move |value| Message::NumberChanged(field, value))
                 .align_x(alignment::Horizontal::Center)
                 .padding(5)
-                .width(Length::Fill),
-        )
-        .width(Length::Fill.max(SETTING_CONTROL_WIDTH))
-        .into(),
+                .width(Length::Fill)
+                .into(),
+        ),
     )
 }

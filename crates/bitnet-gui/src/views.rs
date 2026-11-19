@@ -17,6 +17,27 @@ pub(super) fn action_style(theme: &Theme, status: button::Status) -> button::Sty
     design::flat_button(theme, status)
 }
 
+fn success_button(theme: &Theme, status: button::Status) -> button::Style {
+    status_button(theme, status, design::success(theme))
+}
+
+fn selected_button(theme: &Theme, status: button::Status) -> button::Style {
+    status_button(theme, status, design::accent(theme))
+}
+
+fn status_button(theme: &Theme, status: button::Status, color: Color) -> button::Style {
+    let style = design::flat_button(theme, status);
+    button::Style {
+        background: Some(Color { a: 0.16, ..color }.into()),
+        text_color: color,
+        border: iced::Border {
+            color,
+            ..style.border
+        },
+        ..style
+    }
+}
+
 fn field_row<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
     let d = design::get();
     row![
@@ -117,8 +138,9 @@ fn ips_eye_button<'a>(open: bool) -> Element<'a, Message> {
             .height(Length::Fixed(15.0))
             .into(),
         Message::ToggleIps,
-        30.0,
+        32.0,
     )
+    .height(Length::Fixed(32.0))
     .style(design::flat_button)
     .into()
 }
@@ -317,6 +339,8 @@ pub(super) fn ip_chip<'a>(value: &str, revealed: bool) -> Element<'a, Message> {
     container(
         text(shown)
             .size(d.typography.meta)
+            .wrapping(text::Wrapping::None)
+            .ellipsis(text::Ellipsis::End)
             .font(Font::MONOSPACE)
             .style(design::text_style(design::code_text)),
     )
@@ -592,30 +616,10 @@ impl App {
 
     pub(super) fn shell(&self) -> Element<'_, Message> {
         let content = self.main_shell();
-        let content = if self.snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .capabilities
-                .iter()
-                .any(|item| item == "simulation")
-        }) {
-            column![
-                container(
-                    text(self.t(
-                        "模拟模式：不会连接校园网，账户与流量为测试数据",
-                        "Simulation: no campus connection; accounts and traffic are test data"
-                    ))
-                    .size(16)
-                )
-                .padding([14, 20])
-                .width(Length::Fill)
-                .style(container::danger),
-                content
-            ]
-            .height(Length::Fill)
-            .into()
-        } else {
-            content
-        };
+        let settings_dialog = self.settings_extra_dialog();
+        let detail_dialog = self
+            .health_detail
+            .map(|detail| self.health_detail_dialog(detail));
         let confirmation = self.confirmation.as_ref();
         let health_editor = self.health_editor.as_deref();
         let prompt = self.network_prompt.as_ref().filter(|_| {
@@ -623,6 +627,8 @@ impl App {
                 && !self.enabling_automatic
                 && health_editor.is_none()
                 && !self.account_editing
+                && settings_dialog.is_none()
+                && detail_dialog.is_none()
                 && self.quick_login.is_none()
         });
         let mut layers = stack([layer(
@@ -631,6 +637,8 @@ impl App {
                 || confirmation.is_some()
                 || health_editor.is_some()
                 || self.account_editing
+                || settings_dialog.is_some()
+                || detail_dialog.is_some()
                 || prompt.is_some(),
         )]);
         if let Some(entries) = health_editor {
@@ -659,8 +667,32 @@ impl App {
                 confirmation.is_some(),
             ));
         }
+        if let Some(dialog) = settings_dialog {
+            layers = layers.push(layer(dialog, confirmation.is_some()));
+        }
+        if let Some(dialog) = detail_dialog {
+            layers = layers.push(layer(dialog, confirmation.is_some()));
+        }
         if let Some(confirmation) = confirmation {
             layers = layers.push(self.confirmation_view(confirmation));
+        }
+        if let Some(banner) = self.notice_banner() {
+            let d = design::get();
+            layers = layers.push(
+                container(iced::widget::opaque(banner))
+                    .center_x(Length::Fill)
+                    .align_bottom(Length::Fill)
+                    .padding(iced::Padding {
+                        top: 0.0,
+                        right: d.content.pad,
+                        bottom: 46.0,
+                        left: if d.nav.mode == "topbar" {
+                            d.content.pad
+                        } else {
+                            d.nav.width + d.content.pad
+                        },
+                    }),
+            );
         }
         layers.into()
     }
@@ -683,10 +715,7 @@ impl App {
                 .style(design::bare_button),
         ]
         .align_y(alignment::Vertical::Center);
-        let mut dialog = column![heading].spacing(d.card.gap);
-        if let Some(banner) = self.notice_banner() {
-            dialog = dialog.push(banner);
-        }
+        let dialog = column![heading].spacing(d.card.gap);
         container(
             container(dialog.push(content))
                 .width(Length::Fill.max(max_width))
@@ -701,20 +730,50 @@ impl App {
     }
 
     fn notice_banner(&self) -> Option<Element<'_, Message>> {
-        let (is_error, message) = self.notice.as_ref()?;
-        let banner = row![
-            text(message).width(Length::Fill),
-            button(self.t("关闭", "Dismiss"))
-                .on_press(Message::DismissNotice)
-                .style(button::text)
-        ]
-        .spacing(12)
-        .align_y(alignment::Vertical::Center);
+        let activity = if self.connecting {
+            Some(self.t("正在连接本机引擎…", "Connecting to the local engine…"))
+        } else if self.busy {
+            Some(self.t("正在处理…", "Working…"))
+        } else if preview_only() {
+            Some(self.t("模拟模式 · 仅使用测试数据", "Simulation · test data only"))
+        } else {
+            None
+        };
+        let (is_error, message, action) = if let Some((error, message)) = &self.notice {
+            (
+                *error,
+                message.as_str(),
+                Some((self.t("关闭", "Dismiss"), Message::DismissNotice)),
+            )
+        } else if let Some(error) = &self.connection_error {
+            (
+                true,
+                error.message.as_str(),
+                Some((
+                    self.t("后台服务", "Background service"),
+                    Message::Navigate(Page::Service),
+                )),
+            )
+        } else {
+            let activity = activity?;
+            return Some(
+                container(text(activity).size(design::get().typography.meta))
+                    .padding([6, 12])
+                    .style(design::panel)
+                    .into(),
+            );
+        };
+        let mut banner = row![text(message).width(Length::Fill)]
+            .spacing(12)
+            .align_y(alignment::Vertical::Center);
+        if let Some((label, message)) = action {
+            banner = banner.push(button(label).on_press(message).style(button::text));
+        }
         Some(
             container(banner)
-                .padding(12)
-                .width(Length::Fill)
-                .style(if *is_error {
+                .padding([8, 12])
+                .width(Length::Fill.max(660.0))
+                .style(if is_error {
                     container::danger
                 } else {
                     container::success
@@ -739,34 +798,22 @@ impl App {
                 ))
     }
 
-    fn scope_label(&self) -> &'static str {
-        if self.connecting {
-            return self.t("正在连接后台", "Connecting to engine");
-        }
-        match self
-            .snapshot
-            .as_ref()
-            .filter(|_| self.snapshot_current)
-            .map(|s| s.scope)
-        {
-            Some(Scope::System) => self.t("已连接系统后台", "System service connected"),
-            Some(Scope::User) => self.t("已连接个人引擎", "User engine connected"),
-            None => self.t("未连接后台", "Engine disconnected"),
-        }
-    }
-
-    fn hide_button(&self) -> Element<'_, Message> {
-        button(self.t("隐藏界面", "Hide window"))
-            .on_press_maybe(
-                self.tray
-                    .as_ref()
-                    .filter(|tray| tray.is_available())
-                    .and(self.window)
-                    .map(Message::WindowCloseRequested),
-            )
-            .padding(2)
-            .style(design::nav_button(false))
-            .into()
+    fn hide_button(&self, width: Length) -> Element<'_, Message> {
+        button(button_label(
+            self.t("隐藏到托盘", "Hide to tray"),
+            design::get().typography.body,
+        ))
+        .on_press_maybe(
+            self.tray
+                .as_ref()
+                .filter(|tray| tray.is_available())
+                .and(self.window)
+                .map(Message::WindowCloseRequested),
+        )
+        .width(width)
+        .padding([6, 4])
+        .style(design::flat_button)
+        .into()
     }
 
     fn nav_items(&self, d: &design::Design, inline: bool) -> Vec<Element<'_, Message>> {
@@ -854,21 +901,19 @@ impl App {
             ]
             .width(Length::Fill);
         }
-        let mut footer = column![
-            text(self.scope_label())
+        let mut footer = column![].spacing(d.space.xs).width(Length::Fill);
+        if let Some(entry) = self.service_entry(Length::Fill) {
+            footer = footer.push(entry);
+        }
+        if self.tray.as_ref().is_some_and(tray::Tray::is_available) {
+            footer = footer.push(self.hide_button(Length::Fill));
+        }
+        footer = footer.push(
+            text(format!("v{APP_VERSION}"))
                 .size(d.typography.meta)
                 .width(Length::Fill)
                 .align_x(alignment::Horizontal::Center),
-            text(format!("v{APP_VERSION}"))
-                .size((d.typography.meta - 1.0).max(9.0))
-                .width(Length::Fill)
-                .align_x(alignment::Horizontal::Center),
-        ]
-        .spacing(d.space.xs)
-        .width(Length::Fill);
-        if self.tray.as_ref().is_some_and(tray::Tray::is_available) {
-            footer = footer.push(container(self.hide_button()).center_x(Length::Fill));
-        }
+        );
         let rail = rail.push(Space::new().height(Length::Fill)).push(footer);
         container(rail)
             .width(Length::Fixed(d.nav.width))
@@ -876,6 +921,46 @@ impl App {
             .padding([d.content.pad, d.space.sm])
             .style(design::chrome)
             .into()
+    }
+
+    fn service_entry(&self, width: Length) -> Option<Element<'_, Message>> {
+        let d = design::get();
+        let system_connected = self.snapshot_current
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.scope == Scope::System);
+        if system_connected {
+            Some(
+                button(button_label(
+                    self.t("后台运行中", "Service running"),
+                    d.typography.body,
+                ))
+                .width(width)
+                .padding([6, 4])
+                .style(success_button)
+                .into(),
+            )
+        } else if self
+            .observed_service()
+            .is_some_and(|service| service.running)
+        {
+            Some(
+                button(button_label(
+                    self.t("连接到后台", "Connect to service"),
+                    d.typography.body,
+                ))
+                .width(width)
+                .padding([6, 4])
+                .style(design::flat_button)
+                .on_press_maybe(
+                    (!self.busy && !self.connecting).then_some(Message::ModeChanged(Mode::System)),
+                )
+                .into(),
+            )
+        } else {
+            None
+        }
     }
 
     fn topbar(&self, d: &design::Design) -> Element<'_, Message> {
@@ -888,10 +973,13 @@ impl App {
         for item in self.nav_items(d, true) {
             bar = bar.push(item);
         }
-        bar = bar
-            .push(Space::new().width(Length::Fill))
-            .push(text(self.scope_label()).size(d.typography.meta))
-            .push(self.hide_button());
+        bar = bar.push(Space::new().width(Length::Fill));
+        if let Some(entry) = self.service_entry(Length::Fixed(140.0)) {
+            bar = bar.push(entry);
+        }
+        if self.tray.as_ref().is_some_and(tray::Tray::is_available) {
+            bar = bar.push(self.hide_button(Length::Fixed(100.0)));
+        }
         container(bar)
             .height(Length::Fixed(d.header.height))
             .width(Length::Fill)
@@ -910,7 +998,6 @@ impl App {
     }
 
     fn page_header(&self, d: &design::Design) -> Element<'_, Message> {
-        let english = self.english();
         let title = container(
             text(self.area_page().label(self.english()))
                 .size(d.header.title_size)
@@ -918,33 +1005,7 @@ impl App {
         )
         .height(Length::Fixed(30.0))
         .align_y(alignment::Vertical::Center);
-        let mut header = row![title]
-            .spacing(d.space.md)
-            .align_y(alignment::Vertical::Center)
-            .push(Space::new().width(Length::Fill));
-        if d.header.mode_picker {
-            let picker = pick_list(
-                Some(self.mode),
-                [Mode::User, Mode::System],
-                move |value: &Mode| value.label(english).to_string(),
-            )
-            .on_select(Message::ModeChanged)
-            .text_size(d.typography.body)
-            .padding([d.space.xs + 1.0, d.space.sm])
-            .width(Length::Fixed(d.header.picker_width));
-            header = header.push(picker);
-        }
-        if d.header.refresh {
-            header = header.push(
-                button(text(self.t("刷新", "Refresh")).size(d.typography.body))
-                    .on_press_maybe(
-                        (!self.busy && !self.connecting && !self.polling)
-                            .then_some(Message::Refresh),
-                    )
-                    .padding([d.space.xs + 1.0, d.space.md])
-                    .style(design::flat_button),
-            );
-        }
+        let header = row![title].align_y(alignment::Vertical::Center);
         let mut result = column![header].spacing(d.space.sm);
         if d.header.border {
             result = result.push(Self::rule(false));
@@ -954,59 +1015,17 @@ impl App {
 
     fn workspace_body(&self, d: &design::Design) -> Element<'_, Message> {
         let mut content = column![self.page_header(d)].spacing(d.content.gap);
-        if let Some(error) = &self.connection_error {
-            content = content.push(
-                container(
-                    row![
-                        container(text(&error.message).size(d.typography.body))
-                            .width(Length::Fill)
-                            .height(Length::Fixed(34.0))
-                            .clip(true),
-                        button(self.t("后台服务", "Background service"))
-                            .on_press(Message::Navigate(Page::Service))
-                            .style(button::text),
-                    ]
-                    .spacing(d.space.sm)
-                    .align_y(alignment::Vertical::Center),
-                )
-                .padding(d.space.md)
-                .width(Length::Fill)
-                .style(container::danger),
-            );
-        }
-        if self.connection_error.is_none()
-            && self.health_editor.is_none()
-            && self.quick_login.is_none()
-        {
-            if let Some(banner) = self.notice_banner() {
-                content = content.push(banner);
-            }
-        }
-        if self.connection_error.is_none()
-            && self.snapshot.is_some()
-            && !self.snapshot_current
-            && !self.connecting
-        {
-            content = content.push(
-                text(self.t("显示断开前的数据", "Showing data from before disconnect"))
-                    .size(d.typography.meta),
-            );
-        }
-        if self.busy || self.connecting {
-            content = content.push(
-                text(if self.connecting {
-                    self.t("正在连接本机引擎…", "Connecting to the local engine…")
-                } else {
-                    self.t("正在处理，请稍候…", "Working, please wait…")
-                })
-                .size(d.typography.meta),
-            );
-        }
         content = content.push(match self.page {
             Page::Status | Page::Health | Page::Statistics | Page::Diagnostics => {
                 responsive(|size| self.connection_workspace(size)).into()
             }
-            Page::Accounts => responsive(|size| self.accounts_view(size)).into(),
+            Page::Accounts => responsive(|size| {
+                self.single_tab(
+                    self.t("账户列表", "Saved accounts"),
+                    self.accounts_view(Size::new(size.width, (size.height - 38.0).max(0.0))),
+                )
+            })
+            .into(),
             Page::Networks => responsive(|size| self.networks_workspace(size)).into(),
             Page::Settings => responsive(|size| self.settings_workspace(size)).into(),
             Page::Service => self.service_view(),
@@ -1104,20 +1123,20 @@ impl App {
             .map(|binding| binding.source_ip.to_string())
             .unwrap_or_else(|| "—".into());
 
+        let account = if let Some(username) = &snapshot.session.username {
+            button(text(username).size(d.typography.body))
+                .padding(0)
+                .style(design::nav_button(true))
+                .on_press(Message::Navigate(Page::Accounts))
+                .into()
+        } else {
+            text("—").size(d.typography.body).into()
+        };
         let left = column![
             labelled_row(
                 self.t("当前校园账号", "Campus account"),
-                text(
-                    snapshot
-                        .session
-                        .username
-                        .clone()
-                        .unwrap_or_else(|| "—".into())
-                )
-                .size(d.typography.body)
-                .width(Length::Fill)
-                .into(),
-                label_width,
+                account,
+                label_width
             ),
             labelled_row(
                 self.t("认证 IP", "Authenticated IP"),
@@ -1127,7 +1146,7 @@ impl App {
             labelled_row(
                 self.t("本机 IP", "Local IP"),
                 ip_chip(&local_ip, revealed),
-                label_width,
+                label_width
             ),
         ]
         .spacing(d.card.gap)
@@ -1135,89 +1154,89 @@ impl App {
 
         let ipv6 = snapshot.health.ipv6_status;
         let adapter = ipv6_adapter(snapshot);
-        let ipv6_address = adapter
-            .filter(|_| matches!(ipv6, Ipv6Status::GlobalNotPreferred | Ipv6Status::Normal))
-            .and_then(|adapter| {
-                adapter
-                    .ipv6
-                    .iter()
-                    .copied()
-                    .find(|ip| bitnet_core::is_public_ipv6(*ip))
-            })
-            .map(|ip| ip.to_string());
+        let ipv6_address = snapshot
+            .health
+            .local_ipv6
+            .or(snapshot.health.public_ipv6)
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "—".into());
 
         let right = column![
             labelled_row(
                 self.t("互联网", "Internet"),
-                badge_cell(
-                    health_badge_label(&snapshot.health.internet, english),
-                    health_badge_role(&snapshot.health.internet),
-                    badge_width,
+                self.health_badge(
+                    &snapshot.health.internet,
+                    HealthDetail::Internet,
+                    badge_width
                 ),
-                health_label_width,
+                health_label_width
             ),
             labelled_row(
                 "DNS",
-                badge_cell(
-                    health_badge_label(&snapshot.health.dns, english),
-                    health_badge_role(&snapshot.health.dns),
-                    badge_width,
-                ),
-                health_label_width,
+                self.health_badge(&snapshot.health.dns, HealthDetail::Dns, badge_width),
+                health_label_width
             ),
         ]
         .spacing(d.card.gap)
         .width(Length::Fill);
-
+        let compact_title = if english || size.height < 390.0 {
+            d.typography.section_title
+        } else {
+            d.typography.page_title
+        };
         let mut summary = column![
             row![
                 text(self.state_label(&snapshot.state))
                     .font(design::family_medium())
-                    .size(if size.height < 390.0 {
-                        d.typography.page_title
-                    } else {
-                        d.typography.page_title * 1.35
-                    }),
+                    .size(compact_title)
+                    .width(Length::Fixed(label_width)),
                 badge(auth, auth_role(&snapshot.session.auth)),
-                Space::new().width(Length::Fill),
                 ips_eye_button(revealed),
             ]
-            .spacing(d.space.md)
+            .spacing(d.space.sm)
             .align_y(alignment::Vertical::Center),
             row![left, right].spacing(d.space.xl),
         ]
         .spacing(d.card.gap);
-        let ipv6_caption = if ipv6 == Ipv6Status::Unknown && snapshot.health.checked_at.is_some() {
-            self.t("未能确认", "Inconclusive")
+        let ipv6_caption =
+            if ipv6 == Ipv6Status::Unknown && snapshot.health.ipv6_checked_at.is_some() {
+                self.t("未能确认", "Inconclusive")
+            } else {
+                ipv6_label(ipv6, english)
+            };
+        let protocol =
+            ipv6_maintenance_target(snapshot).zip(adapter.and_then(|adapter| adapter.ipv6_enabled));
+        let protocol_width = if english { 108.0 } else { 90.0 };
+        let controls_width = if protocol.is_some() {
+            2.0 * protocol_width + 2.0 * d.space.sm
         } else {
-            ipv6_label(ipv6, english)
+            0.0
         };
-        let status_badge = badge_cell(ipv6_caption, ipv6_role(ipv6), badge_width);
-        let status_badge = if let Some(detail) = &snapshot.health.ipv6_detail {
-            iced::widget::tooltip(
-                status_badge,
-                container(text(detail).size(d.typography.meta)).padding(d.space.sm),
-                iced::widget::tooltip::Position::Top,
-            )
-            .style(design::panel)
-            .into()
-        } else {
-            status_badge
-        };
-        let ipv6_status = row![
+        let ip_width = (size.width
+            - 2.0 * d.card.pad
+            - label_width
+            - badge_width
+            - 4.0 * d.space.sm
+            - controls_width)
+            .clamp(60.0, 300.0);
+        let mut ipv6_row = row![
             text("IPv6")
                 .size(d.typography.meta)
                 .style(design::text_style(design::muted))
-                .width(Length::Fixed(health_label_width)),
-            status_badge,
-            container(ip_chip(ipv6_address.as_deref().unwrap_or("—"), revealed))
-                .width(Length::Fixed(280.0)),
+                .width(Length::Fixed(label_width)),
+            container(ip_chip(&ipv6_address, revealed))
+                .width(Length::Shrink.max(ip_width))
+                .clip(true),
+            self.detail_badge(
+                ipv6_caption,
+                ipv6_role(ipv6),
+                HealthDetail::Ipv6,
+                badge_width
+            ),
+            Space::new().width(Length::Fill),
         ]
         .spacing(d.space.sm)
         .align_y(alignment::Vertical::Center);
-        let mut ipv6_row = row![ipv6_status, Space::new().width(Length::Fill)]
-            .spacing(d.space.sm)
-            .align_y(alignment::Vertical::Center);
 
         if system_auth {
             summary = summary.push(
@@ -1324,7 +1343,7 @@ impl App {
             .filter(|_| !preview_only())
             .zip(adapter.and_then(|adapter| adapter.ipv6_enabled))
         {
-            let protocol_width = 124.0;
+            let protocol_width = if english { 108.0 } else { 90.0 };
             let (caption, toggle) = if enabled {
                 (
                     self.t("关闭 IPv6", "Disable IPv6"),
@@ -1363,11 +1382,259 @@ impl App {
         card(
             summary
                 .push(Self::rule(false))
-                .push(ipv6_row.wrap())
+                .push(ipv6_row)
                 .push(Self::rule(false))
                 .push(actions.wrap()),
         )
         .into()
+    }
+
+    fn detail_badge<'a>(
+        &'a self,
+        label: &'a str,
+        role: fn(&Theme) -> Color,
+        detail: HealthDetail,
+        width: f32,
+    ) -> Element<'a, Message> {
+        button(badge_cell(label, role, width))
+            .padding(0)
+            .on_press(Message::HealthDetail(Some(detail)))
+            .style(design::flat_button)
+            .into()
+    }
+
+    fn health_badge<'a>(
+        &'a self,
+        health: &Health,
+        detail: HealthDetail,
+        width: f32,
+    ) -> Element<'a, Message> {
+        self.detail_badge(
+            health_badge_label(health, self.english()),
+            health_badge_role(health),
+            detail,
+            width,
+        )
+    }
+
+    fn probe_outcome(&self, outcome: bitnet_core::ProbeOutcome) -> &'static str {
+        use bitnet_core::ProbeOutcome::*;
+        match outcome {
+            Match => self.t("符合预期", "Expected response"),
+            UnexpectedStatus => self.t("响应状态与预期不同", "Unexpected status"),
+            UnexpectedBody => self.t("响应内容与预期不同", "Unexpected response body"),
+            InvalidTarget => self.t("地址无效", "Invalid address"),
+            Timeout => self.t("超时", "Timed out"),
+            RequestFailed => self.t("连接失败", "Connection failed"),
+            BodyLimit => self.t("响应内容过大", "Response too large"),
+        }
+    }
+
+    fn health_detail_dialog(&self, detail: HealthDetail) -> Element<'_, Message> {
+        use bitnet_core::{DnsMode, DnsProbeResult, Ipv6ProbeKind};
+        let title = match detail {
+            HealthDetail::Internet => self.t("互联网检测详情", "Internet check"),
+            HealthDetail::Dns => self.t("DNS 检测详情", "DNS check"),
+            HealthDetail::Ipv6 => self.t("IPv6 检测详情", "IPv6 check"),
+        };
+        let d = design::get();
+        let mut evidence = column![].spacing(d.space.sm);
+        if let Some(snapshot) = &self.snapshot {
+            let health = &snapshot.health;
+            let checked_at = match detail {
+                HealthDetail::Ipv6 => health.ipv6_checked_at,
+                _ => health.checked_at,
+            };
+            let checked_at = checked_at
+                .and_then(|seconds| i64::try_from(seconds).ok())
+                .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+                .map_or_else(
+                    || self.t("尚未检测", "Not checked yet").into(),
+                    |instant| {
+                        format!(
+                            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                            instant.year(),
+                            instant.month() as u8,
+                            instant.day(),
+                            instant.hour(),
+                            instant.minute(),
+                            instant.second()
+                        )
+                    },
+                );
+            evidence = evidence.push(pair(self.t("最近检测时间", "Last checked"), checked_at));
+            match detail {
+                HealthDetail::Internet => {
+                    let targets = snapshot.settings.configured_health_targets();
+                    if health.health_probes.is_empty() {
+                        evidence = evidence.push(
+                            text(
+                                health
+                                    .internet_detail
+                                    .as_deref()
+                                    .unwrap_or(self.t("暂无站点检测记录", "No site results yet")),
+                            )
+                            .size(d.typography.meta),
+                        );
+                    }
+                    for probe in &health.health_probes {
+                        let name = targets
+                            .get(probe.target.saturating_sub(1))
+                            .map(|t| t.url.as_str())
+                            .unwrap_or("—");
+                        let status = probe
+                            .status
+                            .map_or_else(|| "—".into(), |code| format!("HTTP {code}"));
+                        evidence = evidence.push(card(column![
+                            text(name.to_owned()).size(d.typography.body),
+                            text(format!(
+                                "{} · {} · {} ms",
+                                self.probe_outcome(probe.outcome),
+                                status,
+                                probe.elapsed_ms
+                            ))
+                            .size(d.typography.meta)
+                            .style(design::text_style(design::muted)),
+                        ]));
+                    }
+                }
+                HealthDetail::Dns => {
+                    let adapter = ipv6_adapter(snapshot);
+                    let config = adapter.and_then(|adapter| adapter.dns_config.as_ref());
+                    let mode = |mode| match mode {
+                        Some(DnsMode::Automatic) => self.t("自动", "Automatic"),
+                        Some(DnsMode::Manual) => self.t("手动", "Manual"),
+                        None => self.t("未能读取", "Unavailable"),
+                    };
+                    let servers = config
+                        .map(|config| {
+                            config
+                                .servers
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|| {
+                            adapter
+                                .map(|item| item.dns.iter().map(ToString::to_string).collect())
+                                .unwrap_or_default()
+                        });
+                    evidence = evidence
+                        .push(pair(
+                            self.t("网卡", "Adapter"),
+                            adapter.map_or("—", |item| item.name.as_str()),
+                        ))
+                        .push(pair(
+                            self.t("IPv4 DNS 设置", "IPv4 DNS mode"),
+                            mode(config.and_then(|c| c.ipv4_mode)),
+                        ))
+                        .push(pair(
+                            self.t("IPv6 DNS 设置", "IPv6 DNS mode"),
+                            mode(config.and_then(|c| c.ipv6_mode)),
+                        ))
+                        .push(pair(
+                            self.t("当前 DNS 服务器", "Current DNS servers"),
+                            if servers.is_empty() {
+                                "—".into()
+                            } else {
+                                servers.join("\n")
+                            },
+                        ));
+                    if let Some(probe) = &health.dns_probe {
+                        let outcome = match probe.result {
+                            DnsProbeResult::Ok => self.t("解析成功", "Resolved"),
+                            DnsProbeResult::Timeout => self.t("查询超时", "Timed out"),
+                            DnsProbeResult::Empty => self.t("未返回地址", "No addresses returned"),
+                            DnsProbeResult::LookupFailed => self.t("查询失败", "Lookup failed"),
+                        };
+                        evidence = evidence.push(pair(
+                            self.t("查询结果", "Lookup result"),
+                            format!("{} · {outcome} · {} ms", probe.host, probe.elapsed_ms),
+                        ));
+                        if !probe.resolved_addresses.is_empty() {
+                            let answers: Vec<_> = probe
+                                .resolved_addresses
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect();
+                            evidence = evidence.push(pair(
+                                self.t("返回地址", "Returned addresses"),
+                                answers.join("\n"),
+                            ));
+                        }
+                    }
+                }
+                HealthDetail::Ipv6 => {
+                    let show_ip = |ip: Option<std::net::Ipv6Addr>| match ip {
+                        Some(ip) if self.ips_revealed => ip.to_string(),
+                        Some(_) => self.t("已隐藏", "Hidden").into(),
+                        None => "—".into(),
+                    };
+                    evidence = evidence
+                        .push(pair(
+                            self.t("本机 IPv6", "Local IPv6"),
+                            show_ip(health.local_ipv6),
+                        ))
+                        .push(pair(
+                            self.t("站点回显 IPv6", "Reported IPv6"),
+                            show_ip(health.public_ipv6),
+                        ));
+                    if let Some(reason) = &health.ipv6_detail {
+                        evidence = evidence.push(text(reason).size(d.typography.meta));
+                    }
+                    for probe in &health.ipv6_probes {
+                        let check = match probe.kind {
+                            Ipv6ProbeKind::Address => self.t("地址回显", "Address check"),
+                            Ipv6ProbeKind::TestIpv6 => self.t("IPv6 连接", "IPv6 connectivity"),
+                            Ipv6ProbeKind::DualStack => {
+                                self.t("双栈连接", "Dual-stack connectivity")
+                            }
+                            Ipv6ProbeKind::LargePacket => self.t("大包测试", "Large packet check"),
+                        };
+                        let provider = snapshot
+                            .settings
+                            .ipv6_targets
+                            .get(probe.target.saturating_sub(1))
+                            .map_or("—", String::as_str);
+                        let target = match probe.kind {
+                            Ipv6ProbeKind::DualStack => "ds.test-ipv6.com".to_owned(),
+                            Ipv6ProbeKind::LargePacket => format!("{provider} · 1600 B"),
+                            _ => provider.to_owned(),
+                        };
+                        let transport = match probe.local_is_v6 {
+                            Some(true) => " · IPv6",
+                            Some(false) => " · IPv4",
+                            None => "",
+                        };
+                        let outcome = probe
+                            .outcome
+                            .map_or(self.t("无结果", "No result"), |result| {
+                                self.probe_outcome(result)
+                            });
+                        let status = probe
+                            .status
+                            .map_or_else(|| "—".into(), |code| format!("HTTP {code}"));
+                        evidence = evidence.push(card(column![
+                            text(format!("{check} · {target}")).size(d.typography.body),
+                            text(format!(
+                                "{outcome} · {status} · {} ms{transport}",
+                                probe.elapsed_ms
+                            ))
+                            .size(d.typography.meta)
+                            .style(design::text_style(design::muted)),
+                        ]));
+                    }
+                }
+            }
+        }
+        self.dialog(
+            title,
+            iced::widget::scrollable(evidence)
+                .height(Length::Shrink.max(330.0))
+                .into(),
+            Message::HealthDetail(None),
+            730,
+        )
     }
 
     fn connection_details(&self) -> Element<'_, Message> {
@@ -1399,11 +1666,6 @@ impl App {
                     .map(|value| format!("¥ {value:.2}"))
                     .unwrap_or_else(|| "—".into())
             ),
-            text(self.t(
-                "网关统计周期由校方定义。",
-                "The campus gateway defines the accounting period."
-            ))
-            .size(12),
             pair(
                 self.t("最近成功认证", "Last successful login"),
                 self.relative_time(snapshot.last_success_at)
@@ -1823,152 +2085,194 @@ impl App {
         )
     }
 
+    fn single_tab<'a>(
+        &'a self,
+        label: &'a str,
+        body: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let d = design::get();
+        column![
+            button(text(label).size(d.typography.body))
+                .on_press(Message::Navigate(self.page))
+                .padding([d.space.xs, d.space.sm])
+                .style(design::nav_button(true)),
+            body,
+        ]
+        .spacing(d.content.gap)
+        .into()
+    }
+
     fn service_view(&self) -> Element<'_, Message> {
         let d = design::get();
-        let mut content = column![text(self.t(
-            "系统后台可在登录系统前连接校园网。",
-            "The system service can connect before you sign in to the computer."
-        ))
-        .size(14)]
-        .spacing(10);
-        if let Some(snapshot) = &self.snapshot {
-            let service = &snapshot.service;
-            content = content.push(card(
-                column![
-                    pair(
-                        self.t("服务安装", "Installed"),
-                        self.service_value(service.installed)
-                    ),
-                    pair(
-                        self.t("服务运行", "Running"),
-                        self.service_value(service.running)
-                    ),
-                    pair(
-                        self.t("开机启动", "Boot startup"),
-                        self.service_value(service.enabled)
-                    ),
-                    pair(
-                        self.t("当前连接范围", "Connected scope"),
-                        if snapshot.scope == Scope::System {
-                            self.t("共享系统服务", "Shared system service")
-                        } else {
-                            self.t("当前用户", "Current user")
-                        }
-                    ),
-                    container(text(service.detail.as_deref().unwrap_or("")).size(12))
-                        .height(34)
-                        .width(Length::Fill)
-                        .clip(true),
-                    row![
-                        button(text(self.t("重新连接后台", "Reconnect")).size(d.typography.body))
-                            .on_press_maybe(
-                                (!self.busy && !self.connecting).then_some(Message::Refresh)
-                            )
-                            .padding([d.space.xs, d.space.md])
-                            .style(design::flat_button),
-                        button(
-                            text(self.t("立即检查连接", "Check connection"))
-                                .size(d.typography.body)
-                        )
-                        .on_press_maybe((!self.busy).then_some(Message::Run(Command::Check)))
-                        .padding([d.space.xs, d.space.md])
-                        .style(design::flat_button)
-                    ]
-                    .spacing(10),
-                ]
-                .spacing(8),
-            ));
-            let mut actions = row![].spacing(10);
-            if service.installed {
-                actions = actions
-                    .push(
-                        button(text(self.t("启动后台", "Start service")).size(d.typography.body))
-                            .padding([d.space.xs, d.space.md])
-                            .style(design::solid)
-                            .on_press_maybe(self.can_start_service().then_some(Message::Ask(
-                                Confirmation::Maintenance(MaintenanceAction::ServiceStart),
-                            ))),
-                    )
-                    .push(
-                        button(text(self.t("停止后台", "Stop service")).size(d.typography.body))
-                            .on_press_maybe((!self.busy && service.running).then_some(
-                                Message::Ask(Confirmation::Maintenance(
-                                    MaintenanceAction::ServiceStop,
-                                )),
-                            ))
-                            .padding([d.space.xs, d.space.md])
-                            .style(design::flat_button),
-                    )
-                    .push(
-                        button(
-                            text(self.t("卸载后台，保留数据", "Remove service, keep data"))
-                                .size(d.typography.body),
-                        )
-                        .on_press_maybe((!self.busy).then_some(Message::Ask(
-                            Confirmation::Maintenance(MaintenanceAction::ServiceRemove {
-                                purge: false,
-                            }),
-                        )))
-                        .padding([d.space.xs, d.space.md])
-                        .style(design::danger_text),
-                    );
-            } else {
-                actions = actions.push(
-                    button(self.t("启用开机后台", "Enable system service")).on_press_maybe(
-                        (!self.busy).then_some(Message::Ask(Confirmation::Maintenance(
-                            MaintenanceAction::ServiceInstall,
-                        ))),
-                    ),
-                );
-            }
-            actions = actions.push(
-                button(text(self.t("修复安装", "Repair installation")).size(d.typography.body))
-                    .on_press_maybe((!self.busy).then_some(Message::Ask(
-                        Confirmation::Maintenance(MaintenanceAction::Repair),
-                    )))
-                    .padding([d.space.xs, d.space.md])
-                    .style(design::flat_button),
-            );
-            if snapshot.scope == Scope::User {
-                actions = actions.push(
-                    button(
-                        text(self.t("停止个人引擎", "Stop user engine")).size(d.typography.body),
-                    )
-                    .on_press_maybe((!self.busy).then_some(Message::Ask(Confirmation::Shutdown)))
-                    .padding([d.space.xs, d.space.md])
-                    .style(design::flat_button),
-                );
-            }
-            content = content.push(actions.wrap());
-            if service.installed {
-                content = content.push(
-                    text(self.t(
-                        "停止后台会关闭开机启动，直到再次启动服务。",
-                        "Stopping the service disables automatic startup until you start it again.",
-                    ))
-                    .size(12),
-                );
-            }
-        } else {
-            content = content
-                .push(
-                    button(self.t("安装或修复系统后台", "Install or repair service"))
-                        .on_press_maybe((!self.busy && !self.connecting).then_some(Message::Ask(
-                            Confirmation::Maintenance(MaintenanceAction::ServiceInstall),
-                        ))),
+        let service = self.observed_service();
+        let installed = service.is_some_and(|service| service.installed);
+        let running = service.is_some_and(|service| service.running);
+        let startup = service.is_some_and(|service| service.enabled);
+        let ready = !self.busy && !self.connecting && !preview_only();
+        let known = service.is_some_and(|service| service.detail.is_none());
+        let connected = self.snapshot.as_ref().filter(|_| self.snapshot_current);
+        let attached_system = connected.is_some_and(|snapshot| snapshot.scope == Scope::System);
+        let scope = match connected.map(|snapshot| snapshot.scope) {
+            Some(Scope::System) => self.t("共享系统服务", "System service"),
+            Some(Scope::User) => self.t("个人引擎", "Personal engine"),
+            None => self.t("未连接", "Disconnected"),
+        };
+        let control = |label: &'static str, enabled: bool, action: MaintenanceAction| {
+            button(text(label).size(d.typography.body))
+                .padding([6, 12])
+                .on_press_maybe(enabled.then_some(Message::Ask(Confirmation::Maintenance(action))))
+        };
+        let install = if installed {
+            row![
+                control(
+                    self.t("卸载后台，保留数据", "Uninstall, keep data"),
+                    ready,
+                    MaintenanceAction::ServiceRemove { purge: false }
                 )
-                .push(
-                    button(self.t(
-                        "启动已安装的系统后台…",
-                        "Start an installed system service…",
-                    ))
-                    .on_press_maybe((!self.busy && !self.connecting).then_some(Message::Ask(
-                        Confirmation::Maintenance(MaintenanceAction::ServiceStart),
-                    )))
-                    .style(button::secondary),
-                );
+                .style(design::danger_outline),
+                control(
+                    self.t("修复安装", "Repair installation"),
+                    ready,
+                    MaintenanceAction::Repair
+                )
+                .style(design::flat_button),
+            ]
+        } else {
+            row![control(
+                self.t("安装后台", "Install service"),
+                ready && known,
+                MaintenanceAction::ServiceInstall
+            )
+            .style(design::flat_button)]
+        };
+        let status_button = button(text(if running {
+            self.t("正在运行", "Running")
+        } else {
+            self.t("启动后台", "Start service")
+        }))
+        .padding([6, 12])
+        .style(if running {
+            success_button
+        } else {
+            design::flat_button
+        })
+        .on_press_maybe(
+            (ready && known && self.can_start_service()).then_some(Message::Ask(
+                Confirmation::Maintenance(MaintenanceAction::ServiceStart),
+            )),
+        );
+        let scope_actions = row![
+            text(scope),
+            button(self.t("重新连接后台", "Reconnect service"))
+                .on_press_maybe((ready && running).then_some(if attached_system {
+                    Message::Refresh
+                } else {
+                    Message::ModeChanged(Mode::System)
+                }))
+                .padding([6, 12])
+                .style(design::flat_button),
+            button(self.t("立即检查连接", "Check connection"))
+                .on_press_maybe(
+                    (!self.busy && connected.is_some()).then_some(Message::Run(Command::Check))
+                )
+                .padding([6, 12])
+                .style(design::flat_button),
+        ]
+        .spacing(d.space.sm)
+        .align_y(alignment::Vertical::Center);
+        let scope_actions = if attached_system || self.mode == Mode::System {
+            scope_actions.push(
+                button(self.t("切换回个人模式", "Switch to personal mode"))
+                    .on_press_maybe((ready && !self.draft.dirty).then_some(Message::SwitchPersonal))
+                    .padding([6, 12])
+                    .style(design::flat_button),
+            )
+        } else if connected.is_some_and(|snapshot| snapshot.scope == Scope::User) {
+            scope_actions.push(
+                button(self.t("停止个人引擎", "Stop personal engine"))
+                    .on_press_maybe(ready.then_some(Message::Ask(Confirmation::Shutdown)))
+                    .padding([6, 12])
+                    .style(design::danger_outline),
+            )
+        } else {
+            scope_actions
+        };
+        let mut rows = column![
+            labelled_row(
+                self.t("服务安装", "Installation"),
+                install.spacing(d.space.sm).into(),
+                136.0
+            ),
+            labelled_row(
+                self.t("服务运行", "Service status"),
+                row![
+                    status_button,
+                    control(
+                        self.t("停止后台", "Stop service"),
+                        ready && known && running,
+                        MaintenanceAction::ServiceStop
+                    )
+                    .style(design::danger_outline)
+                ]
+                .spacing(d.space.sm)
+                .into(),
+                136.0
+            ),
+            labelled_row(
+                self.t("开机启动", "Start at boot"),
+                row![
+                    control(
+                        self.t("启用", "Enable"),
+                        ready && installed && known && !startup,
+                        MaintenanceAction::SetAutostart { enabled: true }
+                    )
+                    .style(if installed && known && startup {
+                        success_button
+                    } else {
+                        design::flat_button
+                    }),
+                    control(
+                        self.t("关闭", "Disable"),
+                        ready && installed && known && startup,
+                        MaintenanceAction::SetAutostart { enabled: false }
+                    )
+                    .style(if installed && known && !startup {
+                        selected_button
+                    } else {
+                        design::flat_button
+                    }),
+                ]
+                .spacing(d.space.sm)
+                .into(),
+                136.0
+            ),
+            labelled_row(
+                self.t("当前连接范围", "Connected scope"),
+                scope_actions.wrap().into(),
+                136.0
+            ),
+        ]
+        .spacing(d.card.gap);
+        if let Some(detail) = service.and_then(|service| service.detail.as_deref()) {
+            rows = rows.push(text(detail).size(d.typography.meta));
         }
-        content.into()
+        self.single_tab(
+            self.t("服务管理", "Service management"),
+            column![
+                card(rows),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(self.t("刷新", "Refresh"))
+                        .padding([6, 12])
+                        .style(design::flat_button)
+                        .on_press_maybe(
+                            (!self.busy && !self.connecting).then_some(Message::Refresh)
+                        )
+                ],
+            ]
+            .spacing(d.content.gap)
+            .into(),
+        )
     }
 
     fn statistics_view(&self) -> Element<'_, Message> {
@@ -2022,13 +2326,7 @@ impl App {
         }
 
         let footer = row![
-            text(self.t(
-                "刷新会重新读取本机统计数据",
-                "Refreshing re-reads local statistics"
-            ))
-            .size(d.typography.meta)
-            .style(design::text_style(design::muted))
-            .width(Length::Fill),
+            Space::new().width(Length::Fill),
             button(text(self.t("刷新统计", "Refresh statistics")).size(d.typography.body))
                 .on_press_maybe(
                     (!self.busy && self.snapshot_current)
@@ -2046,48 +2344,51 @@ impl App {
 
     fn diagnostics_view(&self) -> Element<'_, Message> {
         let d = design::get();
+        let ready = self.diagnostics.is_some();
         let actions = row![
             button(text(self.t("诊断网络", "Diagnose network")).size(d.typography.body))
                 .on_press_maybe(
-                    (!self.busy && self.snapshot_current)
-                        .then_some(Message::Run(Command::Diagnose))
+                    (!self.busy && self.snapshot_current && !self.diagnostics_running)
+                        .then_some(Message::RunDiagnostics)
                 )
                 .padding([d.space.xs + 2.0, d.space.md])
                 .style(design::solid),
+            button(
+                text(self.t("在浏览器打开报告", "Open report in browser")).size(d.typography.body)
+            )
+            .on_press_maybe(ready.then_some(Message::OpenDiagnostics))
+            .padding([d.space.xs + 2.0, d.space.md])
+            .style(design::flat_button),
             button(text(self.t("复制报告", "Copy report")).size(d.typography.body))
-                .on_press_maybe((!self.diagnostics.is_empty()).then_some(Message::CopyDiagnostics))
+                .on_press_maybe(ready.then_some(Message::CopyDiagnostics))
                 .padding([d.space.xs + 2.0, d.space.md])
                 .style(design::flat_button),
-            Space::new().width(Length::Fill),
-            text(if self.diagnostics.is_empty() {
-                self.t("尚未生成报告", "No report yet")
-            } else {
-                self.t("报告已生成", "Report ready")
-            })
-            .size(d.typography.meta)
-            .style(design::text_style(design::muted)),
         ]
         .spacing(d.space.sm)
-        .align_y(alignment::Vertical::Center);
+        .align_y(alignment::Vertical::Center)
+        .wrap();
 
-        let report: Element<'_, Message> = if self.diagnostics.is_empty() {
-            text(self.t(
-                "点击「诊断网络」生成本机脱敏报告。不会注销、改 DNS 或修改路由。",
-                "Run the diagnosis to collect a redacted local report. It never signs out, changes DNS, or edits routes.",
-            ))
+        let report: Element<'_, Message> = match &self.diagnostics {
+            None => text(if self.diagnostics_running {
+                self.t("正在收集网络信息…", "Collecting network information…")
+            } else {
+                self.t(
+                    "诊断当前网络，然后在浏览器查看检测过程和网络出口。",
+                    "Run diagnostics to inspect network checks and egress in the browser.",
+                )
+            })
             .size(d.typography.meta)
             .style(design::text_style(design::muted))
-            .into()
-        } else {
-            container(
-                text(self.diagnostics.clone())
-                    .size(d.typography.meta)
-                    .font(Font::MONOSPACE),
-            )
-            .width(Length::Fill)
-            .padding(d.space.sm)
-            .style(design::tint(design::muted, 0.06))
-            .into()
+            .into(),
+            Some(report) => {
+                let mut content = column![text(self.t("主要结果", "Key findings"))
+                    .font(design::family_medium())
+                    .size(d.typography.section_title)];
+                for finding in report.findings.iter().take(4) {
+                    content = content.push(text(finding).size(d.typography.body));
+                }
+                content.spacing(d.space.sm).into()
+            }
         };
 
         card(column![actions, Self::rule(false), report].spacing(d.card.gap)).into()
@@ -2132,7 +2433,7 @@ impl App {
             ),
         };
         row![
-            text(name).size(d.typography.body),
+            text(name.to_owned()).size(d.typography.body),
             ip_chip(&binding.source_ip.to_string(), true),
             badge(assignment, color),
             badge(
@@ -2196,13 +2497,17 @@ impl App {
             Confirmation::DeleteRule(_) => (self.t("删除网络规则？", "Delete this network rule?"), self.t("更改将立即保存，之后的自动认证使用剩余规则。", "This change is saved immediately. Future authentication uses the remaining rules.")),
             Confirmation::Shutdown => (self.t("停止个人认证引擎？", "Stop the user engine?"), self.t("自动认证和状态检测将停止。当前校园网会话不会自动注销。", "Automatic authentication and monitoring will stop. The campus session is not disconnected automatically.")),
             Confirmation::ClearLogs { .. } => (self.t("清除诊断日志？", "Clear diagnostic logs?"), self.t("清除已写入本机的诊断日志。连接历史和运行统计仍可查看。", "Clear the diagnostic log files on this computer. Connection history and statistics stay available.")),
+            Confirmation::PersonalMode => (
+                self.t("切换回个人模式？", "Switch to personal mode?"),
+                self.t("系统后台将停止，个人认证引擎随后启动。需要管理员批准。", "The system service will stop, then the personal engine will start. Administrator approval is required."),
+            ),
             Confirmation::Maintenance(action) => match action {
                 MaintenanceAction::ServiceInstall => (self.t("启用系统后台？", "Enable the system service?"), self.t("安装器将请求管理员权限，并启用开机无人值守运行。", "The installer requests administrator approval and enables unattended startup.")),
                 MaintenanceAction::ServiceStart => (self.t("启动系统后台？", "Start the system service?"), self.t("此操作可能请求管理员确认，之后将重新连接后台。", "Administrator approval may be requested before the interface reconnects to the service.")),
                 MaintenanceAction::ServiceStop => (self.t("停止共享系统后台？", "Stop the shared system service?"), self.t("所有本机用户的自动认证和监测都会停止。现有校园网会话不会自动注销。", "Automatic authentication and monitoring stop for all local users. The current campus session is not disconnected automatically.")),
                 MaintenanceAction::ServiceRemove { .. } => (self.t("卸载共享系统后台？", "Remove the shared system service?"), self.t("所有本机用户将失去开机无人值守能力。保留设置与受保护凭据；此操作需要管理员确认。", "Unattended startup is removed for all local users. Settings and protected credentials are retained. Administrator approval is required.")),
                 MaintenanceAction::Repair => (self.t("修复 BitNet 安装？", "Repair the BitNet installation?"), self.t("使用受信任的安装包修复文件和后台注册。系统级更改需要管理员确认。", "A trusted installer repairs files and service registration. System changes require administrator approval.")),
-                MaintenanceAction::InstallUpdate => (self.t("安装软件更新？", "Install the software update?"), self.t("将验证发布签名并运行更新安装。后台升级需要本次管理员确认，取消后保留当前版本。", "The release signature is verified before installation. Updating the service requires administrator approval for this update. Cancelling keeps the current version.")),
+                MaintenanceAction::InstallUpdate | MaintenanceAction::InstallCheckedUpdate { .. } => (self.t("安装软件更新？", "Install the software update?"), self.t("将验证发布签名并运行更新安装。后台升级需要本次管理员确认，取消后保留当前版本。", "The release signature is verified before installation. Updating the service requires administrator approval for this update. Cancelling keeps the current version.")),
                 MaintenanceAction::RollbackUpdate => (self.t("恢复上一已验证版本？", "Restore the previous verified version?"), self.t("只允许使用本机上次验签且 API/schema 兼容的缓存版本，执行前会再次验证。没有可用缓存时操作会明确失败，不从未知来源下载旧版。系统后台回滚需本次管理员确认。", "Only a previously verified local cache with a compatible API and schema can be restored, and it is verified again before use. If no usable cache exists, this operation reports unavailable. Service rollback requires administrator approval for this operation.")),
                 MaintenanceAction::EnableIpv6 { .. }
                 | MaintenanceAction::DisableIpv6 { .. }
@@ -2309,24 +2614,5 @@ impl App {
         .padding(24)
         .style(scrim)
         .into()
-    }
-
-    fn yes_no(&self, value: bool) -> &'static str {
-        if value {
-            self.t("是", "Yes")
-        } else {
-            self.t("否", "No")
-        }
-    }
-    fn service_value(&self, last: bool) -> String {
-        if self.snapshot_current {
-            self.yes_no(last).into()
-        } else {
-            format!(
-                "{} ({})",
-                self.t("当前未知，上次", "Unknown now; previously"),
-                self.yes_no(last)
-            )
-        }
     }
 }

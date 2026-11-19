@@ -23,12 +23,65 @@ pub enum MaintenanceAction {
     Repair,
     CheckUpdate,
     InstallUpdate,
+    InstallCheckedUpdate { manifest_sha256: UpdateManifestId },
     RollbackUpdate,
     SetAutostart { enabled: bool },
     SetGuiAutostart { enabled: bool },
     EnableIpv6 { interface: InterfaceTarget },
     DisableIpv6 { interface: InterfaceTarget },
     ResetIpv6 { interface: InterfaceTarget },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateManifestId(String);
+
+impl UpdateManifestId {
+    pub fn parse(value: &str) -> Result<Self, AppError> {
+        if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Ok(Self(value.to_ascii_lowercase()))
+        } else {
+            Err(err(
+                ErrorCode::InvalidInput,
+                "Expected a SHA-256 update manifest identifier",
+            ))
+        }
+    }
+
+    fn for_payload(payload: &[u8]) -> Self {
+        use sha2::{Digest as _, Sha256};
+        Self(format!("{:x}", Sha256::digest(payload)))
+    }
+
+    fn verify(&self, payload: &[u8]) -> Result<(), AppError> {
+        if *self != Self::for_payload(payload) {
+            return Err(err(
+                ErrorCode::Busy,
+                "The verified update changed. Check the new release before installing.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckedUpdate {
+    pub version: String,
+    pub scope: Scope,
+    pub manifest_sha256: UpdateManifestId,
+}
+
+/// Fetch and authenticate the current release without downloading any installers.
+pub async fn check_installable_update(scope: Scope) -> Result<Option<CheckedUpdate>, AppError> {
+    let config = updates::UpdateConfig::embedded()?;
+    let Some(release) = config.check_available_release().await? else {
+        return Ok(None);
+    };
+    let _ = release.manifest.assets_for_install(scope)?;
+    Ok(Some(CheckedUpdate {
+        version: release.manifest.version,
+        scope,
+        manifest_sha256: UpdateManifestId::for_payload(&release.raw_manifest),
+    }))
 }
 
 /// Native Windows adapter identity. Alias, address and display name are never
@@ -115,7 +168,9 @@ pub fn action_name(action: &MaintenanceAction) -> &'static str {
         MaintenanceAction::ServiceRemove { .. } => "service-remove",
         MaintenanceAction::Repair => "repair",
         MaintenanceAction::CheckUpdate => "check-update",
-        MaintenanceAction::InstallUpdate => "install-update",
+        MaintenanceAction::InstallUpdate | MaintenanceAction::InstallCheckedUpdate { .. } => {
+            "install-update"
+        }
         MaintenanceAction::RollbackUpdate => "rollback-update",
         MaintenanceAction::SetAutostart { enabled: true } => "autostart-on",
         MaintenanceAction::SetAutostart { enabled: false } => "autostart-off",
@@ -184,15 +239,28 @@ pub async fn execute(
     interactive: bool,
 ) -> Result<MaintenanceResult, AppError> {
     #[cfg(windows)]
-    if scope == Scope::System && matches!(action, MaintenanceAction::ServiceInstall) {
+    if scope == Scope::System
+        && matches!(
+            action,
+            MaintenanceAction::ServiceInstall | MaintenanceAction::ServiceStart
+        )
+    {
         // Reject absent trust material or a corrupt cached MSI before UAC and
         // before disrupting the user's functioning authentication controller.
-        updates::verify_offline_package(&sibling("packages/Service.msi")?)?;
+        let installing = matches!(action, MaintenanceAction::ServiceInstall);
+        if installing {
+            updates::verify_offline_package(&sibling("packages/Service.msi")?)?;
+        }
         let _handoff = HandoffLock::acquire()?;
         let stopped = stop_personal_controller().await?;
         let outcome = execute_inner(scope, action, interactive).await;
+        let service = bitnet_platform::service::status();
         if outcome.is_err()
-            && restore_personal_controller(stopped, &bitnet_platform::service::status())
+            && (if installing {
+                restore_personal_controller(stopped, &service)
+            } else {
+                stopped && !service.running && service.detail.is_none()
+            })
             && restart_personal_controller().await.is_err()
         {
             return Err(err(
@@ -315,7 +383,10 @@ async fn execute_inner(
             ));
         }
     }
-    if matches!(action, MaintenanceAction::InstallUpdate) {
+    if matches!(
+        action,
+        MaintenanceAction::InstallUpdate | MaintenanceAction::InstallCheckedUpdate { .. }
+    ) {
         // A build without an authenticated feed never prompts for privileges.
         let _ = updates::UpdateConfig::embedded()?;
     }
@@ -358,9 +429,15 @@ async fn execute_inner(
         }
         _ => {}
     }
-    if matches!(action, MaintenanceAction::InstallUpdate) {
+    if matches!(
+        action,
+        MaintenanceAction::InstallUpdate | MaintenanceAction::InstallCheckedUpdate { .. }
+    ) {
         let config = updates::UpdateConfig::embedded()?;
         let release = config.check_release().await?;
+        if let MaintenanceAction::InstallCheckedUpdate { manifest_sha256 } = &action {
+            manifest_sha256.verify(&release.raw_manifest)?;
+        }
         let assets = release.manifest.assets_for_install(scope)?;
         // Native Debian/PKG installers modify the machine even when invoked by
         // the personal client. Their payload must stay in root-owned staging.
@@ -559,7 +636,9 @@ fn requires_admin(scope: Scope, action: &MaintenanceAction) -> bool {
     #[cfg(not(windows))]
     if matches!(
         action,
-        MaintenanceAction::InstallUpdate | MaintenanceAction::RollbackUpdate
+        MaintenanceAction::InstallUpdate
+            | MaintenanceAction::InstallCheckedUpdate { .. }
+            | MaintenanceAction::RollbackUpdate
     ) {
         return true;
     }
@@ -603,23 +682,18 @@ async fn service_action(action: MaintenanceAction) -> Result<MaintenanceResult, 
             });
         }
         MaintenanceAction::ServiceStart => {
-            run(system_plan(
-                "sc.exe",
-                &["config", "BitNet", "start=", "auto"],
-                45,
-            )?)
-            .await?;
+            // Older BitNet versions disabled the service when stopping it.
+            if windows_service_disabled()? {
+                run(system_plan(
+                    "sc.exe",
+                    &["config", "BitNet", "start=", "demand"],
+                    45,
+                )?)
+                .await?;
+            }
             change_windows_service_state(true).await?;
         }
         MaintenanceAction::ServiceStop => {
-            // Disabling also prevents a restart already queued by SCM recovery.
-            // Pause remains the separate way to pause authentication only.
-            run(system_plan(
-                "sc.exe",
-                &["config", "BitNet", "start=", "disabled"],
-                45,
-            )?)
-            .await?;
             change_windows_service_state(false).await?;
         }
         MaintenanceAction::ServiceRemove { purge } => {
@@ -862,6 +936,43 @@ fn windows_service_state() -> Result<u32, AppError> {
         ));
     }
     Ok(state.dwCurrentState)
+}
+
+#[cfg(windows)]
+fn windows_service_disabled() -> Result<bool, AppError> {
+    use windows_sys::Win32::System::Services::*;
+    let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(err(
+            ErrorCode::Unavailable,
+            "Could not query the service manager",
+        ));
+    }
+    let name = wide("BitNet");
+    let service = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_CONFIG) };
+    unsafe { CloseServiceHandle(manager) };
+    if service.is_null() {
+        return Err(err(
+            ErrorCode::Unavailable,
+            "Could not open the system service",
+        ));
+    }
+    let mut needed = 0;
+    unsafe { QueryServiceConfigW(service, std::ptr::null_mut(), 0, &mut needed) };
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+    let queried = needed > 0
+        && unsafe { QueryServiceConfigW(service, buffer.as_mut_ptr().cast(), needed, &mut needed) }
+            != 0;
+    unsafe { CloseServiceHandle(service) };
+    if !queried {
+        return Err(err(
+            ErrorCode::Unavailable,
+            "Could not read the service startup configuration",
+        ));
+    }
+    Ok(unsafe {
+        (*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>()).dwStartType == SERVICE_DISABLED
+    })
 }
 
 #[cfg(windows)]
@@ -1983,6 +2094,10 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
             );
             !matches!(action, MaintenanceAction::DisableIpv6 { .. })
         });
+        if let MaintenanceAction::InstallCheckedUpdate { manifest_sha256 } = &action {
+            use std::fmt::Write as _;
+            let _ = write!(arguments, " --manifest-sha256 {}", manifest_sha256.0);
+        }
         tokio::task::spawn_blocking(move || {
             use windows_sys::Win32::{
                 Foundation::*,
@@ -2076,6 +2191,10 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
         if matches!(action, MaintenanceAction::ServiceRemove { purge: true }) {
             p.args.push("--purge".into());
         }
+        if let MaintenanceAction::InstallCheckedUpdate { manifest_sha256 } = &action {
+            p.args
+                .extend(["--manifest-sha256".into(), manifest_sha256.0.clone().into()]);
+        }
         run(p).await?;
         Ok(result("Authorized maintenance completed"))
     }
@@ -2112,7 +2231,14 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
             });
         }
         root_helper(Path::new(HELPER))?;
-        let script=format!("do shell script \"{HELPER} --scope {} --action {} --elevated{}\" with administrator privileges",if scope==Scope::System{"system"}else{"user"},action_name(&action),if matches!(action,MaintenanceAction::ServiceRemove{purge:true}){" --purge"}else{""});
+        let extra = match &action {
+            MaintenanceAction::InstallCheckedUpdate { manifest_sha256 } => {
+                format!(" --manifest-sha256 {}", manifest_sha256.0)
+            }
+            MaintenanceAction::ServiceRemove { purge: true } => " --purge".to_owned(),
+            _ => String::new(),
+        };
+        let script = format!("do shell script \"{HELPER} --scope {} --action {} --elevated{extra}\" with administrator privileges", if scope == Scope::System {"system"} else {"user"}, action_name(&action));
         run(Plan {
             program: "/usr/bin/osascript".into(),
             args: vec!["-e".into(), script.into()],
@@ -2222,6 +2348,22 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn confirmed_update_requires_the_same_signed_manifest_bytes() {
+        let payload = br#"{"version":"1.0.0","assets":[]}"#;
+        let digest = UpdateManifestId::for_payload(payload);
+        let elevated = UpdateManifestId::parse(&digest.0.to_uppercase()).unwrap();
+        assert_eq!(digest, elevated);
+        assert!(elevated.verify(payload).is_ok());
+        assert_eq!(
+            elevated
+                .verify(br#"{"version":"1.0.1","assets":[]}"#)
+                .unwrap_err()
+                .code,
+            ErrorCode::Busy
+        );
+    }
+
     #[test]
     fn closed_actions_reject_command_injection() {
         assert!(parse_action("service-start;whoami", false).is_err());

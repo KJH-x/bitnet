@@ -39,6 +39,7 @@ struct Options {
     scope: Scope,
     mode: Mode,
     no_open: bool,
+    exact_scope: bool,
     language: &'static str,
 }
 
@@ -54,6 +55,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
         scope: Scope::User,
         mode: Mode::Start,
         no_open: false,
+        exact_scope: false,
         language: "zh",
     };
     while let Some(arg) = args.next() {
@@ -88,6 +90,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
             "--stop" if options.mode == Mode::Start => options.mode = Mode::Stop,
             "--serve" if options.mode == Mode::Start => options.mode = Mode::Serve,
             "--no-open" => options.no_open = true,
+            "--exact-scope" => options.exact_scope = true,
             _ => return Err("Unknown or conflicting option. See --help.".into()),
         }
     }
@@ -388,7 +391,7 @@ fn run() -> Result<()> {
     {
         return Err("Simulation requires user scope and a separate data directory".into());
     }
-    if options.mode != Mode::Serve {
+    if options.mode != Mode::Serve && !options.exact_scope {
         options.scope = bitnet_runtime::client::Client::new(options.scope).effective_scope();
     }
     let dir = paths(Scope::User)?

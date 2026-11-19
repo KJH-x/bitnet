@@ -58,21 +58,24 @@ pub(super) fn status() -> ServiceStatus {
         let mut length = 0;
         QueryServiceConfigW(service, ptr::null_mut(), 0, &mut length);
         let mut storage = vec![0u64; (length as usize).div_ceil(8)];
-        let mut enabled = false;
+        let mut start_type = None;
         if length > 0
             && QueryServiceConfigW(service, storage.as_mut_ptr().cast(), length, &mut length) != 0
         {
-            enabled =
-                (*storage.as_ptr().cast::<QUERY_SERVICE_CONFIGW>()).dwStartType != SERVICE_DISABLED;
+            start_type = Some((*storage.as_ptr().cast::<QUERY_SERVICE_CONFIGW>()).dwStartType);
         }
         CloseServiceHandle(service);
         CloseServiceHandle(manager);
         ServiceStatus {
             installed: true,
             running: ok != 0 && state.dwCurrentState == SERVICE_RUNNING,
-            enabled,
+            enabled: start_type == Some(SERVICE_AUTO_START),
             detail: if ok == 0 {
                 Some("Cannot query service runtime status".into())
+            } else if !matches!(state.dwCurrentState, SERVICE_RUNNING | SERVICE_STOPPED) {
+                Some("The system service is changing state".into())
+            } else if start_type.is_none() {
+                Some("Cannot query service startup configuration".into())
             } else {
                 None
             },

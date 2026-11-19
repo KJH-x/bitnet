@@ -338,6 +338,7 @@ impl Engine {
                 virtual_adapter: false,
                 alternate_adapter: false,
                 dns: Vec::new(),
+                dns_config: None,
                 ipv6: Vec::new(),
                 ipv4_mode: None,
                 ipv6_enabled: None,
@@ -396,9 +397,14 @@ impl Engine {
             })
         });
         let previous_interface = active_interface(&self.snapshot);
-        let ipv6_changed = interface.map(|i| (&i.ipv6, i.ipv6_enabled))
-            != previous_interface.map(|i| (&i.ipv6, i.ipv6_enabled));
-        let dns_changed = interface.map(|i| &i.dns) != previous_interface.map(|i| &i.dns);
+        let ipv6_changed = previous_interfaces
+            .iter()
+            .zip(&interfaces)
+            .any(|(old, current)| {
+                old.ipv6 != current.ipv6 || old.ipv6_enabled != current.ipv6_enabled
+            });
+        let dns_changed = interface.map(|i| (&i.dns, &i.dns_config))
+            != previous_interface.map(|i| (&i.dns, &i.dns_config));
         if network_changed {
             self.close_online_window();
             if self.snapshot.session.auth == AuthState::Authenticated
@@ -414,6 +420,7 @@ impl Engine {
             self.snapshot.health = HealthStatus::default();
         } else if ipv6_changed {
             self.snapshot.health.ipv6_probes.clear();
+            self.snapshot.health.ipv6_checked_at = None;
             // Invalidate proof from the old address set without discarding the
             // result of the Internet probes themselves.
             for probe in &mut self.snapshot.health.health_probes {
@@ -424,10 +431,11 @@ impl Engine {
         if network_changed || ipv6_changed || dns_changed {
             self.next_health = 0;
         }
-        if network_changed || ipv6_changed {
+        if !self.simulation {
             crate::health_probe::update_ipv6_status(
                 &mut self.snapshot.health,
                 interface,
+                &interfaces,
                 &self.snapshot.settings.language,
             );
         }
@@ -505,7 +513,17 @@ impl Engine {
             self.snapshot.retry_count = 0;
             self.snapshot.next_retry_at = None;
             self.snapshot.session = GatewaySession::default();
-            self.snapshot.health = HealthStatus::default();
+            let old_health = std::mem::take(&mut self.snapshot.health);
+            self.snapshot.health = HealthStatus {
+                ipv6: old_health.ipv6,
+                ipv6_status: old_health.ipv6_status,
+                ipv6_detail: old_health.ipv6_detail,
+                ipv6_checked_at: old_health.ipv6_checked_at,
+                ipv6_probes: old_health.ipv6_probes,
+                local_ipv6: old_health.local_ipv6,
+                public_ipv6: old_health.public_ipv6,
+                ..HealthStatus::default()
+            };
             self.snapshot.environment = Environment::NonCampus;
             self.snapshot.state = EngineState::Idle;
             if system_authentication {
@@ -1240,8 +1258,9 @@ impl Engine {
         match command {
             Command::Status => {}
             Command::Check => {
-                self.check(true).await?;
+                let result = self.check(true).await;
                 self.health_check().await;
+                result?;
             }
             Command::Pause => {
                 self.snapshot.settings.paused = true;
@@ -1730,6 +1749,7 @@ impl Engine {
                 settings.revision = self.snapshot.settings.revision.saturating_add(1);
                 persistence::write_settings(&self.paths.config_file, &settings)?;
                 if settings.health_targets != self.snapshot.settings.health_targets
+                    || settings.ipv6_targets != self.snapshot.settings.ipv6_targets
                     || settings.health_expectations != self.snapshot.settings.health_expectations
                     || settings.request_timeout_secs != self.snapshot.settings.request_timeout_secs
                     || settings.language != self.snapshot.settings.language
@@ -1863,14 +1883,14 @@ impl Engine {
         Ok(())
     }
     fn diagnostics(&self) -> serde_json::Value {
-        serde_json::json!({"version":APP_VERSION,"api_version":API_VERSION,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"scope":self.snapshot.scope,"state":self.snapshot.state,"environment":self.snapshot.environment,"network_trusted":self.snapshot.network_trusted,"health":self.snapshot.health,"interface_count":self.snapshot.interfaces.len(),"selected_interface":self.snapshot.active_binding.as_ref().map(|_|"[redacted]"),"network_generation":self.snapshot.network_generation,"retry_count":self.snapshot.retry_count,"next_retry_at":self.snapshot.next_retry_at,"last_error_code":self.snapshot.last_error.as_ref().map(|e|e.code),"credential_store_available":self.vault.is_some(),"history_available":self.history.is_some(),"service":{"installed":self.snapshot.service.installed,"running":self.snapshot.service.running,"enabled":self.snapshot.service.enabled},"update_feed_configured":crate::maintenance::updates::UpdateConfig::configured(),"simulation":self.simulation,"limitations":["报告不包含密码、协议认证材料、用户名或完整IP；网络诊断不会修改系统设置。"]})
+        serde_json::json!({"version":APP_VERSION,"api_version":API_VERSION,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"scope":self.snapshot.scope,"state":self.snapshot.state,"environment":self.snapshot.environment,"network_trusted":self.snapshot.network_trusted,"health":self.snapshot.health.redacted(),"interface_count":self.snapshot.interfaces.len(),"selected_interface":self.snapshot.active_binding.as_ref().map(|_|"[redacted]"),"network_generation":self.snapshot.network_generation,"retry_count":self.snapshot.retry_count,"next_retry_at":self.snapshot.next_retry_at,"last_error_code":self.snapshot.last_error.as_ref().map(|e|e.code),"credential_store_available":self.vault.is_some(),"history_available":self.history.is_some(),"service":{"installed":self.snapshot.service.installed,"running":self.snapshot.service.running,"enabled":self.snapshot.service.enabled},"update_feed_configured":crate::maintenance::updates::UpdateConfig::configured(),"simulation":self.simulation,"limitations":["报告不包含密码、协议认证材料、用户名或完整IP；网络诊断不会修改系统设置。"]})
     }
     async fn health_check(&mut self) {
         self.next_health = now_secs() + self.snapshot.settings.health_interval_secs;
-        if self.snapshot.environment == Environment::NonCampus {
-            return;
-        }
         if self.simulation {
+            if self.snapshot.environment == Environment::NonCampus {
+                return;
+            }
             self.snapshot.health = HealthStatus {
                 internet: Health::Healthy,
                 dns: Health::Healthy,
@@ -1880,14 +1900,31 @@ impl Engine {
             };
             return;
         }
-        if self.snapshot.session.auth != AuthState::Authenticated {
+        let interface = self.snapshot.active_binding.as_ref().and_then(|binding| {
+            self.snapshot.interfaces.iter().find(|adapter| {
+                adapter.id == binding.interface_id && adapter.index == binding.interface_index
+            })
+        });
+        if self.snapshot.environment == Environment::NonCampus
+            || self.snapshot.session.auth != AuthState::Authenticated
+        {
+            crate::health_probe::run_ipv6(
+                &self.snapshot.settings,
+                interface,
+                &self.snapshot.interfaces,
+                &mut self.snapshot.health,
+            )
+            .await;
             return;
         }
-        self.snapshot.health =
-            crate::health_probe::run(&self.snapshot.settings, active_interface(&self.snapshot))
-                .await;
+        self.snapshot.health = crate::health_probe::run(
+            &self.snapshot.settings,
+            interface,
+            &self.snapshot.interfaces,
+        )
+        .await;
         if self.snapshot.settings.log_level == "debug" {
-            let health = &self.snapshot.health;
+            let health = self.snapshot.health.redacted();
             for probe in &health.health_probes {
                 self.record_probe("health_probe", "互联网探测", probe.elapsed_ms, probe);
             }
@@ -3190,6 +3227,7 @@ mod tests {
             virtual_adapter: false,
             alternate_adapter: false,
             dns: Vec::new(),
+            dns_config: None,
             ipv6: Vec::new(),
             ipv4_mode: None,
             ipv6_enabled: None,
@@ -3291,6 +3329,7 @@ mod tests {
             virtual_adapter: false,
             alternate_adapter: false,
             dns: Vec::new(),
+            dns_config: None,
             ipv6: Vec::new(),
             ipv4_mode: None,
             ipv6_enabled: None,

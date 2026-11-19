@@ -1,7 +1,7 @@
 use super::*;
 use bitnet_core::{NetworkInterface, NetworkRule};
 use bitnet_runtime::engine::fingerprint_for;
-use iced::widget::{column, row, tooltip};
+use iced::widget::{column, mouse_area, row, toggler, tooltip};
 use std::time::Duration;
 
 struct AdapterRow<'a> {
@@ -140,8 +140,8 @@ fn fitted_text<'a>(value: impl ToString, size: f32) -> Element<'a, Message> {
 
 fn section_label(section: NetworkSection, english: bool) -> &'static str {
     match (section, english) {
-        (NetworkSection::Adapters, false) => "网络",
-        (NetworkSection::Adapters, true) => "Network",
+        (NetworkSection::Adapters, false) => "选择网卡",
+        (NetworkSection::Adapters, true) => "Adapters",
         (NetworkSection::Profiles, false) => "认证环境",
         (NetworkSection::Profiles, true) => "Profiles",
         (NetworkSection::Rules, false) => "网络规则",
@@ -217,38 +217,33 @@ impl App {
             NetworkSection::RuleEditor => NetworkSection::Rules,
             other => other,
         };
-        let picker = pick_list(
-            Some(section),
+        let tabs = if self.network_advanced {
             [
                 NetworkSection::Adapters,
                 NetworkSection::Profiles,
                 NetworkSection::Rules,
-            ],
-            move |value: &NetworkSection| section_label(*value, english).to_string(),
-        )
-        .on_select(Message::NetworkTab)
-        .width(Length::Fixed(140.0));
+            ]
+            .as_slice()
+        } else {
+            [NetworkSection::Adapters].as_slice()
+        };
+        let mut navigation = row![].spacing(d.space.xs);
+        for &tab in tabs {
+            let selected = section == tab;
+            navigation = navigation.push(
+                button(text(section_label(tab, english)).size(d.typography.body))
+                    .on_press_maybe((!selected).then_some(Message::NetworkTab(tab)))
+                    .padding([d.space.xs, d.space.sm])
+                    .style(design::nav_button(selected)),
+            );
+        }
         let header = row![
-            container(
-                text(
-                    if self.enabling_automatic && section == NetworkSection::Adapters {
-                        self.t(
-                            "选择用于自动登录的网卡，然后继续。",
-                            "Select the adapter for automatic sign-in, then continue.",
-                        )
-                    } else {
-                        self.section_hint(section)
-                    }
-                )
-                .size(d.typography.meta)
-                .style(design::text_style(design::muted)),
-            )
-            .padding(iced::padding::left(d.space.md))
-            .width(Length::Fill),
-            text(self.t("高级", "Advanced"))
-                .size(d.typography.meta)
-                .style(design::text_style(design::muted)),
-            picker,
+            navigation.wrap(),
+            Space::new().width(Length::Fill),
+            toggler(self.network_advanced)
+                .label(self.t("高级", "Advanced"))
+                .text_size(d.typography.body)
+                .on_toggle(|_| Message::ToggleNetworkAdvanced),
         ]
         .spacing(d.space.sm)
         .align_y(alignment::Vertical::Center);
@@ -259,26 +254,7 @@ impl App {
             NetworkSection::Rules => self.rule_page(size),
             NetworkSection::RuleEditor => self.rule_editor(),
         };
-        column![header, Self::rule(false), body]
-            .spacing(d.content.gap)
-            .into()
-    }
-
-    fn section_hint(&self, section: NetworkSection) -> &'static str {
-        match section {
-            NetworkSection::Adapters => self.t(
-                "选择校园网使用的网卡。",
-                "Choose the adapter used for the campus network.",
-            ),
-            NetworkSection::Profiles => self.t(
-                "保存已应用的网关、网卡、账户与规则。",
-                "Capture the applied gateway, adapter, account and rules.",
-            ),
-            _ => self.t(
-                "优先级高的规则先匹配。",
-                "Higher-priority rules match first.",
-            ),
-        }
+        column![header, body].spacing(d.content.gap).into()
     }
 
     fn network_columns(&self, width: f32) -> (f32, f32, f32) {
@@ -384,9 +360,14 @@ impl App {
         }
 
         let editable = self.snapshot_current && !self.busy && !self.draft.dirty;
-        let mut toolbar = row![Space::new().width(Length::Fill)]
-            .spacing(d.space.sm)
-            .align_y(alignment::Vertical::Center);
+        let mut toolbar = row![
+            text(self.t("网卡列表", "Adapters"))
+                .font(design::family_medium())
+                .size(d.typography.section_title),
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(d.space.sm)
+        .align_y(alignment::Vertical::Center);
         toolbar = toolbar.push(super::ips_eye_button(self.ips_revealed));
         if alternate_count > 0 {
             let label = if self.alternate_adapters {
@@ -395,9 +376,10 @@ impl App {
                 self.t("显示备选网卡", "Show other adapters")
             };
             toolbar = toolbar.push(
-                button(text(format!("{label} ({alternate_count})")).size(d.typography.meta))
+                button(text(format!("{label} ({alternate_count})")).size(d.typography.body))
                     .on_press(Message::ToggleAlternateAdapters)
-                    .padding([2.0, 8.0])
+                    .height(Length::Fixed(32.0))
+                    .padding([0, 12])
                     .style(design::flat_button),
             );
         }
@@ -518,7 +500,7 @@ impl App {
             ),
             None => column_label("—", self.trust_column_width()),
         };
-        let cells = row![
+        let chooser =
             button(container(choice_mark(marked, selectable)).center_x(Length::Fill))
                 .on_press_maybe(selectable.then(|| {
                     Message::InterfaceSelected(Some((item.id.clone(), item.ssid.clone())))
@@ -528,7 +510,16 @@ impl App {
                 .style(|theme, status| iced::widget::button::Style {
                     border: iced::Border::default(),
                     ..design::flat_button(theme, status)
-                }),
+                });
+        let chooser: Element<'_, Message> = if selectable {
+            chooser.into()
+        } else {
+            mouse_area(chooser)
+                .interaction(mouse::Interaction::NotAllowed)
+                .into()
+        };
+        let cells = row![
+            chooser,
             badge_cell(
                 if virtual_adapter {
                     self.t("虚拟", "Virtual")

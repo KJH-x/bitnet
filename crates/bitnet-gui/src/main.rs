@@ -2,6 +2,7 @@
 
 mod design;
 mod notifications;
+mod settings_actions;
 mod tray;
 mod views;
 
@@ -12,9 +13,11 @@ use bitnet_core::{
 use bitnet_core::{HealthExpect, HealthTarget as ConfigHealthTarget, MAX_HEALTH_TARGETS};
 use bitnet_launcher::{LaunchError, WebAction};
 use bitnet_runtime::client::Client;
+use bitnet_runtime::diagnostics;
 use bitnet_runtime::maintenance::{self, InterfaceTarget, MaintenanceAction, MaintenanceResult};
-use bitnet_runtime::update_policy::{self, UpdateOutcome, UpdatePolicy};
+use bitnet_runtime::update_policy::{UpdateOutcome, UpdatePolicy};
 use iced::{widget::text_editor, window, Element, Font, Subscription, Task, Theme};
+use settings_actions::{Action as SettingsAction, CheckTrigger, SettingsActions};
 use std::{
     fmt,
     time::{Duration, Instant},
@@ -62,6 +65,12 @@ enum NetworkSection {
     Profiles,
     Rules,
     RuleEditor,
+}
+#[derive(Debug, Clone, Copy)]
+enum HealthDetail {
+    Internet,
+    Dns,
+    Ipv6,
 }
 impl Page {
     /// Sub-tab label inside the connection area; never equal to the area name.
@@ -148,16 +157,6 @@ enum Mode {
     User,
     System,
 }
-impl Mode {
-    fn label(self, english: bool) -> &'static str {
-        match (self, english) {
-            (Self::User, false) => "自动选择",
-            (Self::User, true) => "Automatic",
-            (Self::System, false) => "系统后台",
-            (Self::System, true) => "System service",
-        }
-    }
-}
 impl From<Mode> for Scope {
     fn from(value: Mode) -> Self {
         match value {
@@ -208,6 +207,7 @@ enum Confirmation {
         scope: Scope,
         bytes: u64,
     },
+    PersonalMode,
 }
 
 #[derive(Clone)]
@@ -332,15 +332,18 @@ enum Message {
     TrayToggleWindow(window::Id, bool),
     NotificationSent(Result<(), String>),
     CheckUpdates,
-    UpdateChecked(Result<UpdateOutcome, AppError>, bool),
-    OpenReleasePage,
-    ReleasePageOpened(bool),
+    UpdateChecked(u64, Result<UpdateOutcome, AppError>, CheckTrigger),
+    SettingsAction(SettingsAction),
     Connected(Result<Snapshot, AppError>),
     Refreshed(u64, Result<Snapshot, AppError>),
     Completed(Result<ReplyData, AppError>),
     MaintenanceCompleted(Result<MaintenanceResult, AppError>),
     Navigate(Page),
     ModeChanged(Mode),
+    ServiceObserved(bitnet_core::ServiceStatus),
+    SwitchPersonal,
+    ToggleNetworkAdvanced,
+    HealthDetail(Option<HealthDetail>),
     LanguageChanged(Language),
     AppearanceChanged(Appearance),
     LogLevelChanged(String),
@@ -404,8 +407,12 @@ enum Message {
     TrustPage(usize),
     ImportAction(text_editor::Action),
     ImportSettings,
-    CopyExport,
     CopyDiagnostics,
+    RunDiagnostics,
+    DiagnosticsReady(Scope, std::sync::Arc<diagnostics::Report>),
+    OpenDiagnostics,
+    DiagnosticsOpened(Result<(), AppError>),
+    DiagnosticsCopied(bool),
     WebLogs(WebAction),
     WebLogsFinished(WebAction, Result<(), LaunchError>),
     WindowOpened(window::Id),
@@ -562,8 +569,8 @@ struct App {
     statistics: Option<Statistics>,
     log_viewer_busy: bool,
     log_size: Option<(Scope, u64)>,
-    diagnostics: String,
-    exported: String,
+    diagnostics: Option<std::sync::Arc<diagnostics::Report>>,
+    diagnostics_running: bool,
     import_content: text_editor::Content,
     confirmation: Option<Confirmation>,
     network_return: Page,
@@ -572,6 +579,10 @@ struct App {
     enabling_automatic: bool,
     alternate_adapters: bool,
     network_section: NetworkSection,
+    network_advanced: bool,
+    health_detail: Option<HealthDetail>,
+    native_service: Option<bitnet_core::ServiceStatus>,
+    personal_after_stop: bool,
     network_offset: usize,
     notice: Option<(bool, String)>,
     notice_until: Option<Instant>,
@@ -592,6 +603,7 @@ struct App {
     notification_gate: notifications::Gate,
     pending_notification: Option<notifications::Kind>,
     update_policy: UpdatePolicy,
+    settings_actions: SettingsActions,
     /// Wall clock until which an entered password is shown in clear text.
     password_revealed_until: Option<Instant>,
     /// Whether IP addresses are shown in clear text. Never persisted.
@@ -633,8 +645,8 @@ impl App {
             statistics: None,
             log_viewer_busy: false,
             log_size: None,
-            diagnostics: String::new(),
-            exported: String::new(),
+            diagnostics: None,
+            diagnostics_running: false,
             import_content: text_editor::Content::new(),
             confirmation: None,
             network_return: Page::Status,
@@ -643,6 +655,10 @@ impl App {
             enabling_automatic: false,
             alternate_adapters: false,
             network_section: NetworkSection::Adapters,
+            network_advanced: false,
+            health_detail: None,
+            native_service: None,
+            personal_after_stop: false,
             network_offset: 0,
             notice: None,
             notice_until: None,
@@ -663,13 +679,14 @@ impl App {
             notification_gate: notifications::Gate::default(),
             pending_notification: None,
             update_policy: UpdatePolicy::new(),
+            settings_actions: SettingsActions::default(),
             password_revealed_until: None,
             ips_revealed: false,
             network_prompt: None,
             skipped_network: None,
             trust_offset: 0,
         };
-        let connection = Self::connect(app.client.clone());
+        let connection = Task::batch([Self::connect(app.client.clone()), Self::observe_service()]);
         (app, connection)
     }
 
@@ -1023,9 +1040,17 @@ impl App {
     fn can_start_service(&self) -> bool {
         !self.busy
             && !self.connecting
-            && self.snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.service.installed && (!self.snapshot_current || !snapshot.service.running)
+            && self.observed_service().is_some_and(|service| {
+                service.installed && !service.running && service.detail.is_none()
             })
+    }
+    fn observed_service(&self) -> Option<&bitnet_core::ServiceStatus> {
+        self.native_service
+            .as_ref()
+            .or_else(|| self.snapshot.as_ref().map(|s| &s.service))
+    }
+    fn observe_service() -> Task<Message> {
+        Task::perform(async { Client::service_status() }, Message::ServiceObserved)
     }
     fn can_read_log_size(&self) -> bool {
         self.snapshot_current
@@ -1171,6 +1196,8 @@ impl App {
             | MaintenanceAction::ServiceStart
             | MaintenanceAction::ServiceStop
             | MaintenanceAction::ServiceRemove { .. }
+            | MaintenanceAction::Repair
+            | MaintenanceAction::SetAutostart { .. }
             | MaintenanceAction::EnableIpv6 { .. }
             | MaintenanceAction::DisableIpv6 { .. }
             | MaintenanceAction::ResetIpv6 { .. } => Scope::System,
@@ -1248,6 +1275,11 @@ impl App {
                 {
                     self.clear_notice();
                 }
+                let service = if self.busy || self.polling || self.connecting {
+                    Task::none()
+                } else {
+                    Self::observe_service()
+                };
                 let status = self.refresh();
                 let notification = self
                     .pending_notification
@@ -1260,27 +1292,9 @@ impl App {
                         )
                     })
                     .unwrap_or_else(Task::none);
-                let update = if !self.busy && !self.connecting && !preview_only() {
-                    self.snapshot
-                        .as_ref()
-                        .filter(|snapshot| {
-                            self.update_policy
-                                .due(&snapshot.settings, bitnet_core::now_secs())
-                        })
-                        .map(|snapshot| {
-                            Task::perform(
-                                update_policy::check_desktop(
-                                    snapshot.scope,
-                                    snapshot.settings.auto_update,
-                                ),
-                                |result| Message::UpdateChecked(result, false),
-                            )
-                        })
-                        .unwrap_or_else(Task::none)
-                } else {
-                    Task::none()
-                };
-                Task::batch([status, notification, update])
+                let update = self.check_desktop_update(CheckTrigger::Scheduled);
+                let log_size = self.refresh_settings_log_size();
+                Task::batch([status, service, notification, update, log_size])
             }
             Message::NotificationSent(result) => {
                 if result.is_err() && self.notice.is_none() {
@@ -1292,76 +1306,11 @@ impl App {
                 }
                 Task::none()
             }
-            Message::OpenReleasePage => open_release_page(),
-            Message::ReleasePageOpened(opened) => {
-                if !opened {
-                    self.show_notice(
-                        true,
-                        self.t(
-                            "无法打开发布页面：https://github.com/KJH-x/bitnet/releases",
-                            "Could not open https://github.com/KJH-x/bitnet/releases",
-                        )
-                        .into(),
-                    );
-                }
-                Task::none()
+            Message::CheckUpdates => self.check_desktop_update(CheckTrigger::User),
+            Message::UpdateChecked(request, result, trigger) => {
+                self.desktop_update_checked(request, result, trigger)
             }
-            Message::CheckUpdates => {
-                if preview_only() || !self.update_policy.begin_manual() {
-                    return Task::none();
-                }
-                let scope = self
-                    .snapshot
-                    .as_ref()
-                    .map_or(self.mode.into(), |snapshot| snapshot.scope);
-                Task::perform(update_policy::check_desktop(scope, false), |result| {
-                    Message::UpdateChecked(result, true)
-                })
-            }
-            Message::UpdateChecked(result, manual) => {
-                self.update_policy
-                    .complete(result.is_ok(), bitnet_core::now_secs());
-                match result {
-                    Ok(UpdateOutcome::Available { version }) => {
-                        self.show_notice(
-                            false,
-                            format!(
-                                "{} {version}",
-                                self.t(
-                                    "发现新版本，请在软件更新页确认安装：",
-                                    "Update available; review it in Updates:"
-                                )
-                            ),
-                        );
-                        self.pending_notification
-                            .get_or_insert(notifications::Kind::Update);
-                    }
-                    Ok(UpdateOutcome::InstallerStarted { message }) => {
-                        self.show_notice(false, message)
-                    }
-                    Ok(UpdateOutcome::PublicRelease { version }) => {
-                        self.show_notice(
-                            false,
-                            format!("{} {version}", self.t(
-                            "GitHub 已发布新版，可在「发布说明与下载」获取",
-                            "New GitHub release available under Release notes and downloads",
-                        )),
-                        )
-                    }
-                    Ok(UpdateOutcome::NoUpdate) if manual => self.show_notice(
-                        false,
-                        self.t("当前没有新版", "No newer release is available")
-                            .into(),
-                    ),
-                    Ok(UpdateOutcome::NoUpdate | UpdateOutcome::Unconfigured) => {}
-                    Err(error) => {
-                        if self.notice.is_none() {
-                            self.error(error);
-                        }
-                    }
-                }
-                Task::none()
-            }
+            Message::SettingsAction(action) => self.settings_action(action),
             Message::Connected(result) => {
                 self.connecting = false;
                 match result {
@@ -1492,12 +1441,8 @@ impl App {
                         );
                     }
                     Ok(ReplyData::Statistics(statistics)) => self.statistics = Some(statistics),
-                    Ok(ReplyData::Diagnostics(value)) => {
-                        self.diagnostics = serde_json::to_string_pretty(&value).unwrap_or_default()
-                    }
-                    Ok(ReplyData::Settings(settings)) => {
-                        self.exported = serde_json::to_string_pretty(&settings).unwrap_or_default()
-                    }
+                    Ok(ReplyData::Diagnostics(_)) => {}
+                    Ok(ReplyData::Settings(_)) => {}
                     Ok(ReplyData::Ok { message }) => {
                         if self.pending_settings && self.saved_epoch == self.settings_epoch {
                             self.draft.dirty = false;
@@ -1539,12 +1484,7 @@ impl App {
                 Page::Settings => {
                     self.enabling_automatic = false;
                     self.page = page;
-                    if self.settings_tab == SettingsTab::Diagnostics && self.can_read_log_size() {
-                        self.log_size = None;
-                        self.execute(Command::LogSize)
-                    } else {
-                        Task::none()
-                    }
+                    self.settings_tab_entered()
                 }
                 _ => {
                     self.enabling_automatic = false;
@@ -1554,6 +1494,7 @@ impl App {
             },
             Message::MaintenanceCompleted(result) => {
                 self.busy = false;
+                let personal = std::mem::take(&mut self.personal_after_stop) && result.is_ok();
                 match result {
                     Ok(result) => {
                         let message = match result.details["ipv6_enabled"].as_bool() {
@@ -1565,7 +1506,29 @@ impl App {
                     }
                     Err(error) => self.error(error),
                 }
-                self.refresh()
+                let status = if personal {
+                    self.update(Message::ModeChanged(Mode::User))
+                } else {
+                    self.refresh()
+                };
+                Task::batch([status, Self::observe_service()])
+            }
+            Message::ServiceObserved(service) => {
+                self.native_service = Some(service);
+                Task::none()
+            }
+            Message::SwitchPersonal => {
+                if self.busy || self.connecting || self.draft.dirty {
+                    return Task::none();
+                }
+                if self
+                    .observed_service()
+                    .is_some_and(|service| service.running)
+                {
+                    self.update(Message::Ask(Confirmation::PersonalMode))
+                } else {
+                    self.update(Message::ModeChanged(Mode::User))
+                }
             }
             Message::ModeChanged(mode) => {
                 if self.busy || self.connecting {
@@ -1583,7 +1546,7 @@ impl App {
                 }
                 self.mode = mode;
                 self.request_epoch = self.request_epoch.wrapping_add(1);
-                self.client = Client::new(mode.into());
+                self.client = Client::exact(mode.into());
                 self.snapshot = None;
                 self.snapshot_current = false;
                 self.connection_error = None;
@@ -1598,11 +1561,13 @@ impl App {
                 self.account = AccountDraft::default();
                 self.enabling_automatic = false;
                 self.network_section = NetworkSection::Adapters;
+                self.health_detail = None;
                 self.network_offset = 0;
                 self.statistics = None;
                 self.log_size = None;
-                self.diagnostics.clear();
-                self.exported.clear();
+                self.diagnostics = None;
+                self.settings_actions.reset_scope();
+                self.update_policy = UpdatePolicy::new();
                 self.draft = SettingsDraft::new(Settings::default());
                 self.connecting = true;
                 Self::connect(self.client.clone())
@@ -1613,13 +1578,27 @@ impl App {
                 if self.busy {
                     return Task::none();
                 }
-                if !self.snapshot_current && !self.connecting {
+                let status = if !self.snapshot_current && !self.connecting {
                     self.request_epoch = self.request_epoch.wrapping_add(1);
                     self.connecting = true;
                     Self::connect(self.client.clone())
                 } else {
                     self.refresh()
+                };
+                Task::batch([status, Self::observe_service()])
+            }
+            Message::HealthDetail(detail) => {
+                self.health_detail = detail;
+                Task::none()
+            }
+            Message::ToggleNetworkAdvanced => {
+                self.network_advanced = !self.network_advanced;
+                if !self.network_advanced {
+                    self.network_section = NetworkSection::Adapters;
+                    self.network_offset = 0;
+                    self.rule = RuleDraft::default();
                 }
+                Task::none()
             }
             Message::Run(Command::Resume)
                 if self
@@ -1684,6 +1663,14 @@ impl App {
                 }
                 Some(Confirmation::Shutdown) => self.execute(Command::Shutdown),
                 Some(Confirmation::Maintenance(action)) => self.maintain(action),
+                Some(Confirmation::PersonalMode) => {
+                    self.personal_after_stop = !preview_only() && !self.busy && !self.draft.dirty;
+                    if self.personal_after_stop {
+                        self.maintain(MaintenanceAction::ServiceStop)
+                    } else {
+                        Task::none()
+                    }
+                }
                 Some(Confirmation::SwitchAccount(target)) => {
                     self.switch_saved_account(target, true)
                 }
@@ -1714,11 +1701,17 @@ impl App {
                 Task::none()
             }
             Message::Escape => {
+                if self.health_detail.is_some() {
+                    return self.update(Message::HealthDetail(None));
+                }
                 if self.confirmation.is_some()
                     || self.health_editor.is_some()
                     || self.quick_login.is_some()
                 {
                     return self.update(Message::Cancel);
+                }
+                if self.settings_actions.close_dialog() {
+                    return Task::none();
                 }
                 if self.account_editing {
                     return self.update(Message::AccountCancel);
@@ -1996,12 +1989,7 @@ impl App {
             }
             Message::SettingsTabChanged(tab) => {
                 self.settings_tab = tab;
-                if tab == SettingsTab::Diagnostics && self.can_read_log_size() {
-                    self.log_size = None;
-                    self.execute(Command::LogSize)
-                } else {
-                    Task::none()
-                }
+                self.settings_tab_entered()
             }
             Message::OpenHealthEditor => {
                 self.clear_notice();
@@ -2345,8 +2333,74 @@ impl App {
                     }
                 }
             }
-            Message::CopyExport => iced::clipboard::write(self.exported.clone()).discard(),
-            Message::CopyDiagnostics => iced::clipboard::write(self.diagnostics.clone()).discard(),
+            Message::RunDiagnostics => {
+                let Some(snapshot) = self
+                    .snapshot
+                    .clone()
+                    .filter(|_| self.snapshot_current && !self.busy && !self.diagnostics_running)
+                else {
+                    return Task::none();
+                };
+                let scope = snapshot.scope;
+                self.diagnostics_running = true;
+                self.diagnostics = None;
+                let english = self.english();
+                Task::perform(diagnostics::collect(snapshot, english), move |report| {
+                    Message::DiagnosticsReady(scope, std::sync::Arc::new(report))
+                })
+            }
+            Message::DiagnosticsReady(scope, report) => {
+                self.diagnostics_running = false;
+                if !self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.scope == scope)
+                {
+                    return Task::none();
+                }
+                self.diagnostics = Some(report);
+                self.show_notice(
+                    false,
+                    self.t("诊断报告已生成", "Diagnostic report ready").into(),
+                );
+                Task::none()
+            }
+            Message::OpenDiagnostics => {
+                let Some(report) = self.diagnostics.clone() else {
+                    return Task::none();
+                };
+                Task::perform(
+                    diagnostics::open_in_browser(report, self.english()),
+                    Message::DiagnosticsOpened,
+                )
+            }
+            Message::DiagnosticsOpened(result) => {
+                match result {
+                    Ok(()) => self.show_notice(
+                        false,
+                        self.t("报告已在浏览器中打开", "Report opened in the browser")
+                            .into(),
+                    ),
+                    Err(error) => self.error(error),
+                }
+                Task::none()
+            }
+            Message::CopyDiagnostics => {
+                let Some(report) = self.diagnostics.as_ref() else {
+                    return Task::none();
+                };
+                iced::clipboard::write(report.text.clone())
+                    .map(|result| Message::DiagnosticsCopied(result.is_ok()))
+            }
+            Message::DiagnosticsCopied(ok) => {
+                let message = if ok {
+                    self.t("已复制报告", "Report copied")
+                } else {
+                    self.t("未能复制诊断报告", "Could not copy the report")
+                };
+                self.show_notice(!ok, message.into());
+                Task::none()
+            }
             Message::WebLogs(action) => {
                 if self.log_viewer_busy {
                     return Task::none();
@@ -2356,7 +2410,7 @@ impl App {
                 let english = self.english();
                 let (sender, receiver) = iced::futures::channel::oneshot::channel();
                 let _ = std::thread::Builder::new().spawn(move || {
-                    let _ = sender.send(bitnet_launcher::web(
+                    let _ = sender.send(bitnet_launcher::web_exact(
                         client.effective_scope(),
                         action,
                         english,
@@ -2409,6 +2463,7 @@ impl App {
                 self.account_editing = false;
                 self.quick_login = None;
                 self.confirmation = None;
+                self.settings_actions.close_dialog();
                 self.password_revealed_until = None;
                 if self.tray.as_ref().is_some_and(tray::Tray::is_available) {
                     window::close(id)
@@ -2512,35 +2567,6 @@ impl App {
     }
 }
 
-fn open_release_page() -> Task<Message> {
-    const RELEASES: &str = "https://github.com/KJH-x/bitnet/releases";
-    #[cfg(windows)]
-    let launcher = match std::env::var_os("SystemRoot") {
-        Some(root) => std::path::PathBuf::from(root).join("explorer.exe"),
-        None => return Task::done(Message::ReleasePageOpened(false)),
-    };
-    #[cfg(target_os = "macos")]
-    let launcher = "/usr/bin/open";
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let launcher = "xdg-open";
-    let (sender, receiver) = iced::futures::channel::oneshot::channel();
-    let _ = std::thread::Builder::new().spawn(move || {
-        let opened = std::process::Command::new(launcher)
-            .arg(RELEASES)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            // Explorer may exit with code 1 after forwarding the URL.
-            .is_ok_and(|status| cfg!(windows) || status.success());
-        let _ = sender.send(opened);
-    });
-    Task::perform(
-        async move { receiver.await.unwrap_or(false) },
-        Message::ReleasePageOpened,
-    )
-}
-
 fn account_label(account: &AccountInfo) -> String {
     format!("{}  ·  {}", account.username, account.id)
 }
@@ -2587,8 +2613,8 @@ mod tests {
             statistics: None,
             log_viewer_busy: false,
             log_size: None,
-            diagnostics: String::new(),
-            exported: String::new(),
+            diagnostics: None,
+            diagnostics_running: false,
             import_content: text_editor::Content::new(),
             confirmation: None,
             network_return: Page::Status,
@@ -2597,7 +2623,11 @@ mod tests {
             enabling_automatic: false,
             alternate_adapters: false,
             network_section: NetworkSection::Adapters,
+            network_advanced: false,
             network_offset: 0,
+            health_detail: None,
+            native_service: None,
+            personal_after_stop: false,
             notice: None,
             notice_until: None,
             connection_error: None,
@@ -2617,6 +2647,7 @@ mod tests {
             notification_gate: notifications::Gate::default(),
             pending_notification: None,
             update_policy: UpdatePolicy::new_at(0),
+            settings_actions: SettingsActions::default(),
             password_revealed_until: None,
             ips_revealed: false,
             network_prompt: None,
@@ -2748,6 +2779,7 @@ mod tests {
             virtual_adapter: false,
             alternate_adapter: false,
             dns: Vec::new(),
+            dns_config: None,
             ipv6: Vec::new(),
             ipv4_mode: None,
             ipv6_enabled: None,
@@ -2993,6 +3025,11 @@ mod tests {
             Err(AppError::new(ErrorCode::Unavailable, "offline")),
         ));
         assert!(!app.snapshot_current);
+        assert!(!app.can_start_service());
+        let _ = app.update(Message::ServiceObserved(bitnet_core::ServiceStatus {
+            installed: true,
+            ..Default::default()
+        }));
         assert!(app.can_start_service());
         assert!(
             !app.connecting,

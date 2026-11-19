@@ -40,7 +40,7 @@ impl Viewer {
             session,
             origin: format!("http://{host}"),
             host,
-            client: Client::new(scope),
+            client: Client::exact(scope),
             shutdown: watch::channel(false).0,
             activity: watch::channel(Instant::now()).0,
             cache: Mutex::new(None),
@@ -130,9 +130,6 @@ impl Viewer {
             },
         };
         let result = time::timeout(IPC_TIMEOUT, async {
-            if self.client.effective_scope() != self.client.scope {
-                return None;
-            }
             let reply = self.client.command(command).await.ok()?;
             if let ReplyData::History(events) = reply {
                 serde_json::to_vec(&events).ok().map(Bytes::from)
