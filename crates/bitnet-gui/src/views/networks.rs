@@ -148,6 +148,7 @@ fn section_label(section: NetworkSection, english: bool) -> &'static str {
         (NetworkSection::Rules, true) => "Rules",
         (NetworkSection::RuleEditor, false) => "规则编辑",
         (NetworkSection::RuleEditor, true) => "Edit rule",
+        (NetworkSection::Ipv6, _) => "IPv6",
     }
 }
 
@@ -222,6 +223,7 @@ impl App {
                 NetworkSection::Adapters,
                 NetworkSection::Profiles,
                 NetworkSection::Rules,
+                NetworkSection::Ipv6,
             ]
             .as_slice()
         } else {
@@ -253,6 +255,7 @@ impl App {
             NetworkSection::Profiles => self.profile_page(size),
             NetworkSection::Rules => self.rule_page(size),
             NetworkSection::RuleEditor => self.rule_editor(),
+            NetworkSection::Ipv6 => self.ipv6_page(size),
         };
         column![header, body].spacing(d.content.gap).into()
     }
@@ -575,18 +578,26 @@ impl App {
         let mut entries = column![].spacing(5);
         for profile in &profiles[range.clone()] {
             let active = snapshot.settings.active_profile.as_deref() == Some(profile.id.as_str());
+            let adapter_name = profile
+                .interface_id
+                .as_ref()
+                .and_then(|id| snapshot.interfaces.iter().find(|adapter| &adapter.id == id))
+                .map(|adapter| adapter.name.as_str())
+                .unwrap_or_else(|| {
+                    if profile.interface_id.is_some() {
+                        self.t("已保存网卡", "Saved adapter")
+                    } else {
+                        self.t("自动选择网卡", "Automatic adapter")
+                    }
+                });
             let summary = format!(
-                "{}{} · {}",
+                "{}{}",
                 if active {
                     self.t("当前环境 · ", "Active · ")
                 } else {
                     ""
                 },
-                profile.id,
-                profile
-                    .interface_id
-                    .as_deref()
-                    .unwrap_or_else(|| self.t("自动选择", "Automatic")),
+                adapter_name,
             );
             entries = entries.push(
                 container(
@@ -629,17 +640,20 @@ impl App {
         if profiles.is_empty() {
             entries = entries.push(text(self.t("还没有认证环境", "No authentication profiles")));
         }
-        let fields = row![
-            text_input(self.t("环境 ID", "Profile ID"), &self.profile_id)
-                .on_input(Message::ProfileIdChanged),
-            text_input(self.t("环境名称", "Profile name"), &self.profile_name)
-                .on_input(Message::ProfileNameChanged),
-        ]
-        .spacing(8);
+        let fields = text_input(self.t("环境名称", "Profile name"), &self.profile_name)
+            .on_input(Message::ProfileNameChanged);
+        let replacing = profiles
+            .iter()
+            .any(|profile| profile.name.trim() == self.profile_name.trim());
         let note = if self.draft.dirty {
             self.t(
                 "请先保存或放弃未保存的设置。",
                 "Save or discard your pending settings first.",
+            )
+        } else if replacing {
+            self.t(
+                "保存将更新同名环境。",
+                "Saving will update the profile with this name.",
             )
         } else {
             self.t(
@@ -654,18 +668,137 @@ impl App {
                 column![
                     text(note).size(12),
                     fields,
-                    button(self.t("保存环境", "Capture applied settings")).on_press_maybe(
-                        (enabled
-                            && !self.profile_id.trim().is_empty()
-                            && !self.profile_name.trim().is_empty())
-                        .then_some(Message::ProfileSave)
-                    ),
+                    button(self.t("保存环境", "Save profile"))
+                        .on_press_maybe(
+                            (enabled && !self.profile_name.trim().is_empty())
+                                .then_some(Message::ProfileSave)
+                        )
+                        .style(design::solid),
                 ]
                 .spacing(7)
             ),
         ]
         .spacing(9)
         .into()
+    }
+
+    fn ipv6_page(&self, size: Size) -> Element<'_, Message> {
+        let d = design::get();
+        let Some(snapshot) = &self.snapshot else {
+            return card(text(self.t("尚未连接后台", "Engine disconnected"))).into();
+        };
+        let mut body = column![].spacing(d.card.gap);
+        if !ipv6_maintenance_available(snapshot) {
+            return card(text(self.t(
+                "仅可在 Windows 正常运行时更改网卡的 IPv6 设置。",
+                "Adapter IPv6 settings can only be changed in a regular Windows session.",
+            )))
+            .into();
+        }
+        body = body.push(
+            text(self.t(
+                "更改需要管理员确认，远程桌面可能会断开。",
+                "Changes need administrator approval and may disconnect Remote Desktop.",
+            ))
+            .size(d.typography.meta),
+        );
+        let mut interfaces: Vec<_> = snapshot
+            .interfaces
+            .iter()
+            .filter(|adapter| ipv6_maintenance_target(adapter).is_some())
+            .collect();
+        let active = ipv6_adapter(snapshot);
+        interfaces.sort_by_key(|adapter| {
+            (
+                active.is_none_or(|item| item.id != adapter.id),
+                !adapter.up,
+                adapter.index,
+            )
+        });
+        if interfaces.is_empty() {
+            return card(body.push(text(self.t("没有可管理的网卡", "No manageable adapters"))))
+                .into();
+        }
+        let capacity = page_capacity(size.height, 200.0, 46.0, 8);
+        let range = page_window(interfaces.len(), self.network_offset, capacity);
+        for adapter in &interfaces[range.clone()] {
+            let is_active = active.is_some_and(|item| item.id == adapter.id);
+            let caption = match (is_active, adapter.ipv6_enabled) {
+                (true, Some(true)) => {
+                    self.t("当前网卡 · IPv6 已启用", "Active adapter · IPv6 enabled")
+                }
+                (true, Some(false)) => {
+                    self.t("当前网卡 · IPv6 已禁用", "Active adapter · IPv6 disabled")
+                }
+                (_, Some(true)) => self.t("IPv6 已启用", "IPv6 enabled"),
+                (_, Some(false)) => self.t("IPv6 已禁用", "IPv6 disabled"),
+                (_, None) => self.t("IPv6 状态未知", "IPv6 status unavailable"),
+            };
+            body = body.push(
+                row![
+                    column![
+                        fitted_text(&adapter.name, d.typography.body),
+                        text(caption)
+                            .size(d.typography.meta)
+                            .style(design::text_style(design::muted))
+                    ]
+                    .width(Length::Fill),
+                    self.ipv6_actions(adapter),
+                ]
+                .spacing(d.space.sm)
+                .align_y(alignment::Vertical::Center),
+            );
+        }
+        if interfaces.len() > capacity {
+            body = body.push(self.page_controls(
+                interfaces.len(),
+                range,
+                capacity,
+                Message::NetworkPage,
+            ));
+        }
+        card(body).into()
+    }
+
+    pub(super) fn ipv6_actions(&self, adapter: &NetworkInterface) -> Element<'_, Message> {
+        let Some((target, state)) = ipv6_maintenance_target(adapter).zip(adapter.ipv6_enabled)
+        else {
+            return Space::new().into();
+        };
+        let editable = self.snapshot_current
+            && !self.busy
+            && !self.connecting
+            && self.ipv6_maintenance_adapter(&target).is_some();
+        let width = if self.english() { 108.0 } else { 90.0 };
+        let d = design::get();
+        let mut actions = row![].spacing(d.space.sm);
+        if state {
+            actions = actions.push(
+                action_button(self.t("禁用 IPv6", "Disable IPv6"), width)
+                    .on_press_maybe(editable.then(|| {
+                        Message::Ask(Confirmation::Maintenance(MaintenanceAction::DisableIpv6 {
+                            interface: target.clone(),
+                        }))
+                    }))
+                    .style(design::danger_outline),
+            );
+            actions = actions.push(
+                action_button(self.t("重启 IPv6", "Restart IPv6"), width)
+                    .on_press_maybe(editable.then_some(Message::Ask(Confirmation::Maintenance(
+                        MaintenanceAction::ResetIpv6 { interface: target },
+                    ))))
+                    .style(design::flat_button),
+            );
+        } else {
+            actions = actions.push(
+                action_button(self.t("启用 IPv6", "Enable IPv6"), width)
+                    .on_press_maybe(editable.then_some(Message::Ask(Confirmation::Maintenance(
+                        MaintenanceAction::EnableIpv6 { interface: target },
+                    ))))
+                    .style(design::solid),
+            );
+        }
+        actions.into()
     }
 
     fn rule_page(&self, size: Size) -> Element<'_, Message> {

@@ -499,11 +499,14 @@ dependencies = [
  "iced",
  "ksni",
  "notify-rust",
+ "raw-window-handle",
  "serde",
  "serde_json",
+ "sha2",
  "time",
  "tokio",
  "tray-icon",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
