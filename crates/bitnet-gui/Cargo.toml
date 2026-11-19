@@ -21,6 +21,12 @@ time = { version = "0.3", default-features = false }
 tray-icon = "0.21"
 notify-rust = { version = "=4.17.0", default-features = false }
 
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+sha2 = "0.10"
+tokio = { workspace = true, features = ["sync"] }
+windows-sys = { workspace = true, features = ["Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_UI_WindowsAndMessaging"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 iced = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34", default-features = false, features = ["x11", "wayland", "linux-theme-detection"] }
 ksni = "0.3.7"

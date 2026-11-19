@@ -1662,6 +1662,7 @@ fn set_autostart(gui: bool, enabled: bool) -> Result<MaintenanceResult, AppError
         windows_autostart(
             if gui { "BitNetGUI" } else { "BitNetEngine" },
             &executable,
+            gui,
             enabled,
         )?;
     }
@@ -1690,7 +1691,8 @@ fn set_autostart(gui: bool, enabled: bool) -> Result<MaintenanceResult, AppError
                 .replace('`', "\\`")
                 .replace('$', "\\$")
                 .replace('%', "%%");
-            write_startup(&path,format!("[Desktop Entry]\nType=Application\nName=BitNet\nExec=\"{value}\"\nTerminal=false\n").as_bytes())?;
+            let args = if gui { " --autostart" } else { "" };
+            write_startup(&path,format!("[Desktop Entry]\nType=Application\nName=BitNet\nExec=\"{value}\"{args}\nTerminal=false\n").as_bytes())?;
         } else {
             remove_file(&path)?;
         }
@@ -1717,7 +1719,12 @@ fn set_autostart(gui: bool, enabled: bool) -> Result<MaintenanceResult, AppError
                 .replace('>', "&gt;")
                 .replace('"', "&quot;")
                 .replace('\'', "&apos;");
-            write_startup(&path,format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{value}</string></array><key>RunAtLoad</key><true/></dict></plist>").as_bytes())?;
+            let args = if gui {
+                "<string>--autostart</string>"
+            } else {
+                ""
+            };
+            write_startup(&path,format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{value}</string>{args}</array><key>RunAtLoad</key><true/></dict></plist>").as_bytes())?;
         } else {
             remove_file(&path)?;
         }
@@ -2014,7 +2021,12 @@ fn service_product() -> Result<String, AppError> {
     Ok(String::from_utf16_lossy(&guid[..38]))
 }
 #[cfg(windows)]
-fn windows_autostart(name: &str, executable: &Path, enabled: bool) -> Result<(), AppError> {
+fn windows_autostart(
+    name: &str,
+    executable: &Path,
+    gui: bool,
+    enabled: bool,
+) -> Result<(), AppError> {
     use windows_sys::Win32::System::Registry::*;
     let mut key = std::ptr::null_mut();
     if unsafe {
@@ -2037,7 +2049,8 @@ fn windows_autostart(name: &str, executable: &Path, enabled: bool) -> Result<(),
         ));
     }
     let status = if enabled {
-        let value = wide(format!("\"{}\"", executable.to_string_lossy()));
+        let args = if gui { " --autostart" } else { "" };
+        let value = wide(format!("\"{}\"{args}", executable.to_string_lossy()));
         unsafe {
             RegSetValueExW(
                 key,

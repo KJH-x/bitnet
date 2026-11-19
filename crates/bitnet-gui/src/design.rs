@@ -471,6 +471,13 @@ pub fn flat_button(theme: &Theme, status: button::Status) -> button::Style {
     style
 }
 
+pub fn disabled_button(theme: &Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(Background::Color(muted(theme).scale_alpha(0.12))),
+        ..flat_button(theme, button::Status::Disabled)
+    }
+}
+
 pub fn solid(theme: &Theme, status: button::Status) -> button::Style {
     let design = get();
     let accent = color(&set(theme).accent);

@@ -10,7 +10,8 @@ use bitnet_launcher::WebAction;
 use iced::{
     alignment,
     widget::{
-        button, checkbox, column, container, pick_list, row, text, text_editor, text_input, Space,
+        button, checkbox, column, container, pick_list, row, text, text_editor, text_input,
+        toggler, Space,
     },
     Element, Length, Size,
 };
@@ -176,6 +177,13 @@ impl App {
 
     fn general_settings(&self) -> Element<'_, Message> {
         let english = self.english();
+        let d = design::get();
+        let can_edit = self.mode == Mode::User && self.snapshot_current && !self.busy;
+        let autorun = self.t("系统登录时启动 BitNet", "Start BitNet at sign-in");
+        let hidden_unavailable = !self.draft.settings.gui_autostart;
+        let resume = self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.settings.automatic && (snapshot.settings.paused || snapshot.verification_hold)
+        });
         let mut body = column![
             setting_row(
                 self.t("界面语言", "Language").to_string(),
@@ -205,54 +213,81 @@ impl App {
                     (!self.busy && self.snapshot_current).then_some(Message::AutomaticChanged),
                 ),
         ]
-        .spacing(7);
-        for (flag, value, label) in [
-            (
-                SettingFlag::UserAutostart,
-                self.draft.settings.user_autostart,
-                self.t("系统登录后启动后台", "Start the engine at system sign-in"),
-            ),
-            (
-                SettingFlag::GuiAutostart,
-                self.draft.settings.gui_autostart,
-                self.t("系统登录后打开窗口", "Open the window at system sign-in"),
-            ),
-            (
-                SettingFlag::StartHidden,
-                self.draft.settings.start_hidden,
-                self.t("启动时隐藏主窗口", "Start with the window hidden"),
-            ),
-            (
-                SettingFlag::NotifyErrors,
-                self.draft.settings.notify_errors,
-                self.t("需要处理时才通知", "Notify when an error needs attention"),
-            ),
-        ] {
-            let enabled = self.mode == Mode::User
-                || !matches!(flag, SettingFlag::UserAutostart | SettingFlag::GuiAutostart);
-            body = body.push(checkbox(value).label(label).on_toggle_maybe(
-                enabled.then_some(move |value| Message::FlagChanged(flag, value)),
-            ));
-        }
-        if self.mode == Mode::System {
+        .spacing(d.space.xs);
+        if resume {
             body = body.push(
-                text(self.t(
-                    "切换到个人模式后可修改个人启动项。",
-                    "Switch to personal mode to edit personal startup options.",
+                button(text(
+                    self.t("恢复自动认证", "Resume automatic authentication"),
                 ))
-                .size(12),
+                .on_press_maybe(
+                    (self.snapshot_current && !self.busy && !self.draft.dirty)
+                        .then_some(Message::Run(Command::Resume)),
+                )
+                .style(design::flat_button),
             );
+        }
+        body =
+            body.push(Self::rule(false))
+                .push(
+                    text(self.t("启动与窗口", "Startup and window")).font(design::family_medium()),
+                )
+                .push(
+                    checkbox(self.draft.settings.gui_autostart)
+                        .label(autorun)
+                        .on_toggle_maybe(can_edit.then_some(|value| {
+                            Message::FlagChanged(SettingFlag::GuiAutostart, value)
+                        })),
+                )
+                .push(
+                    checkbox(self.draft.settings.start_hidden)
+                        .label(self.t(
+                            "自动启动时隐藏主窗口",
+                            "Hide the window when started automatically",
+                        ))
+                        .on_toggle_maybe((can_edit && !hidden_unavailable).then_some(|value| {
+                            Message::FlagChanged(SettingFlag::StartHidden, value)
+                        })),
+                );
+        if hidden_unavailable {
+            body = body.push(setting_hint(self.t(
+                "先开启登录时启动 BitNet，才能选择隐藏窗口。",
+                "Enable sign-in startup to choose whether the window stays hidden.",
+            )));
+        }
+        body = body.push(
+            checkbox(self.draft.settings.user_autostart)
+                .label(self.t(
+                    "系统登录时启动个人后台",
+                    "Start the personal engine at sign-in",
+                ))
+                .on_toggle_maybe(
+                    can_edit
+                        .then_some(|value| Message::FlagChanged(SettingFlag::UserAutostart, value)),
+                ),
+        );
+        if self.mode == Mode::System {
+            body = body.push(setting_hint(self.t(
+                "切回个人后台后可修改这些启动选项。",
+                "Switch to the personal engine to edit these startup options.",
+            )));
         }
         if !self.tray.as_ref().is_some_and(tray::Tray::is_available) {
-            body = body.push(
-                text(self.t(
-                    "系统托盘不可用，启动时将显示窗口。",
-                    "Startup opens the window while the system tray is unavailable.",
-                ))
-                .size(12),
-            );
+            body = body.push(setting_hint(self.t(
+                "系统托盘不可用，自动启动时也会显示窗口。",
+                "Automatic startup opens the window while the system tray is unavailable.",
+            )));
         }
-        card(body).padding(10).into()
+        card(
+            body.push(Self::rule(false))
+                .push(text(self.t("通知", "Notifications")).font(design::family_medium()))
+                .push(
+                    checkbox(self.draft.settings.notify_errors)
+                        .label(self.t("需要处理时才通知", "Notify when an error needs attention"))
+                        .on_toggle(|value| Message::FlagChanged(SettingFlag::NotifyErrors, value)),
+                ),
+        )
+        .padding(10)
+        .into()
     }
 
     fn check_settings(&self) -> Element<'_, Message> {
@@ -277,27 +312,6 @@ impl App {
                     "认证状态间隔（5–3600 秒）",
                     "Authentication interval (5–3600 s)"
                 ),
-            ),
-            setting_number(
-                NumericSetting::HealthInterval,
-                &self.draft.health_interval,
-                self.t(
-                    "健康探测间隔（30–86400 秒）",
-                    "Health interval (30–86400 s)"
-                ),
-            ),
-            setting_number(
-                NumericSetting::RetryMaximum,
-                &self.draft.retry_maximum,
-                self.t(
-                    "最长重试等待（5–3600 秒）",
-                    "Maximum retry delay (5–3600 s)"
-                ),
-            ),
-            setting_number(
-                NumericSetting::RequestTimeout,
-                &self.draft.request_timeout,
-                self.t("单请求超时（1–60 秒）", "Request timeout (1–60 s)"),
             ),
             setting_row(
                 target_label,
@@ -341,6 +355,49 @@ impl App {
                 .style(design::field)
                 .into(),
         ));
+        let mut advanced = row![
+            toggler(self.settings_checks_advanced)
+                .label(self.t("高级参数", "Advanced parameters"))
+                .text_size(d.typography.body)
+                .on_toggle(|_| Message::ToggleCheckAdvanced),
+            Space::new().width(Length::Fill),
+        ]
+        .align_y(alignment::Vertical::Center);
+        if self.settings_checks_advanced {
+            advanced = advanced.push(
+                button(text(self.t("恢复默认参数", "Restore defaults")).size(d.typography.body))
+                    .on_press_maybe(
+                        (self.snapshot_current && !self.busy)
+                            .then_some(Message::RestoreCheckDefaults),
+                    )
+                    .style(design::flat_button),
+            );
+        }
+        body = body.push(Self::rule(false)).push(advanced);
+        if self.settings_checks_advanced {
+            body = body
+                .push(setting_number(
+                    NumericSetting::HealthInterval,
+                    &self.draft.health_interval,
+                    self.t(
+                        "健康探测间隔（30–86400 秒）",
+                        "Health interval (30–86400 s)",
+                    ),
+                ))
+                .push(setting_number(
+                    NumericSetting::RetryMaximum,
+                    &self.draft.retry_maximum,
+                    self.t(
+                        "最长重试等待（5–3600 秒）",
+                        "Maximum retry delay (5–3600 s)",
+                    ),
+                ))
+                .push(setting_number(
+                    NumericSetting::RequestTimeout,
+                    &self.draft.request_timeout,
+                    self.t("单请求超时（1–60 秒）", "Request timeout (1–60 s)"),
+                ));
+        }
 
         card(body).padding(10).into()
     }
@@ -676,6 +733,13 @@ fn sub_item<'a>(value: &'a str) -> Element<'a, Message> {
             .style(design::text_style(design::muted)),
     ]
     .into()
+}
+
+fn setting_hint(label: &str) -> Element<'_, Message> {
+    text(label)
+        .size(design::get().typography.meta)
+        .style(design::text_style(design::muted))
+        .into()
 }
 
 fn setting_number<'a>(

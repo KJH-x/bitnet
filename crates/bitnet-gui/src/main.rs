@@ -3,8 +3,12 @@
 mod design;
 mod notifications;
 mod settings_actions;
+#[cfg(windows)]
+mod single_instance;
 mod tray;
 mod views;
+#[cfg(windows)]
+mod window_placement;
 
 use bitnet_core::{
     AccountInfo, AppError, AuthState, Command, EngineState, Environment, ErrorCode, NetworkRule,
@@ -25,22 +29,54 @@ use std::{
 use zeroize::Zeroize;
 
 fn main() -> iced::Result {
-    iced::daemon(App::new, App::update, App::view)
-        .settings(iced::Settings {
-            font: design::family(),
-            text_size: iced::Pixels(design::get().typography.body),
-            line_height: iced::widget::text::LineHeight::Relative(
-                design::get().typography.line_height,
-            ),
-            ..iced::Settings::default()
-        })
-        .title(App::title)
-        .theme(App::theme)
-        .style(|_, theme| design::app_style(theme))
-        .subscription(App::subscription)
-        .font(include_bytes!("../assets/fonts/BitNetHanSansSC-Regular-3755.otf").as_slice())
-        .font(include_bytes!("../assets/fonts/BitNetHanSansSC-Medium-3755.otf").as_slice())
-        .run()
+    let launch = Startup::from_args(std::env::args_os().skip(1));
+    #[cfg(windows)]
+    let (_instance, receiver) =
+        match single_instance::acquire(launch.activate_existing(), preview_only()) {
+            Ok(single_instance::Launch::Primary(instance, inbox)) => {
+                (instance, std::sync::Mutex::new(Some(inbox)))
+            }
+            Ok(single_instance::Launch::Existing) => return Ok(()),
+            Err(error) => {
+                single_instance::show_startup_error(&error);
+                std::process::exit(1);
+            }
+        };
+    iced::daemon(
+        move || {
+            let (state, task) = App::new(launch);
+            #[cfg(windows)]
+            let task = if let Some(inbox) = receiver.lock().unwrap().take() {
+                Task::batch([
+                    task,
+                    Task::stream(iced::futures::stream::unfold(inbox, |mut inbox| async {
+                        inbox
+                            .recv()
+                            .await
+                            .map(|show| (Message::ShowExisting(show), inbox))
+                    })),
+                ])
+            } else {
+                task
+            };
+            (state, task)
+        },
+        App::update,
+        App::view,
+    )
+    .settings(iced::Settings {
+        font: design::family(),
+        text_size: iced::Pixels(design::get().typography.body),
+        line_height: iced::widget::text::LineHeight::Relative(design::get().typography.line_height),
+        ..iced::Settings::default()
+    })
+    .title(App::title)
+    .theme(App::theme)
+    .style(|_, theme| design::app_style(theme))
+    .subscription(App::subscription)
+    .font(include_bytes!("../assets/fonts/BitNetHanSansSC-Regular-3755.otf").as_slice())
+    .font(include_bytes!("../assets/fonts/BitNetHanSansSC-Medium-3755.otf").as_slice())
+    .run()
 }
 
 fn preview_only() -> bool {
@@ -65,8 +101,9 @@ enum NetworkSection {
     Profiles,
     Rules,
     RuleEditor,
+    Ipv6,
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HealthDetail {
     Internet,
     Dns,
@@ -100,7 +137,7 @@ impl Page {
             (Self::Settings, false) => "软件设置",
             (Self::Settings, true) => "Settings",
             (Self::Service, false) => "后台服务",
-            (Self::Service, true) => "Server Mode",
+            (Self::Service, true) => "Background Service",
             (Self::Health, false) => "详情",
             (Self::Health, true) => "Details",
             (Self::Statistics, false) => "统计",
@@ -163,6 +200,62 @@ impl From<Mode> for Scope {
             Mode::User => Self::User,
             Mode::System => Self::System,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupVisibility {
+    Show,
+    Automatic,
+    Hide,
+}
+
+#[derive(Clone, Copy)]
+struct Startup {
+    mode: Mode,
+    visibility: StartupVisibility,
+}
+
+impl Startup {
+    fn from_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Self {
+        let (mut system, mut autostart, mut show, mut hide) = (false, false, false, false);
+        for arg in args {
+            match arg.to_str() {
+                Some("--system") => system = true,
+                Some("--autostart") => autostart = true,
+                Some("--show") => show = true,
+                Some("--hidden" | "--silent") => hide = true,
+                _ => {}
+            }
+        }
+        Self {
+            mode: if system { Mode::System } else { Mode::User },
+            visibility: if show {
+                StartupVisibility::Show
+            } else if hide {
+                StartupVisibility::Hide
+            } else if autostart {
+                StartupVisibility::Automatic
+            } else {
+                StartupVisibility::Show
+            },
+        }
+    }
+
+    #[cfg(windows)]
+    fn activate_existing(self) -> bool {
+        matches!(self.visibility, StartupVisibility::Show)
+    }
+}
+
+impl StartupVisibility {
+    fn hidden(self, tray_available: bool, settings: &Settings) -> bool {
+        tray_available
+            && match self {
+                Self::Show => false,
+                Self::Automatic => settings.gui_autostart && settings.start_hidden,
+                Self::Hide => true,
+            }
     }
 }
 
@@ -296,16 +389,24 @@ fn ipv6_adapter(snapshot: &Snapshot) -> Option<&bitnet_core::NetworkInterface> {
     })
 }
 
-fn ipv6_maintenance_target(snapshot: &Snapshot) -> Option<InterfaceTarget> {
-    if !cfg!(windows)
-        || snapshot
-            .capabilities
-            .iter()
-            .any(|item| item == "simulation")
-    {
-        return None;
+fn ipv6_maintenance_target(interface: &bitnet_core::NetworkInterface) -> Option<InterfaceTarget> {
+    (!is_alternate_adapter(interface))
+        .then(|| InterfaceTarget::from_interface(interface).ok())
+        .flatten()
+}
+
+fn ipv6_maintenance_available(snapshot: &Snapshot) -> bool {
+    cfg!(windows) && !preview_only() && !snapshot.capabilities.iter().any(|c| c == "simulation")
+}
+
+fn profile_id_for(profiles: &[bitnet_core::NetworkProfile], name: &str, now: u128) -> String {
+    if let Some(profile) = profiles.iter().find(|profile| profile.name.trim() == name) {
+        return profile.id.clone();
     }
-    InterfaceTarget::from_interface(ipv6_adapter(snapshot)?).ok()
+    (0..=profiles.len())
+        .map(|n| format!("profile-{now}-{n}"))
+        .find(|id| !profiles.iter().any(|profile| profile.id == *id))
+        .expect("at least one candidate is unused")
 }
 
 fn confirmation_target(snapshot: &Snapshot) -> Option<(String, String)> {
@@ -330,6 +431,8 @@ enum Message {
     TrayTick,
     #[cfg(windows)]
     TrayToggleWindow(window::Id, bool),
+    #[cfg(windows)]
+    ShowExisting(single_instance::Show),
     NotificationSent(Result<(), String>),
     CheckUpdates,
     UpdateChecked(u64, Result<UpdateOutcome, AppError>, CheckTrigger),
@@ -341,6 +444,7 @@ enum Message {
     Navigate(Page),
     ModeChanged(Mode),
     ServiceObserved(bitnet_core::ServiceStatus),
+    SetServiceAutostart(bool),
     SwitchPersonal,
     ToggleNetworkAdvanced,
     HealthDetail(Option<HealthDetail>),
@@ -352,6 +456,8 @@ enum Message {
     BeginAutomatic,
     NumberChanged(NumericSetting, String),
     SettingsTabChanged(SettingsTab),
+    ToggleCheckAdvanced,
+    RestoreCheckDefaults,
     OpenHealthEditor,
     HealthEntryChanged(usize, String),
     HealthEntryExpectChanged(usize, HealthCondition),
@@ -386,7 +492,6 @@ enum Message {
     OpenQuickLogin,
     TemporaryLogin,
     RuleNameChanged(String),
-    ProfileIdChanged(String),
     ProfileNameChanged(String),
     ProfileSave,
     ProfileSelect(String),
@@ -417,6 +522,7 @@ enum Message {
     WebLogsFinished(WebAction, Result<(), LaunchError>),
     WindowOpened(window::Id),
     WindowCloseRequested(window::Id),
+    HideWindow,
     TogglePassword,
     ToggleIps,
     RevealTick,
@@ -564,7 +670,6 @@ struct App {
     account_offset: usize,
     quick_login: Option<AccountDraft>,
     rule: RuleDraft,
-    profile_id: String,
     profile_name: String,
     statistics: Option<Statistics>,
     log_viewer_busy: bool,
@@ -575,6 +680,7 @@ struct App {
     confirmation: Option<Confirmation>,
     network_return: Page,
     settings_tab: SettingsTab,
+    settings_checks_advanced: bool,
     health_editor: Option<Vec<HealthTarget>>,
     enabling_automatic: bool,
     alternate_adapters: bool,
@@ -597,8 +703,10 @@ struct App {
     settings_epoch: u64,
     saved_epoch: u64,
     request_epoch: u64,
-    startup_hidden: bool,
+    startup_visibility: StartupVisibility,
     window: Option<window::Id>,
+    #[cfg(windows)]
+    window_hidden: bool,
     tray: Option<tray::Tray>,
     notification_gate: notifications::Gate,
     pending_notification: Option<notifications::Kind>,
@@ -614,19 +722,11 @@ struct App {
 }
 
 impl App {
-    fn new() -> (Self, Task<Message>) {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let mode = if args.iter().any(|s| s == "--system") {
-            Mode::System
-        } else {
-            Mode::User
-        };
+    fn new(startup: Startup) -> (Self, Task<Message>) {
+        let mode = startup.mode;
         let client = Client::new(mode.into());
         let tray = tray::Tray::new().ok();
-        let hide = args
-            .iter()
-            .any(|s| matches!(s.as_str(), "--hidden" | "--silent"));
-        let app = Self {
+        let mut app = Self {
             client,
             mode,
             snapshot: None,
@@ -640,7 +740,6 @@ impl App {
             account_offset: 0,
             quick_login: None,
             rule: RuleDraft::default(),
-            profile_id: String::new(),
             profile_name: String::new(),
             statistics: None,
             log_viewer_busy: false,
@@ -651,6 +750,7 @@ impl App {
             confirmation: None,
             network_return: Page::Status,
             settings_tab: SettingsTab::General,
+            settings_checks_advanced: false,
             health_editor: None,
             enabling_automatic: false,
             alternate_adapters: false,
@@ -673,8 +773,10 @@ impl App {
             settings_epoch: 0,
             saved_epoch: 0,
             request_epoch: 0,
-            startup_hidden: hide,
+            startup_visibility: startup.visibility,
             window: None,
+            #[cfg(windows)]
+            window_hidden: false,
             tray,
             notification_gate: notifications::Gate::default(),
             pending_notification: None,
@@ -686,8 +788,11 @@ impl App {
             skipped_network: None,
             trust_offset: 0,
         };
-        let connection = Task::batch([Self::connect(app.client.clone()), Self::observe_service()]);
-        (app, connection)
+        let mut tasks = vec![Self::connect(app.client.clone()), Self::observe_service()];
+        if app.tray.is_none() || startup.visibility == StartupVisibility::Show {
+            tasks.push(app.open_window());
+        }
+        (app, Task::batch(tasks))
     }
 
     fn connect(client: Client) -> Task<Message> {
@@ -971,7 +1076,7 @@ impl App {
     }
     fn open_window(&mut self) -> Task<Message> {
         if let Some(id) = self.window {
-            return window::gain_focus(id);
+            return Self::focus_window(id);
         }
         let (id, task) = window::open(window::Settings {
             size: iced::Size::new(1120.0, 780.0),
@@ -981,6 +1086,39 @@ impl App {
         });
         self.window = Some(id);
         task.map(Message::WindowOpened)
+    }
+    fn restore_window(&mut self) -> Task<Message> {
+        #[cfg(windows)]
+        {
+            self.window_hidden = false;
+        }
+        self.open_window()
+    }
+    #[cfg(windows)]
+    fn focus_window(id: window::Id) -> Task<Message> {
+        window::run(id, |window| window_placement::restore(window)).discard()
+    }
+    #[cfg(not(windows))]
+    fn focus_window(id: window::Id) -> Task<Message> {
+        window::minimize(id, false).chain(window::gain_focus(id))
+    }
+    fn hide_window(&mut self, id: window::Id) -> Task<Message> {
+        self.password_revealed_until = None;
+        #[cfg(windows)]
+        {
+            self.window_hidden = true;
+            window::set_mode(id, window::Mode::Hidden)
+        }
+        #[cfg(not(windows))]
+        {
+            self.window = None;
+            self.account = AccountDraft::default();
+            self.account_editing = false;
+            self.quick_login = None;
+            self.confirmation = None;
+            self.settings_actions.close_dialog();
+            window::close(id)
+        }
     }
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
         let target = confirmation_target(&snapshot);
@@ -1168,17 +1306,12 @@ impl App {
             return Task::none();
         }
         if let Some(target) = action.ipv6_target() {
-            let actual = self
-                .snapshot
-                .as_ref()
-                .filter(|_| self.snapshot_current)
-                .and_then(ipv6_maintenance_target);
-            if actual.as_ref() != Some(target) {
+            if self.ipv6_maintenance_adapter(target).is_none() {
                 self.error(AppError::new(
                     ErrorCode::Unavailable,
                     self.t(
-                        "当前网卡已更换，请刷新后再试",
-                        "The active adapter changed. Refresh and try again.",
+                        "无法确认这块网卡的 IPv6 状态，请刷新后重试",
+                        "This adapter’s IPv6 setting could not be confirmed. Refresh and try again.",
                     ),
                 ));
                 return Task::none();
@@ -1208,6 +1341,19 @@ impl App {
             Message::MaintenanceCompleted,
         )
     }
+    fn ipv6_maintenance_adapter(
+        &self,
+        target: &InterfaceTarget,
+    ) -> Option<&bitnet_core::NetworkInterface> {
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| self.snapshot_current && ipv6_maintenance_available(snapshot))?;
+        snapshot.interfaces.iter().find(|interface| {
+            interface.ipv6_enabled.is_some()
+                && ipv6_maintenance_target(interface).as_ref() == Some(target)
+        })
+    }
     fn save_settings(&mut self) -> Task<Message> {
         match self.draft.validated(self.english()) {
             Ok(settings) => {
@@ -1228,6 +1374,12 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            #[cfg(windows)]
+            Message::ShowExisting(ack) => {
+                let restore = self.restore_window();
+                let _ = ack.try_send(());
+                restore
+            }
             Message::TrayTick => {
                 if self
                     .tray
@@ -1235,19 +1387,18 @@ impl App {
                     .is_some_and(|tray| !tray.is_starting() && !tray.is_available())
                 {
                     self.tray = None;
-                    if self.window.is_none() && !self.connecting {
-                        return self.open_window();
-                    }
+                    return self.restore_window();
                 }
                 if let Some(action) = self.tray.as_ref().and_then(tray::Tray::poll) {
                     return match action {
-                        tray::Action::Open => self.open_window(),
+                        tray::Action::Open => self.restore_window(),
                         #[cfg(windows)]
                         tray::Action::Toggle => match self.window {
+                            Some(_) if self.window_hidden => self.restore_window(),
                             Some(id) => window::is_minimized(id).map(move |minimized| {
                                 Message::TrayToggleWindow(id, minimized.unwrap_or(false))
                             }),
-                            None => self.open_window(),
+                            None => self.restore_window(),
                         },
                         tray::Action::Check => self.execute(Command::Check),
                         tray::Action::Pause => self.execute(Command::Pause),
@@ -1263,9 +1414,9 @@ impl App {
                     return Task::none();
                 }
                 if minimized {
-                    window::minimize(id, false).chain(window::gain_focus(id))
+                    self.restore_window()
                 } else {
-                    self.update(Message::WindowCloseRequested(id))
+                    self.hide_window(id)
                 }
             }
             Message::Tick => {
@@ -1320,11 +1471,13 @@ impl App {
                         self.connection_error = Some(error);
                     }
                 }
-                let hidden = self
+                let tray_available = self
                     .tray
                     .as_ref()
-                    .is_some_and(|tray| tray.is_starting() || tray.is_available())
-                    && (self.startup_hidden || self.draft.settings.start_hidden);
+                    .is_some_and(|tray| tray.is_starting() || tray.is_available());
+                let hidden = self
+                    .startup_visibility
+                    .hidden(tray_available, &self.draft.settings);
                 if self.window.is_none() && !hidden {
                     self.open_window()
                 } else {
@@ -1483,6 +1636,9 @@ impl App {
                 }
                 Page::Settings => {
                     self.enabling_automatic = false;
+                    if self.page != page {
+                        self.settings_checks_advanced = false;
+                    }
                     self.page = page;
                     self.settings_tab_entered()
                 }
@@ -1516,6 +1672,9 @@ impl App {
             Message::ServiceObserved(service) => {
                 self.native_service = Some(service);
                 Task::none()
+            }
+            Message::SetServiceAutostart(enabled) => {
+                self.maintain(MaintenanceAction::SetAutostart { enabled })
             }
             Message::SwitchPersonal => {
                 if self.busy || self.connecting || self.draft.dirty {
@@ -1701,14 +1860,14 @@ impl App {
                 Task::none()
             }
             Message::Escape => {
-                if self.health_detail.is_some() {
-                    return self.update(Message::HealthDetail(None));
-                }
                 if self.confirmation.is_some()
                     || self.health_editor.is_some()
                     || self.quick_login.is_some()
                 {
                     return self.update(Message::Cancel);
+                }
+                if self.health_detail.is_some() {
+                    return self.update(Message::HealthDetail(None));
                 }
                 if self.settings_actions.close_dialog() {
                     return Task::none();
@@ -1988,8 +2147,25 @@ impl App {
                 Task::none()
             }
             Message::SettingsTabChanged(tab) => {
+                if self.settings_tab != tab {
+                    self.settings_checks_advanced = false;
+                }
                 self.settings_tab = tab;
                 self.settings_tab_entered()
+            }
+            Message::ToggleCheckAdvanced => {
+                self.settings_checks_advanced = !self.settings_checks_advanced;
+                Task::none()
+            }
+            Message::RestoreCheckDefaults => {
+                if self.snapshot_current && !self.busy {
+                    let defaults = Settings::default();
+                    self.draft.health_interval = defaults.health_interval_secs.to_string();
+                    self.draft.retry_maximum = defaults.retry_max_secs.to_string();
+                    self.draft.request_timeout = defaults.request_timeout_secs.to_string();
+                    self.mark_settings_dirty();
+                }
+                Task::none()
             }
             Message::OpenHealthEditor => {
                 self.clear_notice();
@@ -2194,10 +2370,6 @@ impl App {
                 self.trust_offset = offset;
                 Task::none()
             }
-            Message::ProfileIdChanged(value) => {
-                self.profile_id = value;
-                Task::none()
-            }
             Message::ProfileNameChanged(value) => {
                 self.profile_name = value;
                 Task::none()
@@ -2213,9 +2385,18 @@ impl App {
                     ));
                     return Task::none();
                 }
+                let name = self.profile_name.trim();
+                let Some(snapshot) = self.snapshot.as_ref().filter(|_| self.snapshot_current)
+                else {
+                    return Task::none();
+                };
+                if name.is_empty() {
+                    return Task::none();
+                }
+                let id = profile_id_for(&snapshot.settings.profiles, name, bitnet_core::now_ms());
                 self.execute(Command::ProfileSave {
-                    id: self.profile_id.trim().to_owned(),
-                    name: self.profile_name.trim().to_owned(),
+                    id,
+                    name: name.into(),
                 })
             }
             Message::ProfileSelect(id) => {
@@ -2448,25 +2629,31 @@ impl App {
                 Task::none()
             }
             Message::WindowOpened(id) => {
-                if self.window == Some(id) {
-                    Task::none()
+                if self.window != Some(id) {
+                    return window::close(id);
+                }
+                #[cfg(windows)]
+                if !self.window_hidden {
+                    return Self::focus_window(id);
+                }
+                Task::none()
+            }
+            Message::HideWindow => {
+                if let Some(id) = self
+                    .window
+                    .filter(|_| self.tray.as_ref().is_some_and(tray::Tray::is_available))
+                {
+                    self.hide_window(id)
                 } else {
-                    window::close(id)
+                    Task::none()
                 }
             }
             Message::WindowCloseRequested(id) => {
                 if self.window != Some(id) {
                     return Task::none();
                 }
-                self.window = None;
-                self.account = AccountDraft::default();
-                self.account_editing = false;
-                self.quick_login = None;
-                self.confirmation = None;
-                self.settings_actions.close_dialog();
-                self.password_revealed_until = None;
                 if self.tray.as_ref().is_some_and(tray::Tray::is_available) {
-                    window::close(id)
+                    self.hide_window(id)
                 } else {
                     iced::exit()
                 }
@@ -2608,7 +2795,6 @@ mod tests {
             account_offset: 0,
             quick_login: None,
             rule: RuleDraft::default(),
-            profile_id: String::new(),
             profile_name: String::new(),
             statistics: None,
             log_viewer_busy: false,
@@ -2619,6 +2805,7 @@ mod tests {
             confirmation: None,
             network_return: Page::Status,
             settings_tab: SettingsTab::General,
+            settings_checks_advanced: false,
             health_editor: None,
             enabling_automatic: false,
             alternate_adapters: false,
@@ -2641,8 +2828,10 @@ mod tests {
             settings_epoch: 0,
             saved_epoch: 0,
             request_epoch: 0,
-            startup_hidden: false,
+            startup_visibility: StartupVisibility::Show,
             window: None,
+            #[cfg(windows)]
+            window_hidden: false,
             tray: None,
             notification_gate: notifications::Gate::default(),
             pending_notification: None,
@@ -2654,6 +2843,48 @@ mod tests {
             skipped_network: None,
             trust_offset: 0,
         }
+    }
+    #[test]
+    fn startup_intent_keeps_manual_and_automatic_visibility_separate() {
+        let parse =
+            |args: &[&str]| Startup::from_args(args.iter().copied().map(std::ffi::OsString::from));
+        let enabled = Settings {
+            start_hidden: true,
+            gui_autostart: true,
+            ..Settings::default()
+        };
+        let disabled = Settings {
+            start_hidden: true,
+            ..Settings::default()
+        };
+        assert!(!parse(&[]).visibility.hidden(true, &enabled));
+        assert!(parse(&["--silent"]).visibility.hidden(true, &disabled));
+        assert!(parse(&["--autostart"]).visibility.hidden(true, &enabled));
+        assert!(!parse(&["--autostart"]).visibility.hidden(true, &disabled));
+        assert!(!parse(&["--autostart"])
+            .visibility
+            .hidden(true, &Settings::default()));
+        assert!(!parse(&["--autostart", "--silent", "--show"])
+            .visibility
+            .hidden(true, &enabled));
+        assert!(!parse(&["--hidden"]).visibility.hidden(false, &enabled));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn closing_to_tray_preserves_page_dialog_and_window_identity() {
+        let mut app = fixture();
+        let id = window::Id::unique();
+        app.window = Some(id);
+        app.page = Page::Networks;
+        app.confirmation = Some(Confirmation::Logout);
+        let _ = app.hide_window(id);
+        assert!(app.window_hidden);
+        assert_eq!(app.window, Some(id));
+        let _ = app.restore_window();
+        assert!(!app.window_hidden);
+        assert_eq!(app.window, Some(id));
+        assert_eq!(app.page, Page::Networks);
+        assert!(matches!(app.confirmation, Some(Confirmation::Logout)));
     }
     #[test]
     fn message_debug_never_exposes_password() {
@@ -2942,6 +3173,41 @@ mod tests {
         assert!(app.draft.settings.start_hidden);
         assert!(!app.busy);
     }
+
+    #[test]
+    fn profile_ids_preserve_legacy_keys_and_avoid_existing_ids() {
+        let settings = Settings::default();
+        let profile = |id: &str, name: &str| bitnet_core::NetworkProfile {
+            id: id.into(),
+            name: name.into(),
+            gateway: settings.gateway.clone(),
+            interface_id: None,
+            interface_ssid: None,
+            account_id: None,
+            rules: Vec::new(),
+        };
+        let profiles = [
+            profile("legacy-campus", "校园"),
+            profile("profile-42-0", "宿舍"),
+        ];
+        assert_eq!(profile_id_for(&profiles, "校园", 42), "legacy-campus");
+        assert_eq!(profile_id_for(&profiles, "办公室", 42), "profile-42-1");
+    }
+
+    #[test]
+    fn escape_leaves_ipv6_details_open_when_canceling_a_confirmation() {
+        let mut app = fixture();
+        app.health_detail = Some(HealthDetail::Ipv6);
+        app.confirmation = Some(Confirmation::Maintenance(MaintenanceAction::ResetIpv6 {
+            interface: InterfaceTarget::parse("00112233-4455-6677-8899-aabbccddeeff@2").unwrap(),
+        }));
+        let _ = app.update(Message::Escape);
+        assert!(app.confirmation.is_none());
+        assert_eq!(app.health_detail, Some(HealthDetail::Ipv6));
+        let _ = app.update(Message::Escape);
+        assert!(app.health_detail.is_none());
+    }
+
     #[test]
     fn status_sent_before_a_command_cannot_replace_its_result() {
         let mut app = fixture();

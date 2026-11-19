@@ -87,6 +87,10 @@ launch:
   !insertmacro RequireRegularPath "$Payload\bitctl.exe"
   !insertmacro RequireRegularPath "$Payload\bitmaint.exe"
   ${GetParameters} $Args
+  ${GetOptions} $Args "--autostart" $0
+  ${IfNot} ${Errors}
+    StrCpy $Options "--autostart"
+  ${EndIf}
   ${GetOptions} $Args "--silent" $0
   ${IfNot} ${Errors}
     StrCpy $Options "--silent"
@@ -94,6 +98,10 @@ launch:
   ${GetOptions} $Args "--hidden" $0
   ${IfNot} ${Errors}
     StrCpy $Options "--hidden"
+  ${EndIf}
+  ${GetOptions} $Args "--show" $0
+  ${IfNot} ${Errors}
+    StrCpy $Options "--show"
   ${EndIf}
   SetOutPath "$Payload"
   ClearErrors
