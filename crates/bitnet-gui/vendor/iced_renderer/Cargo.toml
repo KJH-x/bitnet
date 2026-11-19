@@ -1,0 +1,40 @@
+[package]
+name = "iced_renderer"
+version = "0.15.0-dev"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+repository = "https://github.com/iced-rs/iced"
+description = "BitNet's Iced renderer adapter using Vello CPU"
+publish = false
+
+[features]
+wgpu = ["iced_wgpu/default"]
+wgpu-bare = ["dep:iced_wgpu"]
+# Iced's pinned top-level feature forwards to this slot. No TinySkia backend is linked.
+tiny-skia = ["vello-cpu"]
+vello-cpu = ["dep:iced_debug", "dep:softbuffer", "dep:vello_cpu", "dep:bytemuck", "dep:rustc-hash"]
+multithreading = ["vello-cpu", "vello_cpu/multithreading"]
+image = ["iced_graphics/image", "iced_wgpu?/image"]
+svg = ["iced_graphics/svg", "dep:resvg", "iced_wgpu?/svg"]
+svg-text = ["svg", "resvg/text", "resvg/system-fonts", "resvg/memmap-fonts", "iced_wgpu?/svg-text"]
+svg-raster-images = ["svg", "resvg/raster-images", "iced_wgpu?/svg-raster-images"]
+geometry = ["iced_graphics/geometry", "iced_wgpu?/geometry"]
+web-colors = ["iced_wgpu?/web-colors"]
+webgl = ["iced_wgpu?/webgl"]
+fira-sans = ["iced_graphics/fira-sans"]
+strict-assertions = ["iced_wgpu?/strict-assertions"]
+x11 = ["softbuffer?/x11", "softbuffer?/x11-dlopen"]
+wayland = ["softbuffer?/wayland", "softbuffer?/wayland-dlopen"]
+
+[dependencies]
+iced_debug = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34", optional = true }
+iced_graphics = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34" }
+iced_wgpu = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34", default-features = false, optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+log = "0.4"
+resvg = { version = "0.45", default-features = false, optional = true }
+rustc-hash = { version = "2", optional = true }
+softbuffer = { version = "0.4", default-features = false, optional = true }
+thiserror = "2"
+vello_cpu = { version = "0.4", default-features = false, features = ["std", "u8_pipeline"], optional = true }

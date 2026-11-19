@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["crates/bitnet-gui/vendor/iced_renderer"]
 
 [workspace.package]
 version = "0.1.5"
@@ -29,3 +30,6 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[patch."https://github.com/iced-rs/iced.git"]
+iced_renderer = { path = "crates/bitnet-gui/vendor/iced_renderer" }
