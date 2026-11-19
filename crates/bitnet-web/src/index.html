@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BitNet · 日志</title>
+  <link rel="stylesheet" href="/app.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="title">BitNet 日志</h1>
+    <button id="language" type="button">English</button>
+    <button id="stop" type="button">停止服务</button>
+  </header>
+  <section aria-labelledby="title">
+    <div class="tools">
+      <label><span id="search-label">筛选</span> <input id="search" type="search" maxlength="128"></label>
+      <button id="refresh" type="button">刷新</button>
+      <button id="export" type="button" disabled>导出 JSON</button>
+      <button id="copy" type="button" disabled>复制 JSON</button>
+    </div>
+    <p id="notice" role="status"></p>
+    <div id="entries"></div>
+    <nav aria-label="分页" class="pages">
+      <button id="previous" type="button" disabled>上一页</button>
+      <span id="page"></span>
+      <button id="next" type="button" disabled>下一页</button>
+      <button id="earlier" type="button" hidden>加载更早记录</button>
+    </nav>
+  </section>
+</main>
+</body>
+</html>

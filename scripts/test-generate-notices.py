@@ -41,6 +41,44 @@ class NoticeTests(unittest.TestCase):
         }
         self.assertEqual(NOTICES.selected_packages(metadata), {"app", "normal", "build"})
 
+    def test_notices_include_active_dependencies_from_all_matching_sources(self):
+        (self.root / "LICENSE").write_text("Project license\n", encoding="utf-8")
+        gateway = self.root / "crates" / "bitnet-gateway"
+        gateway.mkdir(parents=True)
+        (gateway / "NOTICE").write_text("Project notice\n", encoding="utf-8")
+
+        def package(package_id, name):
+            folder = self.root / package_id
+            folder.mkdir()
+            (folder / "LICENSE").write_text(f"{package_id} license\n", encoding="utf-8")
+            return {
+                "id": package_id, "name": name, "version": "1.0.0",
+                "source": None, "manifest_path": str(folder / "Cargo.toml"),
+                "license": "MIT",
+            }
+
+        packages = [
+            package("app", "app"), package("library-one", "library"),
+            package("library-two", "library"), package("unused", "unused"),
+        ]
+        dependencies = [
+            {"pkg": p["id"], "dep_kinds": [{"kind": None}]}
+            for p in packages[1:]
+        ]
+        metadata = {
+            "workspace_root": str(self.root), "workspace_members": ["app"],
+            "packages": packages,
+            "resolve": {"nodes": [
+                {"id": "app", "deps": dependencies, "features": []},
+                *({"id": p["id"], "deps": [], "features": []} for p in packages[1:]),
+            ]},
+        }
+        active = {("app", "1.0.0"), ("library", "1.0.0")}
+        report = NOTICES.collect(metadata, "fixture", [], active)
+        self.assertEqual([p["name"] for p in report["packages"]], ["app", "library", "library"])
+        with self.assertRaisesRegex(ValueError, "missing from metadata"):
+            NOTICES.collect(metadata, "fixture", [], active | {("missing", "1.0.0")})
+
     def test_nested_documents_keep_original_characters_and_raw_hash(self):
         nested = self.root / "vendor/licenses"
         nested.mkdir(parents=True)
@@ -135,6 +173,39 @@ class NoticeTests(unittest.TestCase):
             self.assertEqual(entry["license_files"][0]["provenance"]["commit"], "c" * 40)
         finally:
             NOTICES.PROJECT = original_project
+
+    def test_bundled_font_notice_checks_font_bytes_and_license(self):
+        folder = self.root / "crates/bitnet-gui/assets/fonts"
+        folder.mkdir(parents=True)
+        original = b"Original font copyright and OFL text\n"
+        (folder / "LICENSE.txt").write_bytes(original)
+        fonts = []
+        for name in ("Regular", "Medium"):
+            raw = name.encode()
+            filename = name + ".otf"
+            (folder / filename).write_bytes(raw)
+            fonts.append({
+                "file": filename, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                "source_url": "https://example.invalid/font.otf", "source_sha256": "0" * 64,
+            })
+        record = {
+            "name": "Bundled font", "version": "1", "spdx": "OFL-1.1",
+            "repository": "https://example.invalid/font", "commit": "a" * 40,
+            "license_file": "LICENSE.txt", "license_sha256": hashlib.sha256(original).hexdigest(),
+            "license_url": "https://example.invalid/LICENSE.txt", "files": fonts,
+        }
+        (folder / "manifest.json").write_text(json.dumps(record), encoding="utf-8")
+        documents = {}
+        result = NOTICES.bundled_font_notices(self.root, documents)
+        self.assertEqual(result[0]["spdx"], "OFL-1.1")
+        self.assertEqual(result[0]["assets"], fonts)
+        self.assertEqual(documents[record["license_sha256"]]["text"], original.decode())
+        (folder / "Regular.otf").write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "SHA256/size mismatch"):
+            NOTICES.bundled_font_notices(self.root, {})
+        (folder / "LICENSE.txt").write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "license SHA256 mismatch"):
+            NOTICES.bundled_font_notices(self.root, {})
 
 
 if __name__ == "__main__":

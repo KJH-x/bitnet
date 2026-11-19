@@ -228,12 +228,21 @@ impl UpdateConfig {
     }
 
     pub async fn check_available(&self) -> Result<Option<Manifest>, AppError> {
-        let manifest = self.fetch_verified(false).await?;
-        let target = Version::parse(&manifest.version)
+        Ok(self
+            .check_available_release()
+            .await?
+            .map(|release| release.manifest))
+    }
+
+    pub(super) async fn check_available_release(
+        &self,
+    ) -> Result<Option<VerifiedRelease>, AppError> {
+        let release = self.fetch_verified_release(false).await?;
+        let target = Version::parse(&release.manifest.version)
             .map_err(|_| fail(ErrorCode::Incompatible, "Signed version is invalid"))?;
         let current = Version::parse(APP_VERSION)
             .map_err(|_| fail(ErrorCode::Internal, "Installed version is invalid"))?;
-        Ok((target > current).then_some(manifest))
+        Ok((target > current).then_some(release))
     }
 
     async fn fetch_verified(&self, require_newer: bool) -> Result<Manifest, AppError> {

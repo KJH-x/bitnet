@@ -17,10 +17,22 @@ use tokio::sync::{mpsc, watch};
 
 const SYSTEM_AUTHENTICATION_MESSAGE: &str = "BIT-mobile 由系统认证，无需校园门户登录或注销";
 const VERIFICATION_STEP_TIMEOUT_SECS: u64 = 4;
+const ENGINE_LOG_FILES: [&str; 5] = [
+    "engine.jsonl",
+    "engine.1.jsonl",
+    "engine.2.jsonl",
+    "engine.3.jsonl",
+    "engine.4.jsonl",
+];
 
 enum Vault {
     Real(CredentialStore),
     Simulation,
+}
+#[derive(Clone, Copy)]
+enum AccountActivation {
+    Verify,
+    Switch { confirmed: bool },
 }
 pub struct Engine {
     snapshot: Snapshot,
@@ -69,7 +81,10 @@ impl Engine {
         snapshot.service = bitnet_platform::service::status();
         snapshot.capabilities.push("enable_automatic".into());
         snapshot.capabilities.push("verify_account".into());
+        snapshot.capabilities.push("switch_account".into());
         snapshot.capabilities.push("login_once".into());
+        snapshot.capabilities.push("network_permissions".into());
+        snapshot.capabilities.push("clear_logs".into());
         let (vault, accounts) = if simulation {
             snapshot.capabilities.push("simulation".into());
             (
@@ -170,8 +185,19 @@ impl Engine {
             _ => "info",
         };
         let details = serde_json::json!({"level":level,"state":self.snapshot.state,"environment":self.snapshot.environment,"auth_state":self.snapshot.session.auth,"network":network_fingerprint(&self.snapshot),"generation":self.snapshot.network_generation,"retry_count":self.snapshot.retry_count,"next_retry_at":self.snapshot.next_retry_at,"error_code":self.snapshot.last_error.as_ref().map(|e|e.code)});
+        self.write_event(level, kind, message, account, duration, &details);
+    }
+    fn write_event(
+        &self,
+        level: &str,
+        kind: &str,
+        message: &str,
+        account: Option<&str>,
+        duration: Option<u64>,
+        details: &serde_json::Value,
+    ) {
         if let Some(history) = &self.history {
-            let _ = history.record_details(kind, message, account, duration, &details);
+            let _ = history.record_details(kind, message, account, duration, details);
         }
         if log_rank(level) > log_rank(&self.snapshot.settings.log_level) {
             return;
@@ -181,17 +207,16 @@ impl Engine {
             crate::os_log::write(level, message);
         }
         let _ = std::fs::create_dir_all(&self.paths.log_dir);
-        let path = self.paths.log_dir.join("engine.jsonl");
+        let path = self.paths.log_dir.join(ENGINE_LOG_FILES[0]);
         if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
-            for n in (1..4).rev() {
-                let from = self.paths.log_dir.join(format!("engine.{n}.jsonl"));
-                let to = self.paths.log_dir.join(format!("engine.{}.jsonl", n + 1));
+            for files in ENGINE_LOG_FILES.windows(2).rev() {
+                let from = self.paths.log_dir.join(files[0]);
+                let to = self.paths.log_dir.join(files[1]);
                 if to.exists() {
                     let _ = std::fs::remove_file(&to);
                 }
                 let _ = std::fs::rename(from, to);
             }
-            let _ = std::fs::rename(&path, self.paths.log_dir.join("engine.1.jsonl"));
         }
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
             let _ = writeln!(file, "{value}");
@@ -208,6 +233,9 @@ impl Engine {
         }
     }
     fn observe_online(&mut self) {
+        if self.snapshot.health.checked_at.is_none() {
+            self.next_health = 0;
+        }
         let now = std::time::Instant::now();
         if self.online_window.is_some_and(|(_, last)| {
             now.duration_since(last).as_secs()
@@ -309,6 +337,11 @@ impl Engine {
                 ssid: None,
                 virtual_adapter: false,
                 alternate_adapter: false,
+                dns: Vec::new(),
+                dns_config: None,
+                ipv6: Vec::new(),
+                ipv4_mode: None,
+                ipv6_enabled: None,
             }]
         } else {
             bitnet_platform::network::interfaces()?
@@ -323,6 +356,13 @@ impl Engine {
             interfaces
                 .iter()
                 .find(|i| &i.id == id)
+                .filter(|i| {
+                    self.snapshot
+                        .settings
+                        .interface_ssid
+                        .as_ref()
+                        .is_none_or(|ssid| i.ssid.as_ref() == Some(ssid))
+                })
                 .and_then(|i| i.binding())
         } else {
             let ip = url::Url::parse(&self.snapshot.settings.gateway.base_url)
@@ -333,8 +373,38 @@ impl Engine {
                 })?;
             bitnet_platform::network::preferred_binding(ip)?
         };
-        let network_changed =
-            self.snapshot.active_binding != binding || self.snapshot.interfaces != interfaces;
+        let previous_interfaces = &self.snapshot.interfaces;
+        let network_changed = self.snapshot.active_binding != binding
+            || previous_interfaces.len() != interfaces.len()
+            || previous_interfaces
+                .iter()
+                .zip(&interfaces)
+                .any(|(old, current)| {
+                    old.id != current.id
+                        || old.name != current.name
+                        || old.index != current.index
+                        || old.ipv4 != current.ipv4
+                        || old.gateway != current.gateway
+                        || old.up != current.up
+                        || old.wireless != current.wireless
+                        || old.ssid != current.ssid
+                        || old.virtual_adapter != current.virtual_adapter
+                        || old.alternate_adapter != current.alternate_adapter
+                });
+        let interface = binding.as_ref().and_then(|binding| {
+            interfaces.iter().find(|candidate| {
+                candidate.id == binding.interface_id && candidate.index == binding.interface_index
+            })
+        });
+        let previous_interface = active_interface(&self.snapshot);
+        let ipv6_changed = previous_interfaces
+            .iter()
+            .zip(&interfaces)
+            .any(|(old, current)| {
+                old.ipv6 != current.ipv6 || old.ipv6_enabled != current.ipv6_enabled
+            });
+        let dns_changed = interface.map(|i| (&i.dns, &i.dns_config))
+            != previous_interface.map(|i| (&i.dns, &i.dns_config));
         if network_changed {
             self.close_online_window();
             if self.snapshot.session.auth == AuthState::Authenticated
@@ -348,6 +418,26 @@ impl Engine {
             self.snapshot.next_retry_at = None;
             self.snapshot.session = GatewaySession::default();
             self.snapshot.health = HealthStatus::default();
+        } else if ipv6_changed {
+            self.snapshot.health.ipv6_probes.clear();
+            self.snapshot.health.ipv6_checked_at = None;
+            // Invalidate proof from the old address set without discarding the
+            // result of the Internet probes themselves.
+            for probe in &mut self.snapshot.health.health_probes {
+                probe.used_ipv6 = None;
+                probe.on_selected_interface = None;
+            }
+        }
+        if network_changed || ipv6_changed || dns_changed {
+            self.next_health = 0;
+        }
+        if !self.simulation {
+            crate::health_probe::update_ipv6_status(
+                &mut self.snapshot.health,
+                interface,
+                &interfaces,
+                &self.snapshot.settings.language,
+            );
         }
         self.snapshot.interfaces = interfaces;
         self.snapshot.active_binding = binding;
@@ -378,6 +468,7 @@ impl Engine {
             }
         }
         self.snapshot.network_trusted = !system_authentication
+            && !network_permission_denied(&self.snapshot)
             && (self.simulation
                 || network_fingerprint(&self.snapshot)
                     .is_some_and(|key| self.snapshot.settings.trusted_networks.contains(&key)));
@@ -422,7 +513,17 @@ impl Engine {
             self.snapshot.retry_count = 0;
             self.snapshot.next_retry_at = None;
             self.snapshot.session = GatewaySession::default();
-            self.snapshot.health = HealthStatus::default();
+            let old_health = std::mem::take(&mut self.snapshot.health);
+            self.snapshot.health = HealthStatus {
+                ipv6: old_health.ipv6,
+                ipv6_status: old_health.ipv6_status,
+                ipv6_detail: old_health.ipv6_detail,
+                ipv6_checked_at: old_health.ipv6_checked_at,
+                ipv6_probes: old_health.ipv6_probes,
+                local_ipv6: old_health.local_ipv6,
+                public_ipv6: old_health.public_ipv6,
+                ..HealthStatus::default()
+            };
             self.snapshot.environment = Environment::NonCampus;
             self.snapshot.state = EngineState::Idle;
             if system_authentication {
@@ -518,15 +619,7 @@ impl Engine {
             ));
         };
         let mut settings = self.snapshot.settings.clone();
-        if !settings.trusted_networks.contains(&key) {
-            if settings.trusted_networks.len() >= 128 {
-                return Err(AppError::new(
-                    ErrorCode::InvalidInput,
-                    "已确认网络过多，请先删除旧记录",
-                ));
-            }
-            settings.trusted_networks.push(key);
-        }
+        remember_network(&self.snapshot, &mut settings, key, true)?;
         settings.automatic = true;
         if settings != self.snapshot.settings {
             settings.revision = settings.revision.saturating_add(1);
@@ -586,10 +679,12 @@ impl Engine {
         } else if allow_login && self.snapshot.settings.automatic && !self.snapshot.network_trusted
         {
             self.snapshot.state = EngineState::Idle;
-            self.snapshot.last_error = Some(AppError::new(
-                ErrorCode::ConfirmationRequired,
-                "此网络尚未确认；请先信任当前网络再启用自动登录",
-            ));
+            self.snapshot.last_error = (!network_permission_denied(&self.snapshot)).then(|| {
+                AppError::new(
+                    ErrorCode::ConfirmationRequired,
+                    "此网络尚未确认；请先信任当前网络再启用自动登录",
+                )
+            });
         } else if allow_login && self.snapshot.settings.automatic {
             let selected = self
                 .selected(self.snapshot.active_binding.as_ref(), None)?
@@ -807,10 +902,11 @@ impl Engine {
         Ok(())
     }
 
-    async fn verify_account(
+    async fn activate_account(
         &mut self,
         candidate: AccountSecret,
         expected_network: &str,
+        activation: AccountActivation,
     ) -> Result<(), AppError> {
         validate_account_id(&candidate.id)?;
         GatewayClient::validate_credentials(&candidate.username, candidate.password.expose())
@@ -851,6 +947,31 @@ impl Engine {
         }
         self.verification_binding(expected_network, Some(&binding))
             .await?;
+        if let AccountActivation::Switch { confirmed } = activation {
+            if original.auth == AuthState::Authenticated
+                && original.username.as_deref() == Some(&candidate.username)
+            {
+                self.select_saved_account(&candidate.id)?;
+                self.snapshot.session = original;
+                self.snapshot.verification_hold = false;
+                self.snapshot.last_error = None;
+                self.next_check = 0;
+                self.reconcile_auth(false).await?;
+                self.event(
+                    "account_selected",
+                    "已选中当前在线的账户",
+                    Some(&candidate.id),
+                    None,
+                );
+                return Ok(());
+            }
+            if original.auth == AuthState::Authenticated && !confirmed {
+                return Err(AppError::new(
+                    ErrorCode::ConfirmationRequired,
+                    "当前账户已在线，请确认退出后再切换账户。远程桌面可能因此断开",
+                ));
+            }
+        }
         let mut previous_accounts = stored_accounts
             .as_deref()
             .unwrap_or(&self.accounts)
@@ -910,9 +1031,13 @@ impl Engine {
                 } else {
                     "未确认恢复原会话，自动认证已暂停"
                 };
+                let operation = match activation {
+                    AccountActivation::Verify => "账户验证失败，凭据未保存",
+                    AccountActivation::Switch { .. } => "账户切换失败",
+                };
                 let error = AppError::new(
                     error.code,
-                    format!("账户验证失败，凭据未保存。{status}。{}", error.message),
+                    format!("{operation}。{status}。{}", error.message),
                 );
                 self.snapshot.last_error = Some(error.clone());
                 self.event("account_verification_failed", &error.message, None, None);
@@ -927,7 +1052,11 @@ impl Engine {
         self.snapshot.retry_count = 0;
         self.snapshot.next_retry_at = None;
         self.next_check = 0;
-        if let Err(error) = self.save_verified_account(candidate) {
+        let save = match activation {
+            AccountActivation::Verify => self.save_verified_account(candidate),
+            AccountActivation::Switch { .. } => self.select_saved_account(&candidate.id),
+        };
+        if let Err(error) = save {
             self.snapshot.last_error = Some(error.clone());
             self.emit();
             return Err(error);
@@ -936,10 +1065,31 @@ impl Engine {
         self.snapshot.last_error = None;
         self.event(
             "login_success",
-            "新凭据认证成功并已复核",
+            match activation {
+                AccountActivation::Verify => "新凭据认证成功并已复核",
+                AccountActivation::Switch { .. } => "已切换账户并确认登录",
+            },
             self.snapshot.settings.selected_account.as_deref(),
             Some(started.elapsed().as_millis() as u64),
         );
+        Ok(())
+    }
+
+    fn select_saved_account(&mut self, id: &str) -> Result<(), AppError> {
+        let mut settings = self.snapshot.settings.clone();
+        settings.selected_account = Some(id.to_owned());
+        settings.blocked_accounts.retain(|blocked| blocked != id);
+        settings.revision = settings.revision.saturating_add(1);
+        persistence::write_settings(&self.paths.config_file, &settings).map_err(|_| {
+            AppError::new(
+                ErrorCode::Unavailable,
+                "账户已登录，但当前账户设置保存失败，请检查存储后重试",
+            )
+        })?;
+        self.snapshot.settings = settings;
+        if self.failed_credential.as_deref() == Some(id) {
+            self.failed_credential = None;
+        }
         Ok(())
     }
 
@@ -1108,7 +1258,9 @@ impl Engine {
         match command {
             Command::Status => {}
             Command::Check => {
-                self.check(true).await?;
+                let result = self.check(true).await;
+                self.health_check().await;
+                result?;
             }
             Command::Pause => {
                 self.snapshot.settings.paused = true;
@@ -1127,6 +1279,89 @@ impl Engine {
             Command::EnableAutomatic { expected_network } => {
                 self.enable_automatic(&expected_network).await?;
             }
+            Command::SetNetworkPermission {
+                expected_network,
+                allow,
+            } => {
+                self.check(false).await?;
+                if self.snapshot.environment == Environment::NonCampus
+                    || self.snapshot.session.auth == AuthState::Unknown
+                {
+                    return Err(AppError::new(
+                        ErrorCode::Network,
+                        "当前网络不可用于校园网登录",
+                    ));
+                }
+                let generation = self.snapshot.network_generation;
+                self.refresh_network().await?;
+                if generation != self.snapshot.network_generation
+                    || network_fingerprint(&self.snapshot).as_deref() != Some(&expected_network)
+                    || uses_system_authentication(&self.snapshot)
+                    || ignored_network(&self.snapshot.settings, active_interface(&self.snapshot))
+                {
+                    return Err(AppError::new(
+                        ErrorCode::ConfirmationRequired,
+                        "当前网络已变化，请重新确认",
+                    ));
+                }
+                let mut settings = self.snapshot.settings.clone();
+                remember_network(
+                    &self.snapshot,
+                    &mut settings,
+                    expected_network.clone(),
+                    allow,
+                )?;
+                settings.revision = settings.revision.saturating_add(1);
+                persistence::write_settings(&self.paths.config_file, &settings)?;
+                self.snapshot.settings = settings;
+                self.snapshot.network_trusted = allow;
+                self.snapshot.last_error = None;
+                self.next_check = 0;
+                self.event(
+                    "network_trust",
+                    if allow {
+                        "已允许在当前网络自动登录"
+                    } else {
+                        "已拒绝在当前网络自动登录"
+                    },
+                    None,
+                    None,
+                );
+                if allow {
+                    let login = async {
+                        self.check(false).await?;
+                        if generation != self.snapshot.network_generation
+                            || network_fingerprint(&self.snapshot).as_deref()
+                                != Some(&expected_network)
+                            || !self.snapshot.network_trusted
+                        {
+                            return Err(verification_network_changed());
+                        }
+                        self.reconcile_auth(true).await
+                    };
+                    if let Err(mut error) = login.await {
+                        error.message =
+                            format!("网络信任已保存。本次登录未完成：{}", error.message);
+                        return Err(error);
+                    }
+                }
+            }
+            Command::ForgetNetworkPermission { fingerprint } => {
+                let mut settings = self.snapshot.settings.clone();
+                settings
+                    .trusted_networks
+                    .retain(|known| known != &fingerprint);
+                settings
+                    .network_permissions
+                    .retain(|record| record.fingerprint != fingerprint);
+                if settings != self.snapshot.settings {
+                    settings.revision = settings.revision.saturating_add(1);
+                    persistence::write_settings(&self.paths.config_file, &settings)?;
+                    self.snapshot.settings = settings;
+                    self.refresh_network().await?;
+                    self.next_check = 0;
+                }
+            }
             Command::TrustNetwork { trusted } => {
                 self.check(false).await?;
                 if uses_system_authentication(&self.snapshot) {
@@ -1138,20 +1373,18 @@ impl Engine {
                 let key = network_fingerprint(&self.snapshot).ok_or_else(|| {
                     AppError::new(ErrorCode::Network, "请先连接网络并确认认证网关可用")
                 })?;
-                self.snapshot
-                    .settings
-                    .trusted_networks
-                    .retain(|known| known != &key);
+                let mut settings = self.snapshot.settings.clone();
                 if trusted {
-                    if self.snapshot.settings.trusted_networks.len() >= 128 {
-                        return Err(AppError::new(
-                            ErrorCode::InvalidInput,
-                            "已确认网络过多，请先删除旧记录",
-                        ));
-                    }
-                    self.snapshot.settings.trusted_networks.push(key);
+                    remember_network(&self.snapshot, &mut settings, key, true)?;
+                } else {
+                    settings.trusted_networks.retain(|known| known != &key);
+                    settings
+                        .network_permissions
+                        .retain(|record| record.fingerprint != key);
                 }
-                self.persist()?;
+                settings.revision = settings.revision.saturating_add(1);
+                persistence::write_settings(&self.paths.config_file, &settings)?;
+                self.snapshot.settings = settings;
                 self.snapshot.network_trusted = trusted;
                 self.next_check = 0;
                 self.event(
@@ -1183,6 +1416,7 @@ impl Engine {
                     name,
                     gateway: settings.gateway.clone(),
                     interface_id: settings.interface_id.clone(),
+                    interface_ssid: settings.interface_ssid.clone(),
                     account_id: settings.selected_account.clone(),
                     rules: settings.rules.clone(),
                 });
@@ -1214,6 +1448,7 @@ impl Engine {
                     GatewayClient::new(profile.gateway.clone()).map_err(|e| e.into_app_error())?;
                 self.snapshot.settings.gateway = profile.gateway;
                 self.snapshot.settings.interface_id = profile.interface_id;
+                self.snapshot.settings.interface_ssid = profile.interface_ssid;
                 self.snapshot.settings.selected_account = profile.account_id;
                 self.snapshot.settings.rules = profile.rules;
                 self.snapshot.settings.active_profile = Some(id);
@@ -1376,13 +1611,14 @@ impl Engine {
                 password,
                 expected_network,
             } => {
-                self.verify_account(
+                self.activate_account(
                     AccountSecret {
                         id,
                         username,
                         password,
                     },
                     &expected_network,
+                    AccountActivation::Verify,
                 )
                 .await?;
             }
@@ -1416,6 +1652,35 @@ impl Engine {
                 self.failed_credential = None;
                 self.next_check = 0;
             }
+            Command::SwitchAccount {
+                id,
+                expected_network,
+                expected_scope,
+                expected_revision,
+                confirmed,
+            } => {
+                if self.snapshot.scope != expected_scope
+                    || self.snapshot.settings.revision != expected_revision
+                {
+                    return Err(AppError::new(
+                        ErrorCode::Busy,
+                        "账户或后台设置已变化，请刷新后重新选择",
+                    ));
+                }
+                let candidate = self
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == id)
+                    .filter(|account| !account.password.is_empty())
+                    .cloned()
+                    .ok_or_else(|| AppError::new(ErrorCode::Credentials, "保存的账户已不可用"))?;
+                self.activate_account(
+                    candidate,
+                    &expected_network,
+                    AccountActivation::Switch { confirmed },
+                )
+                .await?;
+            }
             Command::SettingsPut {
                 mut settings,
                 expected_revision,
@@ -1439,9 +1704,13 @@ impl Engine {
                 // Runtime safety intent is not an importable preference.
                 settings.blocked_accounts = self.snapshot.settings.blocked_accounts.clone();
                 settings.paused = self.snapshot.settings.paused;
+                settings.network_permissions = self.snapshot.settings.network_permissions.clone();
                 settings
                     .trusted_networks
                     .retain(|key| self.snapshot.settings.trusted_networks.contains(key));
+                settings.network_permissions.retain(|record| {
+                    !record.allowed || settings.trusted_networks.contains(&record.fingerprint)
+                });
                 let gateway =
                     GatewayClient::new(settings.gateway.clone()).map_err(|e| e.into_app_error())?;
                 if self.snapshot.scope == Scope::User {
@@ -1479,6 +1748,15 @@ impl Engine {
                 }
                 settings.revision = self.snapshot.settings.revision.saturating_add(1);
                 persistence::write_settings(&self.paths.config_file, &settings)?;
+                if settings.health_targets != self.snapshot.settings.health_targets
+                    || settings.ipv6_targets != self.snapshot.settings.ipv6_targets
+                    || settings.health_expectations != self.snapshot.settings.health_expectations
+                    || settings.request_timeout_secs != self.snapshot.settings.request_timeout_secs
+                    || settings.language != self.snapshot.settings.language
+                {
+                    self.snapshot.health = HealthStatus::default();
+                    self.next_health = 0;
+                }
                 self.snapshot.settings = settings;
                 self.gateway = gateway;
                 self.next_check = 0;
@@ -1490,6 +1768,54 @@ impl Engine {
                         .ok_or_else(|| AppError::new(ErrorCode::Unavailable, "历史数据库不可用"))?
                         .recent(limit)?,
                 ))
+            }
+            Command::HistoryBefore { limit, before_id } => {
+                return Ok(ReplyData::History(
+                    self.history
+                        .as_ref()
+                        .ok_or_else(|| AppError::new(ErrorCode::Unavailable, "历史数据库不可用"))?
+                        .recent_before(limit, before_id)?,
+                ));
+            }
+            Command::LogSize => {
+                let bytes = engine_log_files(&self.paths.log_dir)?
+                    .iter()
+                    .fold(0_u64, |bytes, (_, size)| bytes.saturating_add(*size));
+                return Ok(ReplyData::LogSize {
+                    scope: self.snapshot.scope,
+                    bytes,
+                });
+            }
+            Command::ClearLogs { expected_scope } => {
+                if self.snapshot.scope != expected_scope {
+                    return Err(AppError::new(
+                        ErrorCode::Busy,
+                        "当前后台已切换，请重新查看日志大小",
+                    ));
+                }
+                if expected_scope == Scope::System && !caller.administrator {
+                    return Err(AppError::new(
+                        ErrorCode::PermissionDenied,
+                        "请以管理员身份打开 BitNet，再清除系统后台的诊断日志",
+                    ));
+                }
+                let mut bytes = 0_u64;
+                for (path, size) in engine_log_files(&self.paths.log_dir)? {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => bytes = bytes.saturating_add(size),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => {
+                            return Err(AppError::new(
+                                ErrorCode::Unavailable,
+                                "无法清除全部诊断日志，请重新读取大小后再试",
+                            ))
+                        }
+                    }
+                }
+                return Ok(ReplyData::LogsCleared {
+                    scope: expected_scope,
+                    bytes,
+                });
             }
             Command::Statistics => {
                 let mut statistics = self
@@ -1508,9 +1834,9 @@ impl Engine {
             }
             Command::Diagnose => return Ok(ReplyData::Diagnostics(self.diagnostics())),
             Command::ExportSettings => {
-                return Ok(ReplyData::Settings(Box::new(
-                    self.snapshot.settings.clone(),
-                )))
+                let mut portable = self.snapshot.settings.clone();
+                portable.network_permissions.clear();
+                return Ok(ReplyData::Settings(Box::new(portable)));
             }
             Command::Shutdown => {
                 if self.snapshot.scope == Scope::System && !caller.administrator {
@@ -1557,101 +1883,58 @@ impl Engine {
         Ok(())
     }
     fn diagnostics(&self) -> serde_json::Value {
-        serde_json::json!({"version":APP_VERSION,"api_version":API_VERSION,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"scope":self.snapshot.scope,"state":self.snapshot.state,"environment":self.snapshot.environment,"network_trusted":self.snapshot.network_trusted,"health":self.snapshot.health,"interface_count":self.snapshot.interfaces.len(),"selected_interface":self.snapshot.active_binding.as_ref().map(|_|"[redacted]"),"network_generation":self.snapshot.network_generation,"retry_count":self.snapshot.retry_count,"next_retry_at":self.snapshot.next_retry_at,"last_error_code":self.snapshot.last_error.as_ref().map(|e|e.code),"credential_store_available":self.vault.is_some(),"history_available":self.history.is_some(),"service":{"installed":self.snapshot.service.installed,"running":self.snapshot.service.running,"enabled":self.snapshot.service.enabled},"update_feed_configured":crate::maintenance::updates::UpdateConfig::configured(),"simulation":self.simulation,"limitations":["报告不包含密码、协议认证材料、用户名或完整IP；网络诊断不会修改系统设置。"]})
+        serde_json::json!({"version":APP_VERSION,"api_version":API_VERSION,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"scope":self.snapshot.scope,"state":self.snapshot.state,"environment":self.snapshot.environment,"network_trusted":self.snapshot.network_trusted,"health":self.snapshot.health.redacted(),"interface_count":self.snapshot.interfaces.len(),"selected_interface":self.snapshot.active_binding.as_ref().map(|_|"[redacted]"),"network_generation":self.snapshot.network_generation,"retry_count":self.snapshot.retry_count,"next_retry_at":self.snapshot.next_retry_at,"last_error_code":self.snapshot.last_error.as_ref().map(|e|e.code),"credential_store_available":self.vault.is_some(),"history_available":self.history.is_some(),"service":{"installed":self.snapshot.service.installed,"running":self.snapshot.service.running,"enabled":self.snapshot.service.enabled},"update_feed_configured":crate::maintenance::updates::UpdateConfig::configured(),"simulation":self.simulation,"limitations":["报告不包含密码、协议认证材料、用户名或完整IP；网络诊断不会修改系统设置。"]})
     }
     async fn health_check(&mut self) {
         self.next_health = now_secs() + self.snapshot.settings.health_interval_secs;
-        if self.snapshot.environment == Environment::NonCampus {
-            return;
-        }
         if self.simulation {
+            if self.snapshot.environment == Environment::NonCampus {
+                return;
+            }
             self.snapshot.health = HealthStatus {
                 internet: Health::Healthy,
                 dns: Health::Healthy,
                 ipv6: Health::Unknown,
                 checked_at: Some(now_secs()),
+                ..HealthStatus::default()
             };
             return;
         }
-        if self.snapshot.session.auth != AuthState::Authenticated {
+        let interface = self.snapshot.active_binding.as_ref().and_then(|binding| {
+            self.snapshot.interfaces.iter().find(|adapter| {
+                adapter.id == binding.interface_id && adapter.index == binding.interface_index
+            })
+        });
+        if self.snapshot.environment == Environment::NonCampus
+            || self.snapshot.session.auth != AuthState::Authenticated
+        {
+            crate::health_probe::run_ipv6(
+                &self.snapshot.settings,
+                interface,
+                &self.snapshot.interfaces,
+                &mut self.snapshot.health,
+            )
+            .await;
             return;
         }
-        let client = match reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(
-                self.snapshot.settings.request_timeout_secs,
-            ))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let mut succeeded = 0;
-        let mut checked = 0;
-        for target in self.snapshot.settings.health_targets.iter().take(2) {
-            let Ok(url) = url::Url::parse(target) else {
-                continue;
-            };
-            if !matches!(url.scheme(), "http" | "https")
-                || !url.username().is_empty()
-                || url.password().is_some()
-            {
-                continue;
-            }
-            checked += 1;
-            if let Ok(response) = client.get(url.clone()).send().await {
-                let code = response.status();
-                if url.host_str() == Some("connectivitycheck.gstatic.com") {
-                    if code.as_u16() == 204 {
-                        succeeded += 1;
-                    }
-                } else if code.is_success() {
-                    use futures_util::StreamExt;
-                    let mut stream = response.bytes_stream();
-                    let mut body = Vec::new();
-                    while let Some(Ok(chunk)) = stream.next().await {
-                        if body.len() + chunk.len() > 1024 {
-                            break;
-                        }
-                        body.extend_from_slice(&chunk);
-                    }
-                    if url.host_str() != Some("www.msftconnecttest.com")
-                        || body == b"Microsoft Connect Test"
-                    {
-                        succeeded += 1;
-                    }
-                }
-            }
-        }
-        self.snapshot.health.internet = if succeeded > 0 {
-            Health::Healthy
-        } else if checked > 0 {
-            Health::Degraded
-        } else {
-            Health::Unknown
-        };
-        self.snapshot.health.dns = match tokio::time::timeout(
-            Duration::from_secs(3),
-            tokio::net::lookup_host(("www.bit.edu.cn", 80)),
-        )
-        .await
-        {
-            Ok(Ok(mut addresses)) => {
-                if addresses.next().is_some() {
-                    Health::Healthy
-                } else {
-                    Health::Degraded
-                }
-            }
-            _ => Health::Degraded,
-        };
-        self.snapshot.health.checked_at = Some(now_secs());
-        self.snapshot.health.ipv6 = ipv6_health(
-            &self.snapshot.settings.health_targets,
-            self.snapshot.settings.request_timeout_secs,
+        self.snapshot.health = crate::health_probe::run(
+            &self.snapshot.settings,
+            interface,
+            &self.snapshot.interfaces,
         )
         .await;
+        if self.snapshot.settings.log_level == "debug" {
+            let health = self.snapshot.health.redacted();
+            for probe in &health.health_probes {
+                self.record_probe("health_probe", "互联网探测", probe.elapsed_ms, probe);
+            }
+            if let Some(probe) = &health.dns_probe {
+                self.record_probe("dns_probe", "DNS 探测", probe.elapsed_ms, probe);
+            }
+            for probe in &health.ipv6_probes {
+                self.record_probe("ipv6_probe", "IPv6 探测", probe.elapsed_ms, probe);
+            }
+        }
         if self.snapshot.health.internet == Health::Degraded {
             self.next_health = now_secs() + 30.min(self.snapshot.settings.health_interval_secs);
             self.snapshot.state = EngineState::NetworkDegraded;
@@ -1662,6 +1945,17 @@ impl Engine {
                 None,
             );
         }
+    }
+    fn record_probe(
+        &self,
+        kind: &str,
+        message: &str,
+        duration: u64,
+        observation: &impl serde::Serialize,
+    ) {
+        let mut details = serde_json::json!(observation);
+        details["level"] = serde_json::json!("debug");
+        self.write_event("debug", kind, message, None, Some(duration), &details);
     }
 }
 
@@ -1674,17 +1968,33 @@ fn log_rank(level: &str) -> u8 {
     }
 }
 
+fn engine_log_files(
+    directory: &std::path::Path,
+) -> Result<Vec<(std::path::PathBuf, u64)>, AppError> {
+    crate::maintenance::reject_links(directory)?;
+    let mut files = Vec::new();
+    for name in ENGINE_LOG_FILES {
+        let path = directory.join(name);
+        crate::maintenance::reject_links(&path)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => files.push((path, metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(AppError::new(
+                    ErrorCode::Unavailable,
+                    "无法读取诊断日志文件",
+                ))
+            }
+        }
+    }
+    Ok(files)
+}
+
 fn prune_logs(directory: &std::path::Path, days: u32) {
     use std::io::Read;
     let maximum_age = Duration::from_secs(u64::from(days) * 86400);
     let before = now_secs().saturating_sub(maximum_age.as_secs());
-    for name in [
-        "engine.jsonl",
-        "engine.1.jsonl",
-        "engine.2.jsonl",
-        "engine.3.jsonl",
-        "engine.4.jsonl",
-    ] {
+    for name in ENGINE_LOG_FILES {
         let path = directory.join(name);
         if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
             continue;
@@ -1739,56 +2049,6 @@ fn stable_check_delay(stable_checks: u32, maximum: u64) -> u64 {
         .min(maximum)
 }
 
-/// Diagnostic-only IPv6 transport probe. No authentication material is sent.
-/// Uses the configured health origins and the OS route, independently of SRUN.
-async fn ipv6_health(targets: &[String], timeout_secs: u64) -> Health {
-    let check = async {
-        let mut attempted = false;
-        for target in targets.iter().take(2) {
-            let Ok(url) = url::Url::parse(target) else {
-                continue;
-            };
-            if !matches!(url.scheme(), "http" | "https")
-                || !url.username().is_empty()
-                || url.password().is_some()
-            {
-                continue;
-            }
-            let Some(host) = url.host_str() else { continue };
-            let host = match host.strip_prefix('[') {
-                Some(literal) => literal.strip_suffix(']').unwrap_or(literal),
-                None => host,
-            };
-            let Some(port) = url.port_or_known_default() else {
-                continue;
-            };
-            if let Ok(addresses) = tokio::net::lookup_host((host, port)).await {
-                for address in addresses.filter(|a| a.is_ipv6()).take(2) {
-                    attempted = true;
-                    if let Ok(Ok(stream)) = tokio::time::timeout(
-                        Duration::from_secs(2),
-                        tokio::net::TcpStream::connect(address),
-                    )
-                    .await
-                    {
-                        if stream.local_addr().is_ok_and(|address| address.is_ipv6()) {
-                            return Health::Healthy;
-                        }
-                    }
-                }
-            };
-        }
-        if attempted {
-            Health::Unavailable
-        } else {
-            Health::Unknown
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(timeout_secs.clamp(1, 5)), check)
-        .await
-        .unwrap_or(Health::Degraded)
-}
-
 fn active_interface(snapshot: &Snapshot) -> Option<&NetworkInterface> {
     let binding = snapshot.active_binding.as_ref()?;
     snapshot
@@ -1840,12 +2100,20 @@ pub fn uses_system_authentication(snapshot: &Snapshot) -> bool {
 
 /// Identifies the connection context displayed for network-trust confirmation.
 pub fn network_fingerprint(snapshot: &Snapshot) -> Option<String> {
-    use sha2::{Digest, Sha256};
     let binding = snapshot.active_binding.as_ref()?;
     let interface = active_interface(snapshot)?;
+    fingerprint_for(&snapshot.settings.gateway, interface, binding)
+}
+
+pub fn fingerprint_for(
+    gateway: &GatewayConfig,
+    interface: &NetworkInterface,
+    binding: &NetworkBinding,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
     let octets = binding.source_ip.octets();
     let context = serde_json::to_vec(&(
-        &snapshot.settings.gateway.base_url,
+        &gateway.base_url,
         &interface.id,
         &interface.ssid,
         interface.gateway,
@@ -1854,11 +2122,45 @@ pub fn network_fingerprint(snapshot: &Snapshot) -> Option<String> {
     .ok()?;
     let mut hash = Sha256::new();
     hash.update(context);
-    let gateway = &snapshot.settings.gateway;
     if gateway.request_ip.is_some() || gateway.dumb_terminal {
         hash.update(serde_json::to_vec(&(gateway.request_ip, gateway.dumb_terminal)).ok()?);
     }
     Some(format!("{:x}", hash.finalize()))
+}
+
+pub fn network_permission_denied(snapshot: &Snapshot) -> bool {
+    network_fingerprint(snapshot).is_some_and(|fingerprint| {
+        snapshot
+            .settings
+            .network_permissions
+            .iter()
+            .any(|record| record.fingerprint == fingerprint && !record.allowed)
+    })
+}
+
+fn remember_network(
+    snapshot: &Snapshot,
+    settings: &mut Settings,
+    fingerprint: String,
+    allowed: bool,
+) -> Result<(), AppError> {
+    let interface = active_interface(snapshot).ok_or_else(verification_network_changed)?;
+    settings.trusted_networks.retain(|key| key != &fingerprint);
+    settings
+        .network_permissions
+        .retain(|record| record.fingerprint != fingerprint);
+    if allowed {
+        settings.trusted_networks.push(fingerprint.clone());
+    }
+    settings.network_permissions.push(NetworkPermission {
+        fingerprint,
+        interface_id: interface.id.clone(),
+        adapter_name: interface.name.clone(),
+        ssid: interface.ssid.clone(),
+        allowed,
+    });
+    settings.validate()?;
+    Ok(())
 }
 
 pub fn resolve_account(
@@ -1964,7 +2266,7 @@ pub async fn run(scope: Scope, simulation: bool) -> Result<(), AppError> {
             envelope=requests.recv()=>{
                 let Some(envelope)=envelope else{break};
                 let request_id=envelope.request.request_id;
-                let verification=matches!(&envelope.request.command,Command::VerifyAccount{..});
+                let verification=matches!(&envelope.request.command,Command::VerifyAccount{..}|Command::SwitchAccount{..});
                 let fresh_credentials=verification || matches!(&envelope.request.command,Command::LoginOnce{..});
                 if fresh_credentials {
                     if envelope.answer.is_closed() {
@@ -1976,7 +2278,7 @@ pub async fn run(scope: Scope, simulation: bool) -> Result<(), AppError> {
                         continue;
                     }
                 }
-                let network_command=matches!(&envelope.request.command,Command::Check|Command::Login{..}|Command::LoginOnce{..}|Command::Logout{..}|Command::EnableAutomatic{..});
+                let network_command=matches!(&envelope.request.command,Command::Check|Command::Login{..}|Command::LoginOnce{..}|Command::Logout{..}|Command::EnableAutomatic{..}|Command::SetNetworkPermission{..});
                 let mut event=changes.receiver.clone();event.borrow_and_update();
                 let result=if network_command&&network_events_open&&!simulation{
                     tokio::select!{result=engine.execute(envelope.request.command,&envelope.caller)=>result,_=event.changed()=>{engine.next_check=now_secs()+2;Err(AppError::new(ErrorCode::Cancelled,"网络已变化，旧操作已取消；请先查看当前状态"))}}
@@ -2079,6 +2381,249 @@ mod tests {
             owner: true,
             administrator: false,
         }
+    }
+
+    fn saved_switch(engine: &Engine, id: &str, confirmed: bool) -> Command {
+        Command::SwitchAccount {
+            id: id.into(),
+            expected_network: network_fingerprint(&engine.snapshot).unwrap(),
+            expected_scope: engine.snapshot.scope,
+            expected_revision: engine.snapshot.settings.revision,
+            confirmed,
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_switch_confirms_replacement_and_commits_selection_after_login() {
+        let (mut engine, paths) = isolated("switch-saved");
+        engine.snapshot.settings.selected_account = Some("demo".into());
+        engine.execute(Command::Resume, &owner()).await.unwrap();
+        engine
+            .execute(
+                Command::AccountPut {
+                    id: "other".into(),
+                    username: "other-user".into(),
+                    password: Secret::new("saved-password"),
+                },
+                &owner(),
+            )
+            .await
+            .unwrap();
+        let before = engine.snapshot.settings.clone();
+        let error = engine
+            .execute(saved_switch(&engine, "other", false), &owner())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ConfirmationRequired);
+        assert_eq!(engine.snapshot.settings, before);
+        assert_eq!(engine.simulation_session.username.as_deref(), Some("demo"));
+
+        let snapshot = engine
+            .execute(saved_switch(&engine, "other", true), &owner())
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(snapshot.session.username.as_deref(), Some("other-user"));
+        assert_eq!(snapshot.settings.selected_account.as_deref(), Some("other"));
+        assert_eq!(snapshot.settings.revision, before.revision + 1);
+        assert_eq!(snapshot.settings.automatic, before.automatic);
+        assert_eq!(snapshot.settings.paused, before.paused);
+        assert!(!snapshot.verification_hold);
+        assert_eq!(engine.accounts.len(), 2);
+        assert_eq!(engine.accounts[1].password.expose(), "saved-password");
+        assert_eq!(
+            persistence::read_settings(&paths.config_file).unwrap(),
+            snapshot.settings
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_saved_switch_restores_previous_account_and_selection() {
+        let (mut engine, paths) = isolated("switch-rejected");
+        engine.snapshot.settings.selected_account = Some("demo".into());
+        engine.execute(Command::Resume, &owner()).await.unwrap();
+        engine
+            .execute(
+                Command::AccountPut {
+                    id: "rejected".into(),
+                    username: "rejected-user".into(),
+                    password: Secret::new("wrong"),
+                },
+                &owner(),
+            )
+            .await
+            .unwrap();
+        let before = engine.snapshot.settings.clone();
+        let error = engine
+            .execute(saved_switch(&engine, "rejected", true), &owner())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Credentials);
+        assert!(error.message.contains("已确认原账户在线"));
+        assert_eq!(engine.snapshot.settings, before);
+        assert_eq!(engine.simulation_session.username.as_deref(), Some("demo"));
+        assert!(!engine.snapshot.verification_hold);
+        assert_eq!(
+            persistence::read_settings(&paths.config_file).unwrap(),
+            before
+        );
+        assert_eq!(engine.accounts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn saved_switch_rejects_stale_context_before_changing_the_session() {
+        let (mut engine, _) = isolated("switch-stale");
+        engine.snapshot.settings.selected_account = Some("demo".into());
+        engine.execute(Command::Resume, &owner()).await.unwrap();
+        let before = engine.snapshot.settings.clone();
+        let fingerprint = network_fingerprint(&engine.snapshot).unwrap();
+        for (expected_network, expected_scope, expected_revision) in [
+            ("stale".into(), Scope::User, before.revision),
+            (fingerprint.clone(), Scope::System, before.revision),
+            (fingerprint.clone(), Scope::User, before.revision + 1),
+        ] {
+            assert!(engine
+                .execute(
+                    Command::SwitchAccount {
+                        id: "demo".into(),
+                        expected_network,
+                        expected_scope,
+                        expected_revision,
+                        confirmed: true,
+                    },
+                    &owner()
+                )
+                .await
+                .is_err());
+        }
+        let stranger = Caller {
+            owner: false,
+            administrator: false,
+        };
+        assert_eq!(
+            engine
+                .execute(saved_switch(&engine, "demo", true), &stranger)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::PermissionDenied
+        );
+        assert_eq!(engine.simulation_session.username.as_deref(), Some("demo"));
+        assert_eq!(engine.snapshot.settings, before);
+    }
+
+    #[tokio::test]
+    async fn saved_switch_logs_in_from_offline_and_holds_on_selection_save_failure() {
+        let (mut engine, paths) = isolated("switch-save-failure");
+        engine.check(false).await.unwrap();
+        let before = engine.snapshot.settings.clone();
+        std::fs::create_dir(&paths.config_file).unwrap();
+        let error = engine
+            .execute(saved_switch(&engine, "demo", false), &owner())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        assert!(error.message.contains("账户已登录"));
+        assert_eq!(engine.snapshot.session.username.as_deref(), Some("demo"));
+        assert_eq!(engine.snapshot.settings, before);
+        assert!(engine.snapshot.verification_hold);
+    }
+
+    #[tokio::test]
+    async fn clearing_diagnostic_logs_preserves_history_and_other_files() {
+        let (mut engine, paths) = isolated("clear-engine-logs");
+        let history_before = engine.history.as_ref().unwrap().recent(10).unwrap().len();
+        let startup = paths.log_dir.join("startup-error.log");
+        let unrelated = paths.log_dir.join("engine.99.jsonl");
+        std::fs::write(&startup, b"startup").unwrap();
+        std::fs::write(&unrelated, b"unrelated").unwrap();
+        for name in ENGINE_LOG_FILES {
+            std::fs::write(paths.log_dir.join(name), b"{}\n").unwrap();
+        }
+        assert!(matches!(
+            engine.execute(Command::LogSize, &owner()).await.unwrap(),
+            ReplyData::LogSize {
+                scope: Scope::User,
+                bytes: 15
+            }
+        ));
+        assert_eq!(
+            engine
+                .execute(
+                    Command::ClearLogs {
+                        expected_scope: Scope::System
+                    },
+                    &owner()
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Busy
+        );
+        engine.snapshot.scope = Scope::System;
+        assert_eq!(
+            engine
+                .execute(
+                    Command::ClearLogs {
+                        expected_scope: Scope::System
+                    },
+                    &owner()
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::PermissionDenied
+        );
+        engine.snapshot.scope = Scope::User;
+        assert!(matches!(
+            engine
+                .execute(
+                    Command::ClearLogs {
+                        expected_scope: Scope::User
+                    },
+                    &owner()
+                )
+                .await
+                .unwrap(),
+            ReplyData::LogsCleared {
+                scope: Scope::User,
+                bytes: 15
+            }
+        ));
+        assert!(matches!(
+            engine.execute(Command::LogSize, &owner()).await.unwrap(),
+            ReplyData::LogSize {
+                scope: Scope::User,
+                bytes: 0
+            }
+        ));
+        assert_eq!(std::fs::read(startup).unwrap(), b"startup");
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"unrelated");
+        assert_eq!(
+            engine.history.as_ref().unwrap().recent(10).unwrap().len(),
+            history_before
+        );
+    }
+
+    #[tokio::test]
+    async fn log_clear_refuses_non_regular_files_before_deleting_any_logs() {
+        let (mut engine, paths) = isolated("non-regular-engine-log");
+        let active_log = paths.log_dir.join(ENGINE_LOG_FILES[0]);
+        let unexpected_directory = paths.log_dir.join(ENGINE_LOG_FILES[1]);
+        std::fs::create_dir(&unexpected_directory).unwrap();
+        let error = engine
+            .execute(
+                Command::ClearLogs {
+                    expected_scope: Scope::User,
+                },
+                &owner(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        assert!(active_log.is_file());
+        assert!(unexpected_directory.is_dir());
     }
 
     #[tokio::test]
@@ -2220,6 +2765,29 @@ mod tests {
             priority: 1,
         });
         assert_eq!(resolve_account(&s, None).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn manual_check_updates_health_even_before_the_periodic_deadline() {
+        let (mut engine, _) = isolated("manual-health-check");
+        engine
+            .execute(Command::AccountSelect { id: "demo".into() }, &owner())
+            .await
+            .unwrap();
+        engine.execute(Command::Resume, &owner()).await.unwrap();
+        engine.snapshot.health = HealthStatus::default();
+        engine.next_health = now_secs() + 300;
+        engine.observe_online();
+        assert_eq!(engine.next_health, 0);
+        engine.next_health = now_secs() + 300;
+        let snapshot = engine
+            .execute(Command::Check, &owner())
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert!(snapshot.health.checked_at.is_some());
+        assert_eq!(snapshot.health.internet, Health::Healthy);
     }
 
     #[tokio::test]
@@ -2508,6 +3076,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_is_bound_to_the_displayed_network_and_decline_survives_checks() {
+        let (mut engine, _) = isolated("network-decision");
+        engine.snapshot.settings.automatic = true;
+        engine.snapshot.settings.selected_account = Some("demo".into());
+        engine.check(false).await.unwrap();
+        let fingerprint = network_fingerprint(&engine.snapshot).unwrap();
+
+        let stale = engine
+            .execute(
+                Command::SetNetworkPermission {
+                    expected_network: "a".repeat(64),
+                    allow: true,
+                },
+                &owner(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code, ErrorCode::ConfirmationRequired);
+        assert!(engine.snapshot.settings.network_permissions.is_empty());
+
+        engine
+            .execute(
+                Command::SetNetworkPermission {
+                    expected_network: fingerprint.clone(),
+                    allow: false,
+                },
+                &owner(),
+            )
+            .await
+            .unwrap();
+        engine.check(true).await.unwrap();
+        assert_eq!(engine.snapshot.session.auth, AuthState::Unauthenticated);
+        assert!(engine.snapshot.last_error.is_none());
+        let mut settings = persistence::read_settings(&engine.paths.config_file).unwrap();
+        assert!(!settings.network_permissions[0].allowed);
+        assert!(settings.trusted_networks.is_empty());
+
+        settings.network_permissions.clear();
+        engine
+            .execute(
+                Command::SettingsPut {
+                    expected_revision: settings.revision,
+                    settings,
+                },
+                &owner(),
+            )
+            .await
+            .unwrap();
+        assert!(network_permission_denied(&engine.snapshot));
+
+        engine
+            .execute(
+                Command::SetNetworkPermission {
+                    expected_network: fingerprint.clone(),
+                    allow: true,
+                },
+                &owner(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.snapshot.session.auth, AuthState::Authenticated);
+        assert_eq!(
+            engine.snapshot.settings.trusted_networks,
+            vec![fingerprint.clone()]
+        );
+        engine
+            .execute(Command::ForgetNetworkPermission { fingerprint }, &owner())
+            .await
+            .unwrap();
+        assert!(engine.snapshot.settings.network_permissions.is_empty());
+        assert!(engine.snapshot.settings.trusted_networks.is_empty());
+        assert_eq!(engine.snapshot.session.auth, AuthState::Authenticated);
+    }
+
+    #[tokio::test]
     async fn enabling_automatic_requires_the_displayed_network_and_saves_without_logging_in() {
         let (mut engine, paths) = isolated("enable-automatic");
         engine.check(false).await.unwrap();
@@ -2583,6 +3226,11 @@ mod tests {
             ssid: Some("BIT-mobile".into()),
             virtual_adapter: false,
             alternate_adapter: false,
+            dns: Vec::new(),
+            dns_config: None,
+            ipv6: Vec::new(),
+            ipv4_mode: None,
+            ipv6_enabled: None,
         });
         assert!(!uses_system_authentication(&snapshot));
         snapshot.active_binding = snapshot.interfaces[0].binding();
@@ -2680,6 +3328,11 @@ mod tests {
             ssid: Some("Campus".into()),
             virtual_adapter: false,
             alternate_adapter: false,
+            dns: Vec::new(),
+            dns_config: None,
+            ipv6: Vec::new(),
+            ipv4_mode: None,
+            ipv6_enabled: None,
         });
         let first = network_fingerprint(&engine.snapshot).unwrap();
         engine.snapshot.interfaces[0].ssid = Some("Home".into());
@@ -2713,21 +3366,6 @@ mod tests {
         let text = std::fs::read_to_string(path).unwrap();
         assert!(!text.contains("old"));
         assert!(text.contains("recent"));
-    }
-    #[tokio::test]
-    async fn ipv6_diagnostic_proves_transport_on_a_loopback_fixture() {
-        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
-            return;
-        };
-        let address = listener.local_addr().unwrap();
-        let accepted = tokio::spawn(async move {
-            listener.accept().await.unwrap();
-        });
-        assert_eq!(
-            ipv6_health(&[format!("http://{address}")], 3).await,
-            Health::Healthy
-        );
-        accepted.await.unwrap();
     }
     #[tokio::test]
     async fn a_confirmed_lost_session_records_one_reconnect_and_online_intervals() {

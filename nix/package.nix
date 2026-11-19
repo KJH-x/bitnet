@@ -12,6 +12,7 @@ rustPlatform.buildRustPackage {
     lockFile = ../Cargo.lock;
     outputHashes = {
       "cosmic-text-0.19.0" = "sha256-TJ5QXLPOxjoaelH/1TPD01OvTAXcow6bvgI4EVE18vs=";
+      "cryoglyph-0.1.0" = "sha256-U7xLqzb/bWiXEZsncD6Js5hzNUIA2WFF6DeCpCmWDmw=";
       "iced-0.15.0-dev" = "sha256-nC7JZHcodgZu6uzkuaHvDpsj+cFUibgKOKgcR6UD6xg=";
       "winit-0.30.8" = "sha256-pQn1lCFSJMkjUfHoggEzMHnm5k+Chnzi5JEDjahnjUA=";
     };
@@ -29,6 +30,7 @@ rustPlatform.buildRustPackage {
     install -Dm644 installers/linux/bitnet.svg "$out/share/icons/hicolor/scalable/apps/bitnet.svg"
     install -Dm644 LICENSE "$out/share/licenses/bitnet/LICENSE"
     install -Dm644 crates/bitnet-gateway/NOTICE "$out/share/licenses/bitnet/GATEWAY-NOTICE.txt"
+    install -Dm644 crates/bitnet-gui/assets/fonts/LICENSE.txt "$out/share/licenses/bitnet/FONT-OFL.txt"
     wrapProgram "$out/bin/bitnet-gui" \
       --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath [ fontconfig libxkbcommon xorg.libX11 wayland ]}"
   '';

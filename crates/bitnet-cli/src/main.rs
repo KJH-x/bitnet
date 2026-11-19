@@ -1,4 +1,5 @@
 use bitnet_core::*;
+use bitnet_launcher::{LaunchError, WebAction};
 use bitnet_runtime::{
     client::Client,
     maintenance::{self, MaintenanceAction},
@@ -99,6 +100,13 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         limit: u32,
     },
+    /// 在当前终端打开交互界面
+    Tui,
+    /// 启动或停止本机日志 Web 界面
+    Web {
+        #[command(subcommand)]
+        action: WebCommand,
+    },
     Statistics,
     Diagnose {
         #[arg(long)]
@@ -128,6 +136,13 @@ enum Commands {
         #[arg(long)]
         delete_source: bool,
     },
+}
+#[derive(Subcommand)]
+enum WebCommand {
+    /// 打开日志 Web 界面
+    Start,
+    /// 停止日志 Web 服务
+    Stop,
 }
 #[derive(Subcommand)]
 enum ProfileAction {
@@ -231,6 +246,34 @@ async fn run(args: &Args) -> Result<(), AppError> {
         return configure(&client, args).await;
     };
     match command {
+        Commands::Tui => {
+            if args.json
+                || args.non_interactive
+                || !io::stdin().is_terminal()
+                || !io::stdout().is_terminal()
+            {
+                return Err(input("TUI 需要交互终端"));
+            }
+            let status = bitnet_launcher::tui(args.scope.into())
+                .map_err(|error| frontend_error(error, "bitnet-tui"))?;
+            if !status.success() {
+                return Err(frontend_error(LaunchError::Failed, "bitnet-tui"));
+            }
+        }
+        Commands::Web { action } => {
+            let (action, message) = match action {
+                WebCommand::Start => (WebAction::Open, "已请求打开日志 Web 界面"),
+                WebCommand::Stop => (WebAction::Stop, "日志 Web 服务已停止"),
+            };
+            bitnet_launcher::web(client.effective_scope(), action, false)
+                .map_err(|error| frontend_error(error, "bitnet-web"))?;
+            print_data(
+                ReplyData::Ok {
+                    message: message.into(),
+                },
+                args.json,
+            )?;
+        }
         Commands::Status { watch } => loop {
             print_data(client.command(Command::Status).await?, args.json)?;
             if !watch {
@@ -641,6 +684,16 @@ fn prompt(message: &str) -> Result<String, AppError> {
 }
 fn input(message: &str) -> AppError {
     AppError::new(ErrorCode::InvalidInput, message)
+}
+
+fn frontend_error(error: LaunchError, executable: &str) -> AppError {
+    AppError::new(
+        ErrorCode::Unavailable,
+        match error {
+            LaunchError::Missing => format!("未找到 {executable}，请安装对应前端"),
+            LaunchError::Failed => format!("{executable} 未能完成操作"),
+        },
+    )
 }
 fn read_limited(path: &PathBuf, limit: u64) -> Result<Zeroizing<Vec<u8>>, AppError> {
     let file = std::fs::File::open(path).map_err(|_| input("无法读取文件"))?;

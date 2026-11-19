@@ -3,9 +3,11 @@ pub(super) fn polling_only(_: &ChangeGuard) -> bool {
     false
 }
 use crate::{error, windows::wide_string};
-use bitnet_core::ErrorCode;
+use bitnet_core::{DnsConfiguration, DnsMode, ErrorCode, Ipv4Assignment};
 use std::{
     ffi::{c_void, CStr},
+    mem::size_of,
+    net::{IpAddr, Ipv6Addr},
     ptr,
 };
 use windows_sys::Win32::{
@@ -25,6 +27,111 @@ unsafe fn ipv4(address: *const SOCKADDR) -> Option<Ipv4Addr> {
             .S_addr
             .to_ne_bytes(),
     ))
+}
+
+unsafe fn socket_ip(address: SOCKET_ADDRESS) -> Option<IpAddr> {
+    let ptr = address.lpSockaddr;
+    let len = usize::try_from(address.iSockaddrLength).ok()?;
+    if ptr.is_null() || len < size_of::<ADDRESS_FAMILY>() {
+        return None;
+    }
+    match (*ptr).sa_family {
+        AF_INET if len >= size_of::<SOCKADDR_IN>() => ipv4(ptr).map(IpAddr::V4),
+        AF_INET6 if len >= size_of::<SOCKADDR_IN6>() => {
+            let raw = (*ptr.cast::<SOCKADDR_IN6>()).sin6_addr.u.Byte;
+            Some(IpAddr::V6(Ipv6Addr::from(raw)))
+        }
+        _ => None,
+    }
+}
+
+fn dns_mode(id: &str, ipv6: bool) -> Option<DnsMode> {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
+        System::Registry::{
+            RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE,
+            RRF_RT_REG_SZ,
+        },
+    };
+    if id.len() != 38 || !id.starts_with('{') || !id.ends_with('}') {
+        return None;
+    }
+    let service = if ipv6 { "Tcpip6" } else { "Tcpip" };
+    let path = crate::windows::wide(&format!(
+        r"SYSTEM\CurrentControlSet\Services\{service}\Parameters\Interfaces\{id}"
+    ));
+    let mut key: HKEY = ptr::null_mut();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            path.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if opened != ERROR_SUCCESS {
+        return None;
+    }
+    let name = crate::windows::wide("NameServer");
+    let mut value = [0_u16; 1024];
+    let mut bytes = size_of::<[u16; 1024]>() as u32;
+    let result = unsafe {
+        let result = RegGetValueW(
+            key,
+            ptr::null(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            ptr::null_mut(),
+            value.as_mut_ptr().cast(),
+            &mut bytes,
+        );
+        RegCloseKey(key);
+        result
+    };
+    match result {
+        ERROR_FILE_NOT_FOUND => Some(DnsMode::Automatic),
+        ERROR_SUCCESS => {
+            let value = String::from_utf16_lossy(&value[..(bytes as usize / 2).min(value.len())]);
+            static_dns_mode(value.trim_matches(char::from(0)).trim(), ipv6)
+        }
+        _ => None,
+    }
+}
+
+fn static_dns_mode(value: &str, ipv6: bool) -> Option<DnsMode> {
+    if value.is_empty() {
+        return Some(DnsMode::Automatic);
+    }
+    let mut servers = value
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .peekable();
+    (servers.peek().is_some()
+        && servers.all(|part| {
+            part.split('%')
+                .next()
+                .and_then(|ip| ip.parse::<IpAddr>().ok())
+                .is_some_and(|address| address.is_ipv6() == ipv6)
+        }))
+    .then_some(DnsMode::Manual)
+}
+
+#[cfg(test)]
+#[test]
+fn dns_mode_distinguishes_configured_families_without_guessing() {
+    assert_eq!(static_dns_mode("", false), Some(DnsMode::Automatic));
+    assert_eq!(
+        static_dns_mode("1.1.1.1, 8.8.4.4", false),
+        Some(DnsMode::Manual)
+    );
+    assert_eq!(
+        static_dns_mode("2001:4860:4860::8888 fe80::2%4", true),
+        Some(DnsMode::Manual)
+    );
+    assert_eq!(static_dns_mode("2001:4860:4860::8888", false), None);
+    assert_eq!(static_dns_mode("unknown", true), None);
+    assert_eq!(static_dns_mode(", ", false), None);
 }
 
 pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
@@ -72,13 +179,35 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                     .into_owned()
             };
             let mut ips = Vec::new();
+            let mut ipv6 = Vec::new();
+            let mut dhcp_address = false;
             let mut unicast = a.FirstUnicastAddress;
             while !unicast.is_null() {
                 let u = &*unicast;
-                if let Some(ip) = ipv4(u.Address.lpSockaddr) {
-                    ips.push(ip);
+                match socket_ip(u.Address) {
+                    Some(IpAddr::V4(ip)) => {
+                        ips.push(ip);
+                        dhcp_address |= u.PrefixOrigin == IpPrefixOriginDhcp
+                            && !ip.is_unspecified()
+                            && !ip.is_link_local();
+                    }
+                    Some(IpAddr::V6(ip)) => ipv6.push(ip),
+                    None => {}
                 }
                 unicast = u.Next;
+            }
+            ipv6.sort_unstable();
+            ipv6.dedup();
+            let mut servers = Vec::new();
+            let mut server = a.FirstDnsServerAddress;
+            while !server.is_null() {
+                let entry = &*server;
+                if let Some(ip) = socket_ip(entry.Address) {
+                    if !servers.contains(&ip) {
+                        servers.push(ip);
+                    }
+                }
+                server = entry.Next;
             }
             let mut gateway = None;
             let mut g = a.FirstGatewayAddress;
@@ -110,6 +239,28 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                 ]
                 .iter()
                 .any(|kind| description.contains(kind));
+            let flags = a.Anonymous2.Flags;
+            let ipv4_mode = (flags & IP_ADAPTER_IPV4_ENABLED != 0).then_some({
+                if flags & IP_ADAPTER_DHCP_ENABLED == 0 {
+                    Ipv4Assignment::Manual
+                } else if dhcp_address {
+                    Ipv4Assignment::Dhcp
+                } else {
+                    Ipv4Assignment::AutoPending
+                }
+            });
+            let dns = servers
+                .iter()
+                .filter_map(|ip| match ip {
+                    IpAddr::V4(ip) => Some(*ip),
+                    IpAddr::V6(_) => None,
+                })
+                .collect();
+            let dns_config = DnsConfiguration {
+                ipv4_mode: dns_mode(&id, false),
+                ipv6_mode: dns_mode(&id, true),
+                servers,
+            };
             out.push(NetworkInterface {
                 id,
                 name,
@@ -124,6 +275,11 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                     IF_TYPE_TUNNEL | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_PPP
                 ) || super::is_tunnel(&description),
                 alternate_adapter,
+                dns,
+                dns_config: Some(dns_config),
+                ipv6,
+                ipv4_mode,
+                ipv6_enabled: Some(flags & IP_ADAPTER_IPV6_ENABLED != 0),
             });
             row = a.Next;
         }

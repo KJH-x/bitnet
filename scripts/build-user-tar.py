@@ -17,7 +17,9 @@ with output.open('wb') as stream, gzip.GzipFile(filename='', mode='wb', fileobj=
             info.uid = info.gid = 0
             info.uname = info.gname = 'root'
             info.mtime = epoch
-            executable = path.parent == source and path.name in {'bitengine','bitctl','bitmaint','bitnet-gui'}
+            executable = path.parent == source and path.name in {
+                "bitengine", "bitctl", "bitmaint", "bitnet-gui", "bitnet-tui", "bitnet-web",
+            }
             info.mode = 0o755 if path.is_dir() or executable else 0o644
             if path.is_dir():
                 info.type = tarfile.DIRTYPE

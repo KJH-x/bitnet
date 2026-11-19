@@ -8,13 +8,30 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct Client {
     pub scope: Scope,
+    exact_scope: bool,
 }
 impl Client {
     pub fn new(scope: Scope) -> Self {
-        Self { scope }
+        Self {
+            scope,
+            exact_scope: false,
+        }
+    }
+    pub fn exact(scope: Scope) -> Self {
+        Self {
+            scope,
+            exact_scope: true,
+        }
+    }
+    pub fn service_status() -> ServiceStatus {
+        if simulation_only() {
+            ServiceStatus::default()
+        } else {
+            bitnet_platform::service::status()
+        }
     }
     pub fn effective_scope(&self) -> Scope {
-        if simulation_only() {
+        if self.exact_scope || simulation_only() {
             return self.scope;
         }
         if self.scope == Scope::User && bitnet_platform::service::status().installed {
@@ -139,6 +156,15 @@ impl Client {
                 ErrorCode::Unavailable,
                 "系统后台未就绪；不会启动第二个用户认证引擎，请检查或修复服务",
             ));
+        }
+        if self.exact_scope {
+            let service = Self::service_status();
+            if service.running || service.detail.is_some() {
+                return Err(AppError::new(
+                    ErrorCode::Busy,
+                    "请先停止系统后台，再启动个人引擎",
+                ));
+            }
         }
         let executable = engine_path()?;
         let mut process = Process::new(executable);

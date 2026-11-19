@@ -22,6 +22,21 @@ pub struct AppPaths {
     pub log_dir: PathBuf,
 }
 
+/// Prepares a private directory owned by the current user for frontend metadata.
+pub fn prepare_private_directory(path: &Path) -> Result<(), AppError> {
+    secure_fs::prepare_directory(path, Scope::User)
+}
+
+/// Reads a bounded file from a directory prepared for private frontend metadata.
+pub fn read_private_file(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+    secure_fs::read(path)
+}
+
+/// Writes private frontend metadata atomically with user-only access.
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+    secure_fs::atomic_write(path, bytes, Scope::User)
+}
+
 /// Computes locations only; calling this never creates files or directories.
 pub fn paths(scope: Scope) -> Result<AppPaths, AppError> {
     #[cfg(windows)]

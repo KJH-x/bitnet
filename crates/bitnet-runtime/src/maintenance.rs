@@ -1,7 +1,7 @@
 //! The only installation/startup/update entry point shared by GUI and CLI.
 #[path = "updates.rs"]
 pub mod updates;
-use bitnet_core::{AppError, ErrorCode, Scope};
+use bitnet_core::{AppError, ErrorCode, NetworkInterface, Scope};
 use fs2::FileExt;
 use serde_json::json;
 use std::io::Read;
@@ -23,9 +23,127 @@ pub enum MaintenanceAction {
     Repair,
     CheckUpdate,
     InstallUpdate,
+    InstallCheckedUpdate { manifest_sha256: UpdateManifestId },
     RollbackUpdate,
     SetAutostart { enabled: bool },
     SetGuiAutostart { enabled: bool },
+    EnableIpv6 { interface: InterfaceTarget },
+    DisableIpv6 { interface: InterfaceTarget },
+    ResetIpv6 { interface: InterfaceTarget },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateManifestId(String);
+
+impl UpdateManifestId {
+    pub fn parse(value: &str) -> Result<Self, AppError> {
+        if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Ok(Self(value.to_ascii_lowercase()))
+        } else {
+            Err(err(
+                ErrorCode::InvalidInput,
+                "Expected a SHA-256 update manifest identifier",
+            ))
+        }
+    }
+
+    fn for_payload(payload: &[u8]) -> Self {
+        use sha2::{Digest as _, Sha256};
+        Self(format!("{:x}", Sha256::digest(payload)))
+    }
+
+    fn verify(&self, payload: &[u8]) -> Result<(), AppError> {
+        if *self != Self::for_payload(payload) {
+            return Err(err(
+                ErrorCode::Busy,
+                "The verified update changed. Check the new release before installing.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckedUpdate {
+    pub version: String,
+    pub scope: Scope,
+    pub manifest_sha256: UpdateManifestId,
+}
+
+/// Fetch and authenticate the current release without downloading any installers.
+pub async fn check_installable_update(scope: Scope) -> Result<Option<CheckedUpdate>, AppError> {
+    let config = updates::UpdateConfig::embedded()?;
+    let Some(release) = config.check_available_release().await? else {
+        return Ok(None);
+    };
+    let _ = release.manifest.assets_for_install(scope)?;
+    Ok(Some(CheckedUpdate {
+        version: release.manifest.version,
+        scope,
+        manifest_sha256: UpdateManifestId::for_payload(&release.raw_manifest),
+    }))
+}
+
+/// Native Windows adapter identity. Alias, address and display name are never
+/// used as a privileged operation's selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceTarget {
+    guid: String,
+    index: u32,
+}
+
+impl InterfaceTarget {
+    pub fn from_interface(interface: &NetworkInterface) -> Result<Self, AppError> {
+        Self::new(&interface.id, interface.index)
+    }
+
+    pub fn parse(selector: &str) -> Result<Self, AppError> {
+        let (guid, index) = selector
+            .split_once('@')
+            .ok_or_else(|| err(ErrorCode::InvalidInput, "Expected adapter GUID@index"))?;
+        let index = index
+            .parse()
+            .map_err(|_| err(ErrorCode::InvalidInput, "Invalid Windows interface index"))?;
+        Self::new(guid, index)
+    }
+
+    fn new(guid: &str, index: u32) -> Result<Self, AppError> {
+        let guid = guid
+            .strip_prefix('{')
+            .and_then(|guid| guid.strip_suffix('}'))
+            .unwrap_or(guid);
+        if index == 0
+            || guid.len() != 36
+            || !guid.bytes().enumerate().all(|(position, byte)| {
+                if matches!(position, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+            || guid == "00000000-0000-0000-0000-000000000000"
+        {
+            return Err(err(
+                ErrorCode::InvalidInput,
+                "A current Windows adapter GUID and nonzero index are required",
+            ));
+        }
+        Ok(Self {
+            guid: guid.to_ascii_lowercase(),
+            index,
+        })
+    }
+}
+
+impl MaintenanceAction {
+    pub fn ipv6_target(&self) -> Option<&InterfaceTarget> {
+        match self {
+            Self::EnableIpv6 { interface }
+            | Self::DisableIpv6 { interface }
+            | Self::ResetIpv6 { interface } => Some(interface),
+            _ => None,
+        }
+    }
 }
 #[derive(Debug, Clone)]
 pub struct MaintenanceResult {
@@ -50,19 +168,52 @@ pub fn action_name(action: &MaintenanceAction) -> &'static str {
         MaintenanceAction::ServiceRemove { .. } => "service-remove",
         MaintenanceAction::Repair => "repair",
         MaintenanceAction::CheckUpdate => "check-update",
-        MaintenanceAction::InstallUpdate => "install-update",
+        MaintenanceAction::InstallUpdate | MaintenanceAction::InstallCheckedUpdate { .. } => {
+            "install-update"
+        }
         MaintenanceAction::RollbackUpdate => "rollback-update",
         MaintenanceAction::SetAutostart { enabled: true } => "autostart-on",
         MaintenanceAction::SetAutostart { enabled: false } => "autostart-off",
         MaintenanceAction::SetGuiAutostart { enabled: true } => "gui-autostart-on",
         MaintenanceAction::SetGuiAutostart { enabled: false } => "gui-autostart-off",
+        MaintenanceAction::EnableIpv6 { .. } => "ipv6-enable",
+        MaintenanceAction::DisableIpv6 { .. } => "ipv6-disable",
+        MaintenanceAction::ResetIpv6 { .. } => "ipv6-reset",
     }
 }
+
 pub fn parse_action(name: &str, purge: bool) -> Result<MaintenanceAction, AppError> {
+    parse_action_with_interface(name, purge, None)
+}
+
+pub fn parse_action_with_interface(
+    name: &str,
+    purge: bool,
+    interface: Option<InterfaceTarget>,
+) -> Result<MaintenanceAction, AppError> {
     if purge && name != "service-remove" {
         return Err(err(
             ErrorCode::InvalidInput,
             "Purge is valid only for service removal",
+        ));
+    }
+    if matches!(name, "ipv6-enable" | "ipv6-disable" | "ipv6-reset") {
+        let interface = interface.ok_or_else(|| {
+            err(
+                ErrorCode::InvalidInput,
+                "IPv6 maintenance requires --interface GUID@index",
+            )
+        })?;
+        return Ok(match name {
+            "ipv6-enable" => MaintenanceAction::EnableIpv6 { interface },
+            "ipv6-disable" => MaintenanceAction::DisableIpv6 { interface },
+            _ => MaintenanceAction::ResetIpv6 { interface },
+        });
+    }
+    if interface.is_some() {
+        return Err(err(
+            ErrorCode::InvalidInput,
+            "--interface is valid only for IPv6 maintenance",
         ));
     }
     Ok(match name {
@@ -88,15 +239,28 @@ pub async fn execute(
     interactive: bool,
 ) -> Result<MaintenanceResult, AppError> {
     #[cfg(windows)]
-    if scope == Scope::System && matches!(action, MaintenanceAction::ServiceInstall) {
+    if scope == Scope::System
+        && matches!(
+            action,
+            MaintenanceAction::ServiceInstall | MaintenanceAction::ServiceStart
+        )
+    {
         // Reject absent trust material or a corrupt cached MSI before UAC and
         // before disrupting the user's functioning authentication controller.
-        updates::verify_offline_package(&sibling("packages/Service.msi")?)?;
+        let installing = matches!(action, MaintenanceAction::ServiceInstall);
+        if installing {
+            updates::verify_offline_package(&sibling("packages/Service.msi")?)?;
+        }
         let _handoff = HandoffLock::acquire()?;
         let stopped = stop_personal_controller().await?;
         let outcome = execute_inner(scope, action, interactive).await;
+        let service = bitnet_platform::service::status();
         if outcome.is_err()
-            && restore_personal_controller(stopped, &bitnet_platform::service::status())
+            && (if installing {
+                restore_personal_controller(stopped, &service)
+            } else {
+                stopped && !service.running && service.detail.is_none()
+            })
             && restart_personal_controller().await.is_err()
         {
             return Err(err(
@@ -205,7 +369,24 @@ async fn execute_inner(
     action: MaintenanceAction,
     interactive: bool,
 ) -> Result<MaintenanceResult, AppError> {
-    if matches!(action, MaintenanceAction::InstallUpdate) {
+    if action.ipv6_target().is_some() {
+        if !cfg!(windows) {
+            return Err(err(
+                ErrorCode::Unavailable,
+                "Managing IPv6 bindings is currently supported on Windows",
+            ));
+        }
+        if scope != Scope::System {
+            return Err(err(
+                ErrorCode::InvalidInput,
+                "IPv6 maintenance requires system scope",
+            ));
+        }
+    }
+    if matches!(
+        action,
+        MaintenanceAction::InstallUpdate | MaintenanceAction::InstallCheckedUpdate { .. }
+    ) {
         // A build without an authenticated feed never prompts for privileges.
         let _ = updates::UpdateConfig::embedded()?;
     }
@@ -229,6 +410,10 @@ async fn execute_inner(
         }
         return elevate(scope, action).await;
     }
+    #[cfg(windows)]
+    if let Some(interface) = action.ipv6_target() {
+        return ipv6_action(&action, interface).await;
+    }
     match action {
         MaintenanceAction::SetAutostart { enabled } if scope == Scope::User => {
             return set_autostart(false, enabled)
@@ -244,9 +429,15 @@ async fn execute_inner(
         }
         _ => {}
     }
-    if matches!(action, MaintenanceAction::InstallUpdate) {
+    if matches!(
+        action,
+        MaintenanceAction::InstallUpdate | MaintenanceAction::InstallCheckedUpdate { .. }
+    ) {
         let config = updates::UpdateConfig::embedded()?;
         let release = config.check_release().await?;
+        if let MaintenanceAction::InstallCheckedUpdate { manifest_sha256 } = &action {
+            manifest_sha256.verify(&release.raw_manifest)?;
+        }
         let assets = release.manifest.assets_for_install(scope)?;
         // Native Debian/PKG installers modify the machine even when invoked by
         // the personal client. Their payload must stay in root-owned staging.
@@ -445,7 +636,9 @@ fn requires_admin(scope: Scope, action: &MaintenanceAction) -> bool {
     #[cfg(not(windows))]
     if matches!(
         action,
-        MaintenanceAction::InstallUpdate | MaintenanceAction::RollbackUpdate
+        MaintenanceAction::InstallUpdate
+            | MaintenanceAction::InstallCheckedUpdate { .. }
+            | MaintenanceAction::RollbackUpdate
     ) {
         return true;
     }
@@ -489,23 +682,18 @@ async fn service_action(action: MaintenanceAction) -> Result<MaintenanceResult, 
             });
         }
         MaintenanceAction::ServiceStart => {
-            run(system_plan(
-                "sc.exe",
-                &["config", "BitNet", "start=", "auto"],
-                45,
-            )?)
-            .await?;
+            // Older BitNet versions disabled the service when stopping it.
+            if windows_service_disabled()? {
+                run(system_plan(
+                    "sc.exe",
+                    &["config", "BitNet", "start=", "demand"],
+                    45,
+                )?)
+                .await?;
+            }
             change_windows_service_state(true).await?;
         }
         MaintenanceAction::ServiceStop => {
-            // Disabling also prevents a restart already queued by SCM recovery.
-            // Pause remains the separate way to pause authentication only.
-            run(system_plan(
-                "sc.exe",
-                &["config", "BitNet", "start=", "disabled"],
-                45,
-            )?)
-            .await?;
             change_windows_service_state(false).await?;
         }
         MaintenanceAction::ServiceRemove { purge } => {
@@ -748,6 +936,43 @@ fn windows_service_state() -> Result<u32, AppError> {
         ));
     }
     Ok(state.dwCurrentState)
+}
+
+#[cfg(windows)]
+fn windows_service_disabled() -> Result<bool, AppError> {
+    use windows_sys::Win32::System::Services::*;
+    let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(err(
+            ErrorCode::Unavailable,
+            "Could not query the service manager",
+        ));
+    }
+    let name = wide("BitNet");
+    let service = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_CONFIG) };
+    unsafe { CloseServiceHandle(manager) };
+    if service.is_null() {
+        return Err(err(
+            ErrorCode::Unavailable,
+            "Could not open the system service",
+        ));
+    }
+    let mut needed = 0;
+    unsafe { QueryServiceConfigW(service, std::ptr::null_mut(), 0, &mut needed) };
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+    let queried = needed > 0
+        && unsafe { QueryServiceConfigW(service, buffer.as_mut_ptr().cast(), needed, &mut needed) }
+            != 0;
+    unsafe { CloseServiceHandle(service) };
+    if !queried {
+        return Err(err(
+            ErrorCode::Unavailable,
+            "Could not read the service startup configuration",
+        ));
+    }
+    Ok(unsafe {
+        (*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>()).dwStartType == SERVICE_DISABLED
+    })
 }
 
 #[cfg(windows)]
@@ -1584,6 +1809,60 @@ fn system_plan(program: &str, args: &[&str], seconds: u64) -> Result<Plan, AppEr
     p.program = PathBuf::from(OsString::from_wide(&value[..n])).join(program);
     Ok(p)
 }
+
+#[cfg(windows)]
+async fn ipv6_action(
+    action: &MaintenanceAction,
+    interface: &InterfaceTarget,
+) -> Result<MaintenanceResult, AppError> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let command = format!(
+        "$interfaceGuid = '{}'\n$interfaceIndex = {}\n$action = '{}'\n{}",
+        interface.guid,
+        interface.index,
+        action_name(action),
+        include_str!("ipv6_binding.ps1"),
+    );
+    let encoded = STANDARD.encode(
+        command
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let plan = system_plan(
+        r"WindowsPowerShell\v1.0\powershell.exe",
+        &["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded],
+        120,
+    )?;
+    match run_exit_code(plan).await? {
+        0 => {
+            let enabled = !matches!(action, MaintenanceAction::DisableIpv6 { .. });
+            Ok(MaintenanceResult {
+                message: if enabled {
+                    "Verified IPv6 enabled on the selected network adapter"
+                } else {
+                    "Verified IPv6 disabled on the selected network adapter"
+                }
+                .into(),
+                details: json!({"ipv6_enabled":enabled,"reboot_required":false}),
+            })
+        }
+        2 => Err(err(
+            ErrorCode::Unavailable,
+            "The selected Windows network adapter changed or is unavailable",
+        )),
+        3 => Err(err(
+            ErrorCode::Busy,
+            "Another IPv6 operation is running on this adapter",
+        )),
+        _ => Err(err(
+            ErrorCode::Unavailable,
+            "Windows could not change and verify the IPv6 binding",
+        )),
+    }
+}
+
 #[cfg(windows)]
 fn program_data() -> Result<PathBuf, AppError> {
     use windows_sys::Win32::{
@@ -1792,7 +2071,7 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
                 "The installed maintenance helper is missing",
             ));
         }
-        let arguments = format!(
+        let mut arguments = format!(
             "--scope {} --action {} --elevated{}",
             if scope == Scope::System {
                 "system"
@@ -1806,6 +2085,19 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
                 ""
             }
         );
+        let ipv6_enabled = action.ipv6_target().map(|interface| {
+            use std::fmt::Write as _;
+            let _ = write!(
+                arguments,
+                " --interface {}@{}",
+                interface.guid, interface.index
+            );
+            !matches!(action, MaintenanceAction::DisableIpv6 { .. })
+        });
+        if let MaintenanceAction::InstallCheckedUpdate { manifest_sha256 } = &action {
+            use std::fmt::Write as _;
+            let _ = write!(arguments, " --manifest-sha256 {}", manifest_sha256.0);
+        }
         tokio::task::spawn_blocking(move || {
             use windows_sys::Win32::{
                 Foundation::*,
@@ -1848,8 +2140,25 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
                     "Elevated maintenance did not finish in time",
                 ));
             }
-            if code != 0 && code != 3010 {
+            if code != 0 && (code != 3010 || ipv6_enabled.is_some()) {
+                if ipv6_enabled.is_some() && code == ErrorCode::Busy.exit_code() as u32 {
+                    return Err(err(
+                        ErrorCode::Busy,
+                        "Another IPv6 operation is running on this adapter",
+                    ));
+                }
                 return Err(err(ErrorCode::Unavailable, "Elevated maintenance failed"));
+            }
+            if let Some(enabled) = ipv6_enabled {
+                return Ok(MaintenanceResult {
+                    message: if enabled {
+                        "Verified IPv6 enabled on the selected network adapter"
+                    } else {
+                        "Verified IPv6 disabled on the selected network adapter"
+                    }
+                    .into(),
+                    details: json!({"ipv6_enabled":enabled,"reboot_required":false}),
+                });
             }
             Ok(MaintenanceResult {
                 message: "Authorized maintenance completed".into(),
@@ -1881,6 +2190,10 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
         );
         if matches!(action, MaintenanceAction::ServiceRemove { purge: true }) {
             p.args.push("--purge".into());
+        }
+        if let MaintenanceAction::InstallCheckedUpdate { manifest_sha256 } = &action {
+            p.args
+                .extend(["--manifest-sha256".into(), manifest_sha256.0.clone().into()]);
         }
         run(p).await?;
         Ok(result("Authorized maintenance completed"))
@@ -1918,7 +2231,14 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
             });
         }
         root_helper(Path::new(HELPER))?;
-        let script=format!("do shell script \"{HELPER} --scope {} --action {} --elevated{}\" with administrator privileges",if scope==Scope::System{"system"}else{"user"},action_name(&action),if matches!(action,MaintenanceAction::ServiceRemove{purge:true}){" --purge"}else{""});
+        let extra = match &action {
+            MaintenanceAction::InstallCheckedUpdate { manifest_sha256 } => {
+                format!(" --manifest-sha256 {}", manifest_sha256.0)
+            }
+            MaintenanceAction::ServiceRemove { purge: true } => " --purge".to_owned(),
+            _ => String::new(),
+        };
+        let script = format!("do shell script \"{HELPER} --scope {} --action {} --elevated{extra}\" with administrator privileges", if scope == Scope::System {"system"} else {"user"}, action_name(&action));
         run(Plan {
             program: "/usr/bin/osascript".into(),
             args: vec!["-e".into(), script.into()],
@@ -2028,6 +2348,22 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn confirmed_update_requires_the_same_signed_manifest_bytes() {
+        let payload = br#"{"version":"1.0.0","assets":[]}"#;
+        let digest = UpdateManifestId::for_payload(payload);
+        let elevated = UpdateManifestId::parse(&digest.0.to_uppercase()).unwrap();
+        assert_eq!(digest, elevated);
+        assert!(elevated.verify(payload).is_ok());
+        assert_eq!(
+            elevated
+                .verify(br#"{"version":"1.0.1","assets":[]}"#)
+                .unwrap_err()
+                .code,
+            ErrorCode::Busy
+        );
+    }
+
     #[test]
     fn closed_actions_reject_command_injection() {
         assert!(parse_action("service-start;whoami", false).is_err());

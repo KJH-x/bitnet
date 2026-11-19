@@ -2,7 +2,7 @@
 # Build-only: never executes maintainer scripts, starts services, or installs packages.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-version=${VERSION:-0.1.2}
+version=${VERSION:-0.1.5}
 arch=${ARCH:-$(dpkg --print-architecture)}
 glibc_min=${GLIBC_MIN:-$(getconf GNU_LIBC_VERSION | awk '{print $2}')}
 case "$arch" in amd64|arm64|i386) ;; *) echo 'Supported package architectures: amd64 arm64 i386' >&2; exit 2;; esac
@@ -49,7 +49,7 @@ mkdir -p "$stage/core/DEBIAN" "$stage/core/usr/bin" "$stage/core/usr/libexec/bit
 mkdir -p "$stage/gui/usr/share/icons/hicolor/scalable/apps"
 for name in bitengine bitctl bitmaint; do install -m 0755 "$bin/$name" "$stage/core/usr/bin/$name"; done
 install -m 0755 "$bin/bitmaint" "$stage/core/usr/libexec/bitnet/bitmaint"
-install -m 0755 "$bin/bitnet-gui" "$stage/gui/usr/bin/bitnet-gui"
+for name in bitnet-gui bitnet-tui bitnet-web; do install -m 0755 "$bin/$name" "$stage/gui/usr/bin/$name"; done
 install -m 0644 "$root/installers/linux/bitnet.service" "$stage/core/lib/systemd/system/bitnet.service"
 install -m 0644 "$root/installers/linux/bitnet.service" "$stage/core/usr/lib/bitnet/templates/bitnet.service"
 for script in postinst prerm postrm; do install -m 0755 "$root/installers/linux/$script" "$stage/core/DEBIAN/$script"; done
@@ -63,6 +63,7 @@ for package in core gui; do
     install -m 0644 "$licenses/THIRD-PARTY-NOTICES.txt" "$docs/THIRD-PARTY-NOTICES.txt"
     install -m 0644 "$licenses/THIRD-PARTY-NOTICES.json" "$docs/THIRD-PARTY-NOTICES.json"
 done
+install -m 0644 "$root/crates/bitnet-gui/assets/fonts/LICENSE.txt" "$stage/gui/usr/share/doc/bitnet-gui/FONT-OFL.txt"
 cat > "$stage/core/DEBIAN/control" <<EOF
 Package: bitnet-core
 Version: $version
@@ -83,17 +84,18 @@ Depends: bitnet-core (= $version), libx11-6, libxkbcommon0, libwayland-client0, 
 Recommends: libsecret-tools, gnome-keyring | keepassxc
 Section: net
 Priority: optional
-Description: BitNet graphical desktop control client
+Description: BitNet graphical and terminal clients with an on-demand log viewer
 EOF
 mkdir -p "$out"
 python3 "$root/scripts/build-deb.py" "$stage/core" "$out/bitnet-core_${version}_${arch}.deb"
 python3 "$root/scripts/build-deb.py" "$stage/gui" "$out/bitnet-gui_${version}_${arch}.deb"
 dpkg-deb --info "$out/bitnet-core_${version}_${arch}.deb" >/dev/null
 dpkg-deb --info "$out/bitnet-gui_${version}_${arch}.deb" >/dev/null
-for name in bitengine bitctl bitmaint bitnet-gui; do install -m 0755 "$bin/$name" "$stage/portable/bitnet-$version/$name"; done
+for name in bitengine bitctl bitmaint bitnet-gui bitnet-tui bitnet-web; do install -m 0755 "$bin/$name" "$stage/portable/bitnet-$version/$name"; done
 cp "$root/LICENSE" "$stage/portable/bitnet-$version/LICENSE"
 mkdir -p "$stage/portable/bitnet-$version/licenses"
 cp "$root/crates/bitnet-gateway/NOTICE" "$stage/portable/bitnet-$version/licenses/GATEWAY-NOTICE.txt"
+cp "$root/crates/bitnet-gui/assets/fonts/LICENSE.txt" "$stage/portable/bitnet-$version/licenses/FONT-OFL.txt"
 cp "$licenses/THIRD-PARTY-NOTICES.txt" "$licenses/THIRD-PARTY-NOTICES.json" "$stage/portable/bitnet-$version/licenses/"
 python3 "$root/scripts/build-user-tar.py" "$stage/portable/bitnet-$version" "$out/bitnet-user-$version-linux-$arch.tar.gz"
 set -- "$out/bitnet-core_${version}_${arch}.deb" "$out/bitnet-gui_${version}_${arch}.deb" "$out/bitnet-user-$version-linux-$arch.tar.gz"

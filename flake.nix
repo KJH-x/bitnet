@@ -18,6 +18,14 @@
           type = "app";
           program = "${self.packages.${system}.default}/bin/bitnet-gui";
         };
+        tui = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/bitnet-tui";
+        };
+        web = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/bitnet-web";
+        };
       });
       nixosModules.default = module false;
       homeManagerModules.default = module true;

@@ -1,6 +1,8 @@
 pub mod client;
 mod controller;
+pub mod diagnostics;
 pub mod engine;
+mod health_probe;
 pub mod history;
 pub mod ipc;
 pub mod maintenance;

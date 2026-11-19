@@ -1,0 +1,35 @@
+{
+  "name": "BitNet Han Sans SC",
+  "upstream_name": "Source Han Sans SC",
+  "version": "2.001",
+  "repository": "https://github.com/adobe-fonts/source-han-sans",
+  "commit": "a69eda09a2fb57836e055bddb0a9a61b162ad1e6",
+  "spdx": "OFL-1.1",
+  "license_file": "LICENSE.txt",
+  "license_sha256": "0983abed9371adc8958c321bf8d8036324b4a2e8cc324682b0fe0c699e63a009",
+  "license_url": "https://raw.githubusercontent.com/adobe-fonts/source-han-sans/a69eda09a2fb57836e055bddb0a9a61b162ad1e6/LICENSE.txt",
+  "subset": "ASCII, Latin-1, punctuation, arrows, fullwidth forms, GB2312 level 1",
+  "fonttools": "4.62.1",
+  "files": [
+    {
+      "file": "BitNetHanSansSC-Regular-3755.otf",
+      "family": "BitNet Han Sans SC",
+      "style": "Regular",
+      "sha256": "89a0772dc0c22bb476d58929d3aa3c2a1d7aac275d746857442d3147c42b453f",
+      "bytes": 1959036,
+      "source_file": "SourceHanSansSC-Regular.otf",
+      "source_sha256": "a2125a726118e672952ebc914bdf3e7ef4b8f7c19f56c1044b747a02d107a111",
+      "source_url": "https://raw.githubusercontent.com/adobe-fonts/source-han-sans/a69eda09a2fb57836e055bddb0a9a61b162ad1e6/OTF/SimplifiedChinese/SourceHanSansSC-Regular.otf"
+    },
+    {
+      "file": "BitNetHanSansSC-Medium-3755.otf",
+      "family": "BitNet Han Sans SC Medium",
+      "style": "Medium",
+      "sha256": "c33061bb0c4d819e51f06abfc21c066a2aaa1a19421e7bb165fc5e884d393236",
+      "bytes": 1954624,
+      "source_file": "SourceHanSansSC-Medium.otf",
+      "source_sha256": "b6d06ae567c25e347e5f04026179277aab7c2bf495dc4ea88a67a95e365deba7",
+      "source_url": "https://raw.githubusercontent.com/adobe-fonts/source-han-sans/a69eda09a2fb57836e055bddb0a9a61b162ad1e6/OTF/SimplifiedChinese/SourceHanSansSC-Medium.otf"
+    }
+  ]
+}

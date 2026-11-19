@@ -2,7 +2,7 @@
 
 项目本体采用根目录 `LICENSE` 中的 MIT 文本，版权行为 `Copyright (c) 2026 BitNet contributors`。网关协议适配的来源、上游作者版权和 MIT 文本另外保留在 `crates/bitnet-gateway/NOTICE`。两份原文均随客户端、系统后台及便携包分发。
 
-`scripts/generate-notices.py` 使用 Python 标准库和 `cargo metadata --offline --locked`，只读当前机器已有的依赖缓存，不安装工具、不修改依赖、不联网。默认选择 `rustc` 报告的宿主目标，发布时应显式指定目标。缺少目标依赖缓存时失败，不自动下载。
+`scripts/generate-notices.py` 使用 Python 标准库和 Cargo 的离线依赖数据，读取当前机器已有的依赖缓存。默认选择 `rustc` 报告的宿主目标，发布时应显式指定目标。缺少目标依赖缓存时返回错误。
 
 ```text
 python scripts/generate-notices.py --target x86_64-pc-windows-msvc --strict
@@ -11,7 +11,7 @@ python scripts/generate-notices.py --target x86_64-pc-windows-msvc --output-dir 
 
 默认生成 `build/licenses/THIRD-PARTY-NOTICES.txt` 和 `build/licenses/THIRD-PARTY-NOTICES.json`。不同目标并行打包必须分别指定输出目录，防止相互覆盖。TXT 保存项目许可、依赖的名称/版本/来源/SPDX 表达式、原文索引和完整原始许可/声明文本；相同原始字节的文本按 SHA256 只收录一次。JSON 同时保存原文、原始文件字节哈希、编码、依赖特性、来源和收集问题。不会选择或改写双许可条件，也不会用标准模板替换缺失的作者版权。
 
-范围为选定目标上全部工作区成员的普通依赖和构建依赖闭包，排除仅开发依赖的边。构建依赖保守收录；Cargo 的特性可能包含解析时的开发特性统一结果。这份资料不是精确到最终链接符号的 SBOM，也不证明发布包已完成所有许可审计。系统库、另外静态链接的库、字体及安装器自身带入的组件需要另外核对。
+收录选定目标上全部工作区成员的普通依赖和构建依赖。`cargo tree` 确定实际启用的包，`cargo metadata` 提供版本、来源和许可信息。交叉编译的构建依赖也可能来自宿主目标。多个来源使用同一包名与版本时，收录解析结果中所有匹配项。系统库、另外静态链接的库、字体及安装器自身带入的组件单独核对。
 
 缺少原文、无 SPDX 信息、不可读文件或扫描上限均写入报告。默认仍生成报告供检查；`--strict` 在写完报告后以状态码 2 阻止含收集问题的发布。运行/输入错误以状态码 1 返回。文件及目录扫描有边界，拒绝包目录外的许可符号链接、空文件、二进制 NUL 和超限文档。JSON 不包含个人缓存绝对路径。
 
@@ -20,6 +20,14 @@ python scripts/generate-notices.py --target x86_64-pc-windows-msvc --output-dir 
 对于同仓库子 crate，只有仓库 URL、完整提交和 SPDX 表达式一致，才关联根 crate 随包携带的许可。注册表依赖从 `.cargo_vcs_info.json` 读取提交，Git 依赖用本地 `git` 核对缓存 checkout 的 HEAD 和 Cargo 锁定的提交。报告记录来源 crate、提交及原文哈希。
 
 若原 crate 包未带原文，人工读取官方仓库对应完整提交的许可文本，可保留在 `docs/licenses/`，在 `upstream-provenance.json` 登记依赖名称/版本、仓库、提交、准确原文 URL、文件名和 SHA256。生成器始终离线，只在这些字段与当前 Cargo 依赖逐项一致且本地文件哈希相符时使用；不匹配便保留缺项。不得用默认分支或仅同名协议冒充该版本的许可。
+
+## 桌面字体
+
+GUI 内嵌 Adobe Source Han Sans SC 2.001 的 Regular 与 Medium 子集，原始文件来自上游 `2.001R`，提交为 `a69eda09a2fb57836e055bddb0a9a61b162ad1e6`。字体采用 SIL OFL 1.1，并保留原作者版权。子集的主名称改为 `BitNet Han Sans SC` 和 `BitNet Han Sans SC Medium`，遵守上游对 `Source` 的保留名称要求。
+
+两个子集合计 3,913,660 字节，覆盖 ASCII、Latin-1、标点、箭头、全角符号与 GB2312 一级汉字。源文件和产物的 URL、SHA-256、生成工具版本保存在 [字体清单](../crates/bitnet-gui/assets/fonts/manifest.json)，完整原始 [OFL 文本](../crates/bitnet-gui/assets/fonts/LICENSE.txt) 随桌面包分发为 `FONT-OFL.txt`。许可生成器核对字体字节和许可证哈希，并将原文写入第三方声明。
+
+复现命令和运行时家族名见 [字体资产说明](../crates/bitnet-gui/assets/fonts/README.md)。
 
 ## 额外静态库
 

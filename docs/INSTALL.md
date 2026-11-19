@@ -4,9 +4,9 @@
 
 ## Windows
 
-普通用户运行 `BitNetSetup-<版本>-windows-<架构>.exe`。默认安装桌面界面、CLI、个人引擎和维护工具到 `%LOCALAPPDATA%\Programs\BitNet`。选择后台服务时才请求系统授权；取消授权会保留已成功安装的客户端。完成页可直接启动界面。个人数据位于 `%LOCALAPPDATA%\BitNet`，与程序文件分开。程序采用静态 CRT，不要求另装 VC++ 运行库。
+普通用户运行 `BitNetSetup-<版本>-windows-<架构>.exe`。默认安装桌面界面、CLI、TUI、Web 日志查看器、个人引擎和维护工具到 `%LOCALAPPDATA%\Programs\BitNet`。选择后台服务时才请求系统授权；取消授权会保留已成功安装的客户端。完成页可直接启动界面。个人数据位于 `%LOCALAPPDATA%\BitNet`，与程序文件分开。程序采用静态 CRT，不要求另装 VC++ 运行库。
 
-CLI 未写入全局 PATH，可进入安装目录运行，或在 PowerShell 使用 `& "$env:LOCALAPPDATA\Programs\BitNet\bitctl.exe" status`。免安装 ZIP 包含四个程序、许可文本及已签名的离线服务缓存，解压后可直接运行 `bitnet-gui.exe` 或 `bitctl.exe`；默认数据仍在 AppData。需要独立数据目录时，在启动前设置 `BITNET_DATA_DIR` 为绝对路径，只影响个人模式。
+命令行程序未写入全局 PATH。可在 PowerShell 使用 `& "$env:LOCALAPPDATA\Programs\BitNet\bitctl.exe" status`，或进入安装目录运行 `.\bitnet-tui.exe`。免安装 ZIP 提供同一组程序、许可文本及已签名的离线服务缓存。默认数据仍在 AppData。需要独立数据目录时，在启动前设置 `BITNET_DATA_DIR` 为绝对路径，只影响个人模式。
 
 无人值守服务独立安装到 Program Files，固定服务名 `BitNet`，身份为 `NT SERVICE\BitNet`，系统数据位于 `%ProgramData%\BitNet`。凭据用该身份的用户范围 DPAPI 加密，数据 ACL 只允许服务身份、SYSTEM 与 Administrators。客户端和服务具有独立 MSI ProductCode、UpgradeCode 与文件组件；卸载程序不删除账号数据。
 
@@ -31,7 +31,7 @@ bitmaint --scope system --action service-remove --interactive
 
 ## Linux
 
-基线为 Ubuntu 22.04 amd64/arm64（systemd 249），32 位基线为 Debian 12 i386（systemd 252）。32 位 Rust 目标要求 i686/SSE2，不承诺更早 CPU。`bitnet-core` 提供后台、CLI 与维护工具；`bitnet-gui` 提供桌面界面，并依赖同版本 core。
+基线为 Ubuntu 22.04 amd64/arm64（systemd 249），32 位基线为 Debian 12 i386（systemd 252）。32 位 Rust 目标要求 i686/SSE2，不承诺更早 CPU。`bitnet-core` 提供后台、CLI 与维护工具。`bitnet-gui` 包提供桌面界面、TUI 和 Web 日志查看器，依赖同版本 core。
 
 ```sh
 sudo apt install ./bitnet-core_<版本>_<架构>.deb ./bitnet-gui_<版本>_<架构>.deb
@@ -45,22 +45,24 @@ systemd 创建 `/run/bitnet` 为 0755；引擎创建 `control.sock` 为 0666，�
 
 Ubuntu 24.04 等较新系统可由管理员将主密钥转为 `systemd-creds --with-key=host encrypt` 输出，并通过 drop-in 替换为 `LoadCredentialEncrypted=masterkey:<加密文件>`；当前默认包保留 systemd 249 兼容方式，不自动迁移或丢弃旧密钥。该方式不依赖 TPM。
 
-无需管理员的个人模式使用 `bitnet-user-*.tar.gz`，同目录启动 `bitnet-gui` 或 `bitctl`。账号加密主密钥放入桌面 Secret Service，需要 `libsecret-tools` 和已解锁的提供程序，例如 GNOME Keyring 或启用 Secret Service 的 KeePassXC。它不能代替无人登录时的系统服务模式；缺少密钥环时明确报错，绝不降级明文。
+无需管理员的个人模式使用 `bitnet-user-*.tar.gz`。解压后可在同一目录运行 `./bitnet-gui`、`./bitnet-tui` 或 `./bitctl`。账号加密主密钥放入桌面 Secret Service，需要 `libsecret-tools` 和已解锁的提供程序，例如 GNOME Keyring 或启用 Secret Service 的 KeePassXC。它不能代替无人登录时的系统服务模式；缺少密钥环时明确报错，绝不降级明文。
 
 ## 其他安装方式
 
 - Windows 的 `BitNetPortable-<版本>-windows-<架构>.exe` 双击运行，在当前用户的本地应用数据目录展开独立引擎与桌面程序。支持 `--silent`。需要离线系统服务时使用安装器或完整 ZIP。
-- Linux AppImage 解压到用户私有数据目录的版本子目录，保障 GUI 退出后个人引擎和启动项仍可用。通常直接运行，WSL 或无 FUSE 环境可使用 `--appimage-extract-and-run`。追加 `--cli` 可调用同包 CLI，如 `./BitNet.AppImage --cli status`。
-- Linux RPM 将 GUI、CLI 与个人引擎安装至系统路径，需要 Fedora 等 RPM 发行版的桌面依赖和 Secret Service 提供程序。系统服务仍通过支持该路径的 DEB 分发。
-- Cargo 安装面向具备平台编译依赖的个人模式。连用下面三条命令，确保四个程序安装到同一个 Cargo bin 目录。
+- Linux AppImage 解压到用户私有数据目录的版本子目录，保障 GUI 退出后个人引擎和启动项仍可用。WSL 或无 FUSE 环境可使用 `--appimage-extract-and-run`。用 `--cli`、`--tui` 或 `--web` 进入对应程序，例如 `./BitNet.AppImage --cli status`。
+- Linux RPM 将 GUI、CLI、TUI、Web 日志查看器与个人引擎安装至系统路径，需要 Fedora 等 RPM 发行版的桌面依赖和 Secret Service 提供程序。系统服务仍通过支持该路径的 DEB 分发。
+- Cargo 安装面向具备平台编译依赖的个人模式。将所需程序安装到同一个 Cargo bin 目录。
 
 ```sh
 cargo install --locked --git https://github.com/KJH-x/bitnet bitnet-runtime --bins
 cargo install --locked --git https://github.com/KJH-x/bitnet bitnet-cli
 cargo install --locked --git https://github.com/KJH-x/bitnet bitnet-gui
+cargo install --locked --git https://github.com/KJH-x/bitnet bitnet-tui
+cargo install --locked --git https://github.com/KJH-x/bitnet bitnet-web
 ```
 
-Linux x86_64 和 aarch64 用户可执行 `nix run github:KJH-x/bitnet`。NixOS 或 Home Manager 的 flake 可分别导入 `inputs.bitnet.nixosModules.default` 或 `inputs.bitnet.homeManagerModules.default`。模块管理个人图形会话：
+Linux x86_64 和 aarch64 用户可执行 `nix run github:KJH-x/bitnet`。运行 TUI 或 Web 日志查看器时追加 `#tui` 或 `#web`。NixOS 或 Home Manager 的 flake 可分别导入 `inputs.bitnet.nixosModules.default` 或 `inputs.bitnet.homeManagerModules.default`。模块管理个人图形会话：
 
 ```nix
 services.bitnet = {
@@ -72,7 +74,7 @@ services.bitnet = {
 
 ## macOS
 
-DMG 内可拖拽 `BitNet.app` 运行个人模式；CLI 在 app 的 `Contents/MacOS/bitctl`。需要开机无人值守时安装 DMG 内 Service PKG，安装器请求管理员授权。App 自带同一签名 Service.pkg 缓存；首装缺少维护 helper 时界面打开系统安装器，并提示完成安装后刷新，打开安装器不等于安装成功。Client.pkg 仅更新 App，Service.pkg 仅更新后台，个人模式更新不会顺带开启服务；完整组合 PKG 供明确选择完整安装时使用。
+DMG 内可拖拽 `BitNet.app` 运行个人模式。CLI、TUI 和 Web 日志查看器位于 App 的 `Contents/MacOS` 目录。需要开机无人值守时安装 DMG 内 Service PKG，安装器请求管理员授权。App 自带同一签名 Service.pkg 缓存；首装缺少维护 helper 时界面打开系统安装器，并提示完成安装后刷新，打开安装器不等于安装成功。Client.pkg 仅更新 App，Service.pkg 仅更新后台，个人模式更新不会顺带开启服务；完整组合 PKG 供明确选择完整安装时使用。
 
 PKG 安装隐藏、禁止登录的 `_bitnet` 系统身份，后台 worker 使用该身份。按需 root Keychain broker 使用 launchd Sockets 激活，只有 root 或 `_bitnet` 可取得应用主密钥；普通用户仅通过管理 IPC 修改共享账号，不能取回密码。broker 每次启动先准备开机后重建的 `/var/run/bitnet`，再访问 System.keychain。维护模板与 helper 位于 root 控制的 `/Library/PrivilegedHelperTools`。
 

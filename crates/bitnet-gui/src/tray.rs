@@ -6,19 +6,39 @@
 #[derive(Debug, Clone, Copy)]
 pub enum Action {
     Open,
+    #[cfg(windows)]
+    Toggle,
     Check,
     Pause,
     Resume,
     Exit,
 }
 
-const MENU: [(Action, &str, &str); 5] = [
-    (Action::Open, "open", "打开 BitNet / Open"),
-    (Action::Check, "check", "立即检查 / Check"),
-    (Action::Pause, "pause", "暂停自动认证 / Pause"),
-    (Action::Resume, "resume", "恢复自动认证 / Resume"),
-    (Action::Exit, "exit", "退出界面 / Exit UI"),
+const MENU: [(Action, &str, &str, &str); 5] = [
+    (Action::Open, "open", "打开 BitNet", "Open BitNet"),
+    (Action::Check, "check", "立即检查", "Check now"),
+    (
+        Action::Pause,
+        "pause",
+        "暂停自动认证",
+        "Pause automatic sign-in",
+    ),
+    (
+        Action::Resume,
+        "resume",
+        "恢复自动认证",
+        "Resume automatic sign-in",
+    ),
+    (Action::Exit, "exit", "退出界面", "Quit desktop app"),
 ];
+
+fn localized(english: bool, chinese: &'static str, english_text: &'static str) -> &'static str {
+    if english {
+        english_text
+    } else {
+        chinese
+    }
+}
 
 const ICON_SIZE: i32 = 32;
 
@@ -133,6 +153,7 @@ impl Appearance {
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub struct Tray {
     icon: tray_icon::TrayIcon,
+    items: [tray_icon::menu::MenuItem; MENU.len()],
     appearance: Appearance,
 }
 
@@ -145,20 +166,27 @@ impl Tray {
         };
 
         let menu = Menu::new();
-        for (_, id, title) in MENU {
-            menu.append(&MenuItem::with_id(id, title, true, None))
-                .map_err(|e| e.to_string())?;
-        }
         let appearance = Appearance::CHECKING;
+        let items = MENU.map(|(_, id, zh, en)| {
+            MenuItem::with_id(id, localized(appearance.english, zh, en), true, None)
+        });
+        for item in &items {
+            menu.append(item).map_err(|e| e.to_string())?;
+        }
         let icon = Icon::from_rgba(appearance.pixels(), ICON_SIZE as u32, ICON_SIZE as u32)
             .map_err(|e| e.to_string())?;
-        let icon = TrayIconBuilder::new()
+        let builder = TrayIconBuilder::new()
             .with_icon(icon)
             .with_tooltip(appearance.tooltip())
-            .with_menu(Box::new(menu))
-            .build()
-            .map_err(|e| e.to_string())?;
-        Ok(Self { icon, appearance })
+            .with_menu(Box::new(menu));
+        #[cfg(windows)]
+        let builder = builder.with_menu_on_left_click(false);
+        let icon = builder.build().map_err(|e| e.to_string())?;
+        Ok(Self {
+            icon,
+            items,
+            appearance,
+        })
     }
 
     pub fn is_starting(&self) -> bool {
@@ -170,50 +198,112 @@ impl Tray {
     }
 
     pub fn update(&mut self, snapshot: &bitnet_core::Snapshot, english: bool) {
-        let appearance = Appearance::from_snapshot(snapshot, english);
+        self.apply_appearance(Appearance::from_snapshot(snapshot, english));
+    }
+
+    pub fn set_language(&mut self, english: bool) {
+        self.apply_appearance(Appearance {
+            english,
+            ..self.appearance
+        });
+    }
+
+    fn apply_appearance(&mut self, appearance: Appearance) {
         if appearance == self.appearance {
             return;
         }
-        self.appearance = appearance;
-        if let Ok(icon) =
-            tray_icon::Icon::from_rgba(appearance.pixels(), ICON_SIZE as u32, ICON_SIZE as u32)
-        {
-            let _ = self.icon.set_icon(Some(icon));
+        if appearance.english != self.appearance.english {
+            for (item, (_, _, zh, en)) in self.items.iter().zip(MENU) {
+                item.set_text(localized(appearance.english, zh, en));
+            }
         }
+        if appearance.status != self.appearance.status {
+            if let Ok(icon) =
+                tray_icon::Icon::from_rgba(appearance.pixels(), ICON_SIZE as u32, ICON_SIZE as u32)
+            {
+                let _ = self.icon.set_icon(Some(icon));
+            }
+        }
+        self.appearance = appearance;
         let _ = self.icon.set_tooltip(Some(appearance.tooltip()));
     }
 
     pub fn poll(&self) -> Option<Action> {
-        use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
-
-        if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-            return MENU
+        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            if let Some(action) = MENU
                 .iter()
-                .find(|(_, id, _)| *id == event.id.as_ref())
-                .map(|(action, _, _)| *action);
+                .find(|(_, id, _, _)| *id == event.id.as_ref())
+                .map(|(action, _, _, _)| *action)
+            {
+                return Some(action);
+            }
         }
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if matches!(
-                event,
-                TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                } | TrayIconEvent::DoubleClick {
-                    button: MouseButton::Left,
-                    ..
-                }
-            ) {
-                return Some(Action::Open);
+        while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
+            if event.id() != self.icon.id() {
+                continue;
+            }
+            if let Some(action) = icon_action(event) {
+                return Some(action);
             }
         }
         None
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn icon_action(event: tray_icon::TrayIconEvent) -> Option<Action> {
+    use tray_icon::{MouseButton, TrayIconEvent};
+    match event {
+        #[cfg(windows)]
+        TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } => Some(Action::Toggle),
+        #[cfg(target_os = "macos")]
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: tray_icon::MouseButtonState::Up,
+            ..
+        } => Some(Action::Open),
+        _ => None,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{icon_action, Action};
+    use tray_icon::{MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId};
+
+    #[test]
+    fn only_left_double_click_changes_visibility() {
+        let id = TrayIconId::new("test");
+        let rect = Rect::default();
+        let up = TrayIconEvent::Click {
+            id: id.clone(),
+            position: rect.position,
+            rect,
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+        };
+        let double = |button| TrayIconEvent::DoubleClick {
+            id: id.clone(),
+            position: rect.position,
+            rect,
+            button,
+        };
+        assert!(icon_action(up.clone()).is_none());
+        assert!(matches!(
+            icon_action(double(MouseButton::Left)),
+            Some(Action::Toggle)
+        ));
+        assert!(icon_action(up).is_none());
+        assert!(icon_action(double(MouseButton::Right)).is_none());
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{Action, Appearance, ICON_SIZE, MENU};
+    use super::{localized, Action, Appearance, ICON_SIZE, MENU};
     use ksni::TrayMethods;
     use std::{
         sync::mpsc::{self, Receiver, SyncSender},
@@ -276,9 +366,9 @@ mod linux {
 
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
             MENU.iter()
-                .map(|&(action, _, title)| {
+                .map(|&(action, _, zh, en)| {
                     ksni::menu::StandardItem {
-                        label: title.into(),
+                        label: localized(self.appearance.english, zh, en).into(),
                         activate: Box::new(move |item: &mut Self| {
                             let _ = item.actions.try_send(action);
                         }),
@@ -337,6 +427,14 @@ mod linux {
                 }
                 *current = appearance;
                 true
+            });
+        }
+
+        pub fn set_language(&mut self, english: bool) {
+            self.appearance.send_if_modified(|current| {
+                let changed = current.english != english;
+                current.english = english;
+                changed
             });
         }
 
@@ -405,6 +503,8 @@ impl Tray {
     }
 
     pub fn update(&mut self, _: &bitnet_core::Snapshot, _: bool) {}
+
+    pub fn set_language(&mut self, _: bool) {}
 
     pub fn poll(&self) -> Option<Action> {
         None
