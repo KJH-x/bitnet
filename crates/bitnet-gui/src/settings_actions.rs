@@ -446,7 +446,7 @@ try {
     Add-Type -AssemblyName System.Windows.Forms
     $dialog = New-Object Windows.Forms.SaveFileDialog
     $dialog.Title = if ($env:BITNET_SAVE_LANGUAGE -eq 'en') { 'Export settings' } else {
-        [string]::Concat([char]0x5BFC, [char]0x51FA, [char]0x8BBE, [char]0x7F6E)
+        -join [char[]]@(0x5BFC, 0x51FA, 0x8BBE, 0x7F6E)
     }
     $dialog.FileName = 'bitnet-settings.json'
     $dialog.Filter = 'JSON (*.json)|*.json'
