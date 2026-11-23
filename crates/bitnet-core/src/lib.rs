@@ -126,9 +126,29 @@ pub fn is_public_ipv6(address: Ipv6Addr) -> bool {
         && !(first == 0x3fff && second & 0xf000 == 0)
 }
 
-pub fn is_cernet_ipv6(address: Ipv6Addr) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EducationNetworkV6 {
+    Cernet,
+    Cernet2,
+    Fiti,
+}
+
+/// Recognizable address allocations. This is a display hint, not a route or trust decision.
+pub fn education_network_ipv6(address: Ipv6Addr) -> Option<EducationNetworkV6> {
     let [first, second, ..] = address.segments();
-    (first, second) == (0x2001, 0x0da8)
+    match (first, second) {
+        (0x2001, 0x0250 | 0x0251) => Some(EducationNetworkV6::Cernet),
+        (0x2001, 0x0da8) | (0x240c, 0xc000..=0xcfff) => Some(EducationNetworkV6::Cernet2),
+        (0x240a, 0xa000..=0xafff) => Some(EducationNetworkV6::Fiti),
+        _ => None,
+    }
+}
+
+pub fn is_cernet_ipv6(address: Ipv6Addr) -> bool {
+    matches!(
+        education_network_ipv6(address),
+        Some(EducationNetworkV6::Cernet | EducationNetworkV6::Cernet2)
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -180,9 +200,13 @@ const DEFAULT_HEALTH_TEXT_URL: &str = "http://www.msftconnecttest.com/connecttes
 const DEFAULT_HEALTH_STATUS_URL: &str = "http://connectivitycheck.gstatic.com/generate_204";
 pub const MAX_HEALTH_TARGETS: usize = 8;
 pub const MAX_IPV6_TARGETS: usize = 8;
-const DEFAULT_IPV6_TARGETS: [&str; 2] = [
+// RFC 8484 GET for the fixed example.com AAAA question.
+pub const DNS_FREE_IPV6_TARGET: &str =
+    "https://[2606:4700:4700::1111]/dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAAcAAE";
+const DEFAULT_IPV6_TARGETS: [&str; 3] = [
     "http://api-ipv6.ip.sb/ip",
     "http://v6.test-ipv6.com/ip/?callback=cb",
+    DNS_FREE_IPV6_TARGET,
 ];
 
 fn default_ipv6_targets_match(targets: &[String]) -> bool {
@@ -677,11 +701,29 @@ pub struct Ipv6ProbeObservation {
     pub dns_result: Option<DnsProbeResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addresses: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub non_public_target: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub literal_https_reachable: bool,
     pub attempted: usize,
     pub succeeded: usize,
     pub local_is_v6: Option<bool>,
     pub timed_out: bool,
     pub elapsed_ms: u64,
+}
+
+impl Ipv6ProbeObservation {
+    pub fn confirmed_address(&self) -> Option<Ipv6Addr> {
+        self.reported_address.filter(|address| {
+            self.succeeded > 0
+                && self
+                    .outcome
+                    .is_none_or(|outcome| outcome == ProbeOutcome::Match)
+                && self.local_is_v6 != Some(false)
+                && (self.kind != Ipv6ProbeKind::DualStack || self.local_is_v6 == Some(true))
+                && is_public_ipv6(*address)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -725,6 +767,48 @@ pub struct HealthStatus {
 }
 
 impl HealthStatus {
+    pub fn confirmed_ipv6(&self) -> Option<Ipv6Addr> {
+        self.ipv6_probes
+            .iter()
+            .find_map(Ipv6ProbeObservation::confirmed_address)
+    }
+
+    pub fn observed_ipv6_status(&self) -> Ipv6Status {
+        if self.confirmed_ipv6().is_some()
+            || self
+                .ipv6_probes
+                .iter()
+                .any(|probe| probe.literal_https_reachable)
+        {
+            return if self.ipv6_probes.iter().any(|probe| {
+                probe.kind == Ipv6ProbeKind::DualStack
+                    && probe.succeeded > 0
+                    && probe.local_is_v6 == Some(false)
+            }) {
+                Ipv6Status::GlobalNotPreferred
+            } else {
+                Ipv6Status::Normal
+            };
+        }
+        let ipv6_only = || {
+            self.ipv6_probes
+                .iter()
+                .filter(|p| p.kind != Ipv6ProbeKind::DualStack)
+        };
+        let http_replied = self.ipv6_probes.iter().any(|p| p.local_is_v6 == Some(true))
+            || ipv6_only().any(|p| p.status.is_some());
+        if !http_replied && ipv6_only().any(|p| p.attempted > 0 && !p.non_public_target) {
+            return Ipv6Status::GlobalUnreachable;
+        }
+        if http_replied || self.ipv6_probes.iter().any(|p| p.non_public_target) {
+            return Ipv6Status::Unknown;
+        }
+        match self.ipv6_status {
+            Ipv6Status::Disabled | Ipv6Status::LinkLocalOnly => self.ipv6_status,
+            _ => Ipv6Status::Unknown,
+        }
+    }
+
     pub fn redacted(&self) -> Self {
         let mut state = self.clone();
         state.local_ipv6 = None;
@@ -1047,6 +1131,52 @@ pub fn retry_delay(attempt: u32, max_secs: u64, jitter_percent: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn education_address_hints_respect_allocation_boundaries() {
+        use EducationNetworkV6::*;
+        for (address, expected) in [
+            ("2001:da8:280::1", Some(Cernet2)),
+            ("2001:250::1", Some(Cernet)),
+            ("2001:251::1", Some(Cernet)),
+            ("240c:c000::1", Some(Cernet2)),
+            ("240c:cfff:ffff::1", Some(Cernet2)),
+            ("240a:afff::1", Some(Fiti)),
+            ("240c::1", None),
+            ("240c:d000::1", None),
+            ("2001:daa::1", None),
+            ("fdfe:dcba:9876::1", None),
+        ] {
+            assert_eq!(education_network_ipv6(address.parse().unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn ipv6_status_uses_observations_even_with_a_legacy_normal_status() {
+        let mut health = HealthStatus {
+            ipv6_status: Ipv6Status::Normal,
+            local_ipv6: Some("2001:da8::1".parse().unwrap()),
+            ipv6_probes: vec![serde_json::from_value(serde_json::json!({
+                "target": 1, "attempted": 1, "succeeded": 0, "timed_out": true,
+                "elapsed_ms": 5000, "outcome": "timeout"
+            }))
+            .unwrap()],
+            ..HealthStatus::default()
+        };
+        assert_eq!(health.observed_ipv6_status(), Ipv6Status::GlobalUnreachable);
+        health.ipv6_probes[0] = serde_json::from_value(serde_json::json!({
+            "target": 1, "attempted": 0, "succeeded": 0, "timed_out": false,
+            "elapsed_ms": 10, "non_public_target": true
+        }))
+        .unwrap();
+        assert_eq!(health.observed_ipv6_status(), Ipv6Status::Unknown);
+        health.ipv6_probes.push(serde_json::from_value(serde_json::json!({
+            "target": 3, "attempted": 1, "succeeded": 1, "timed_out": false,
+            "elapsed_ms": 100, "status": 200, "outcome": "match", "literal_https_reachable": true
+        })).unwrap());
+        assert_eq!(health.observed_ipv6_status(), Ipv6Status::Normal);
+        assert_eq!(health.confirmed_ipv6(), None);
+    }
+
     #[test]
     fn secrets_are_not_debugged() {
         let s = Secret::new("do-not-print");

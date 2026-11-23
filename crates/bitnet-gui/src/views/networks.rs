@@ -379,11 +379,16 @@ impl App {
                 self.t("显示备选网卡", "Show other adapters")
             };
             toolbar = toolbar.push(
-                button(text(format!("{label} ({alternate_count})")).size(d.typography.body))
-                    .on_press(Message::ToggleAlternateAdapters)
-                    .height(Length::Fixed(32.0))
-                    .padding([0, 12])
-                    .style(design::flat_button),
+                button(
+                    text(format!("{label} ({alternate_count})"))
+                        .size(d.typography.body)
+                        .height(Length::Fill)
+                        .align_y(alignment::Vertical::Center),
+                )
+                .on_press(Message::ToggleAlternateAdapters)
+                .height(Length::Fixed(32.0))
+                .padding([0, 12])
+                .style(design::flat_button),
             );
         }
         if self.enabling_automatic {
@@ -743,7 +748,7 @@ impl App {
                             .style(design::text_style(design::muted))
                     ]
                     .width(Length::Fill),
-                    self.ipv6_actions(adapter),
+                    self.ipv6_actions(adapter, true),
                 ]
                 .spacing(d.space.sm)
                 .align_y(alignment::Vertical::Center),
@@ -760,7 +765,11 @@ impl App {
         card(body).into()
     }
 
-    pub(super) fn ipv6_actions(&self, adapter: &NetworkInterface) -> Element<'_, Message> {
+    pub(super) fn ipv6_actions(
+        &self,
+        adapter: &NetworkInterface,
+        renew: bool,
+    ) -> Element<'_, Message> {
         let Some((target, state)) = ipv6_maintenance_target(adapter).zip(adapter.ipv6_enabled)
         else {
             return Space::new().into();
@@ -785,10 +794,23 @@ impl App {
             actions = actions.push(
                 action_button(self.t("重启 IPv6", "Restart IPv6"), width)
                     .on_press_maybe(editable.then_some(Message::Ask(Confirmation::Maintenance(
-                        MaintenanceAction::ResetIpv6 { interface: target },
+                        MaintenanceAction::ResetIpv6 {
+                            interface: target.clone(),
+                        },
                     ))))
                     .style(design::flat_button),
             );
+            if renew {
+                actions = actions.push(
+                    action_button(self.t("续租 IPv6", "Renew IPv6"), width)
+                        .on_press_maybe((editable && adapter.up).then_some(Message::Ask(
+                            Confirmation::Maintenance(MaintenanceAction::RenewIpv6 {
+                                interface: target,
+                            }),
+                        )))
+                        .style(design::flat_button),
+                );
+            }
         } else {
             actions = actions.push(
                 action_button(self.t("启用 IPv6", "Enable IPv6"), width)

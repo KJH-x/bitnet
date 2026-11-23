@@ -187,25 +187,29 @@ impl App {
         let mut body = column![
             setting_row(
                 self.t("界面语言", "Language").to_string(),
-                pick_list(
-                    Some(self.language),
-                    [Language::Chinese, Language::English],
-                    ToString::to_string,
-                )
-                .on_select(Message::LanguageChanged)
-                .width(Length::Fill)
-                .into(),
+                setting_control(
+                    pick_list(
+                        Some(self.language),
+                        [Language::Chinese, Language::English],
+                        ToString::to_string,
+                    )
+                    .on_select(Message::LanguageChanged)
+                    .width(Length::Fill)
+                    .into(),
+                ),
             ),
             setting_row(
                 self.t("主题", "Theme").to_string(),
-                pick_list(
-                    Some(self.appearance),
-                    [Appearance::System, Appearance::Light, Appearance::Dark],
-                    move |value: &Appearance| value.label(english).to_string(),
-                )
-                .on_select(Message::AppearanceChanged)
-                .width(Length::Fill)
-                .into(),
+                setting_control(
+                    pick_list(
+                        Some(self.appearance),
+                        [Appearance::System, Appearance::Light, Appearance::Dark],
+                        move |value: &Appearance| value.label(english).to_string(),
+                    )
+                    .on_select(Message::AppearanceChanged)
+                    .width(Length::Fill)
+                    .into(),
+                ),
             ),
             checkbox(self.draft.settings.automatic)
                 .label(self.t("自动认证", "Automatic authentication"))
@@ -593,7 +597,13 @@ impl App {
     pub(super) fn settings_extra_dialog(&self) -> Option<Element<'_, Message>> {
         let d = design::get();
         if let Some(targets) = &self.settings_actions.ipv6_editor {
-            let mut content = column![].spacing(d.space.sm);
+            let mut content = column![text(self.t(
+                "网址可填写带方括号的 IPv6 地址，直接连接检测站点。",
+                "Use an IPv6 address in brackets to reach a probe site without DNS."
+            ))
+            .size(d.typography.meta)
+            .style(design::text_style(design::muted))]
+            .spacing(d.space.sm);
             for (index, value) in targets.iter().enumerate() {
                 content = content.push(
                     row![

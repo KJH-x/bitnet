@@ -104,7 +104,7 @@ fn main() {
             .nth(1)
             .is_some_and(|a| a == "--help" || a == "-h")
     {
-        println!("BitNet maintenance\nUsage: bitmaint --scope user|system --action ACTION [--interactive] [--purge] [--interface GUID@index] [--manifest-sha256 SHA256]\nActions: service-install, service-start, service-stop, service-remove, repair,\n         check-update, install-update, rollback-update, autostart-on, autostart-off,\n         gui-autostart-on, gui-autostart-off, ipv6-enable, ipv6-disable, ipv6-reset\nIPv6 actions require Windows, system scope and --interface GUID@index.\n--purge is valid only with service-remove. --manifest-sha256 is valid only with install-update.\nNoninteractive operations never elevate.");
+        println!("BitNet maintenance\nUsage: bitmaint --scope user|system --action ACTION [--interactive] [--purge] [--interface GUID@index] [--manifest-sha256 SHA256]\nActions: service-install, service-start, service-stop, service-remove, repair,\n         check-update, install-update, rollback-update, autostart-on, autostart-off,\n         gui-autostart-on, gui-autostart-off, ipv6-enable, ipv6-disable, ipv6-reset, ipv6-renew\nIPv6 actions require Windows, system scope and --interface GUID@index.\n--purge is valid only with service-remove. --manifest-sha256 is valid only with install-update.\nNoninteractive operations never elevate.");
         return;
     }
     let outcome = (|| {
@@ -207,8 +207,18 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(action, MaintenanceAction::DisableIpv6 { .. }));
+        let (_, action, _, _) = parse(&[
+            "--scope",
+            "system",
+            "--action",
+            "ipv6-renew",
+            "--interface",
+            selector,
+        ])
+        .unwrap();
+        assert!(matches!(action, MaintenanceAction::RenewIpv6 { .. }));
         for args in [
-            vec!["--scope", "system", "--action", "ipv6-reset"],
+            vec!["--scope", "system", "--action", "ipv6-renew"],
             vec!["--action", "ipv6-enable", "--interface", "Ethernet@18"],
             vec![
                 "--action",

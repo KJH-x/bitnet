@@ -497,6 +497,7 @@ dependencies = [
  "bitnet-launcher",
  "bitnet-runtime",
  "iced",
+ "iced-mcp",
  "ksni",
  "notify-rust",
  "raw-window-handle",
@@ -2208,6 +2209,31 @@ dependencies = [
  "iced_widget",
  "iced_winit",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "iced-mcp"
+version = "0.3.1"
+dependencies = [
+ "base64 0.22.1",
+ "block2 0.5.1",
+ "futures",
+ "iced",
+ "iced-mcp-protocol",
+ "iced_winit",
+ "objc2 0.5.3",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+ "png",
+ "serde_json",
+]
+
+[[package]]
+name = "iced-mcp-protocol"
+version = "0.3.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -230,8 +230,10 @@ fn ipv6_label(state: Ipv6Status, english: bool) -> &'static str {
         (Ipv6Status::Unknown, true) => "Unknown",
         (Ipv6Status::Disabled, false) => "未启用",
         (Ipv6Status::Disabled, true) => "Disabled",
-        (Ipv6Status::LinkLocalOnly | Ipv6Status::GlobalUnreachable, false) => "无互联网",
-        (Ipv6Status::LinkLocalOnly | Ipv6Status::GlobalUnreachable, true) => "No internet",
+        (Ipv6Status::LinkLocalOnly, false) => "仅限本地",
+        (Ipv6Status::LinkLocalOnly, true) => "Local only",
+        (Ipv6Status::GlobalUnreachable, false) => "探测失败",
+        (Ipv6Status::GlobalUnreachable, true) => "Check failed",
         (Ipv6Status::GlobalNotPreferred, false) => "非首选",
         (Ipv6Status::GlobalNotPreferred, true) => "Not preferred",
         (Ipv6Status::Normal, false) => "正常",
@@ -1129,12 +1131,12 @@ impl App {
                 label_width
             ),
             labelled_row(
-                self.t("认证 IP", "Authenticated IP"),
+                self.t("网关所见 IPv4", "Gateway IPv4"),
                 ip_chip(&authenticated_ip, revealed),
                 label_width,
             ),
             labelled_row(
-                self.t("本机 IP", "Local IP"),
+                self.t("网卡 IPv4", "Adapter IPv4"),
                 ip_chip(&local_ip, revealed),
                 label_width
             ),
@@ -1142,11 +1144,11 @@ impl App {
         .spacing(d.card.gap)
         .width(Length::Fixed(280.0));
 
-        let ipv6 = snapshot.health.ipv6_status;
+        let ipv6 = snapshot.health.observed_ipv6_status();
         let ipv6_address = snapshot
             .health
             .local_ipv6
-            .or(snapshot.health.public_ipv6)
+            .or_else(|| snapshot.health.confirmed_ipv6())
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "—".into());
 
@@ -1489,16 +1491,26 @@ impl App {
                         Some(_) => self.t("已隐藏", "Hidden").into(),
                         None => "—".into(),
                     };
+                    use bitnet_core::{education_network_ipv6, EducationNetworkV6};
+                    let mut local = show_ip(health.local_ipv6);
+                    if let Some(network) = health.local_ipv6.and_then(education_network_ipv6) {
+                        local.push_str(match network {
+                            EducationNetworkV6::Cernet => " · CERNET",
+                            EducationNetworkV6::Cernet2 => " · CERNET2",
+                            EducationNetworkV6::Fiti => " · FITI",
+                        });
+                    }
                     evidence = evidence
+                        .push(pair(self.t("本机 IPv6", "Local IPv6"), local))
                         .push(pair(
-                            self.t("本机 IPv6", "Local IPv6"),
-                            show_ip(health.local_ipv6),
-                        ))
-                        .push(pair(
-                            self.t("站点回显 IPv6", "Reported IPv6"),
-                            show_ip(health.public_ipv6),
+                            self.t("站点所见出口 IPv6", "IPv6 seen by site"),
+                            show_ip(health.confirmed_ipv6()),
                         ));
-                    if let Some(reason) = &health.ipv6_detail {
+                    if let Some(reason) = health
+                        .ipv6_detail
+                        .as_ref()
+                        .filter(|_| health.ipv6_status == health.observed_ipv6_status())
+                    {
                         evidence = evidence.push(text(reason).size(d.typography.meta));
                     }
                     for probe in &health.ipv6_probes {
@@ -1515,9 +1527,13 @@ impl App {
                             .ipv6_targets
                             .get(probe.target.saturating_sub(1))
                             .map_or("—", String::as_str);
+                        let direct_https = provider == bitnet_core::DNS_FREE_IPV6_TARGET;
                         let target = match probe.kind {
                             Ipv6ProbeKind::DualStack => "ds.test-ipv6.com".to_owned(),
                             Ipv6ProbeKind::LargePacket => format!("{provider} · 1600 B"),
+                            _ if direct_https => self
+                                .t("Cloudflare IPv6 直连", "Cloudflare IPv6 direct")
+                                .into(),
                             _ => provider.to_owned(),
                         };
                         let transport = match probe.local_is_v6 {
@@ -1525,16 +1541,35 @@ impl App {
                             Some(false) => " · IPv4",
                             None => "",
                         };
-                        let outcome = probe
-                            .outcome
-                            .map_or(self.t("无结果", "No result"), |result| {
-                                self.probe_outcome(result)
-                            });
+                        let outcome = if probe.literal_https_reachable {
+                            self.t("直连成功", "Direct connection succeeded")
+                        } else if probe.non_public_target {
+                            self.t(
+                                "目标地址不在公网，未测到真实 IPv6",
+                                "No public IPv6 target to test",
+                            )
+                        } else if probe.kind == Ipv6ProbeKind::DualStack
+                            && probe.local_is_v6 == Some(false)
+                            && probe.outcome == Some(bitnet_core::ProbeOutcome::Match)
+                        {
+                            self.t("站点通过 IPv4 响应", "Site reached over IPv4")
+                        } else {
+                            probe
+                                .outcome
+                                .map_or(self.t("无结果", "No result"), |result| {
+                                    self.probe_outcome(result)
+                                })
+                        };
                         let status = probe
                             .status
                             .map_or_else(|| "—".into(), |code| format!("HTTP {code}"));
                         evidence = evidence.push(card(column![
-                            text(format!("{check} · {target}")).size(d.typography.body),
+                            text(if direct_https {
+                                target
+                            } else {
+                                format!("{check} · {target}")
+                            })
+                            .size(d.typography.body),
                             text(format!(
                                 "{outcome} · {status} · {} ms{transport}",
                                 probe.elapsed_ms
@@ -1558,7 +1593,7 @@ impl App {
             {
                 content = content
                     .push(Self::rule(false))
-                    .push(self.ipv6_actions(adapter));
+                    .push(self.ipv6_actions(adapter, false));
             }
         }
         self.dialog(
@@ -2167,22 +2202,15 @@ impl App {
         } else {
             Message::ModeChanged(Mode::System)
         };
-        let scope_actions = row![
-            control(
-                if attached_system {
-                    self.t("重新连接后台", "Reconnect")
-                } else {
-                    self.t("连接到系统后台", "Connect to service")
-                },
-                (maintenance_ready && running).then_some(reconnect),
-                design::flat_button,
-            ),
-            control(
-                self.t("立即检查连接", "Check connection"),
-                (idle && connected.is_some()).then_some(Message::Run(Command::Check)),
-                design::flat_button,
-            ),
-        ]
+        let scope_actions = row![control(
+            if attached_system {
+                self.t("重新连接后台", "Reconnect")
+            } else {
+                self.t("连接到系统后台", "Connect to service")
+            },
+            (maintenance_ready && running).then_some(reconnect),
+            design::flat_button,
+        )]
         .spacing(d.space.sm)
         .align_y(alignment::Vertical::Center);
         let scope_actions = if attached_system || self.mode == Mode::System {
@@ -2526,10 +2554,12 @@ impl App {
                 MaintenanceAction::RollbackUpdate => (self.t("恢复上一已验证版本？", "Restore the previous verified version?"), self.t("只允许使用本机上次验签且 API/schema 兼容的缓存版本，执行前会再次验证。没有可用缓存时操作会明确失败，不从未知来源下载旧版。系统后台回滚需本次管理员确认。", "Only a previously verified local cache with a compatible API and schema can be restored, and it is verified again before use. If no usable cache exists, this operation reports unavailable. Service rollback requires administrator approval for this operation.")),
                 MaintenanceAction::EnableIpv6 { .. }
                 | MaintenanceAction::DisableIpv6 { .. }
-                | MaintenanceAction::ResetIpv6 { .. } => {
+                | MaintenanceAction::ResetIpv6 { .. }
+                | MaintenanceAction::RenewIpv6 { .. } => {
                     let title = match action {
                         MaintenanceAction::EnableIpv6 { .. } => self.t("启用 IPv6？", "Enable IPv6?"),
                         MaintenanceAction::DisableIpv6 { .. } => self.t("禁用 IPv6？", "Disable IPv6?"),
+                        MaintenanceAction::RenewIpv6 { .. } => self.t("重新获取 IPv6 地址？", "Renew the IPv6 address?"),
                         _ => self.t("重启 IPv6？", "Restart IPv6?"),
                     };
                     (title, self.t("Windows 会请求管理员确认。更改期间，远程桌面或正在使用的网络连接可能会断开。", "Windows will ask for administrator approval. Remote Desktop or other active connections may drop."))

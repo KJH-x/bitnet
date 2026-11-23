@@ -48,11 +48,25 @@ try {
         switch ($action) {
             'ipv6-enable'  { Set-TargetBinding $true }
             'ipv6-disable' { Set-TargetBinding $false }
-            'ipv6-reset' {
+            { $_ -eq 'ipv6-reset' -or $_ -eq 'ipv6-renew' } {
+                if ($action -eq 'ipv6-renew') {
+                    if ($adapters[0].Status -ne 'Up' -or !(Get-TargetBinding).Enabled) { exit 2 }
+                    # ipconfig accepts patterns; only pass a single literal adapter alias.
+                    $alias = [string]$adapters[0].Name
+                    if ([string]::IsNullOrWhiteSpace($alias) -or $alias -match '[*?"/]|[\x00-\x1f]|^[- ]|[\\ ]$') { exit 2 }
+                }
                 try {
                     Set-TargetBinding $false
                 } finally {
                     Set-TargetBinding $true
+                }
+                if ($action -eq 'ipv6-renew') {
+                    $current = @(Get-NetAdapter -IncludeHidden | Where-Object {
+                        $_.ifIndex -eq $interfaceIndex -and ([string]$_.InterfaceGuid).Trim('{}') -ieq $interfaceGuid
+                    })
+                    if ($current.Count -ne 1 -or $current[0].Name -cne $alias) { exit 2 }
+                    & ([IO.Path]::Combine($PSHOME, '..', '..', 'ipconfig.exe')) /renew6 $alias | Out-Null
+                    if ($LASTEXITCODE -ne 0) { exit 1 }
                 }
             }
             default { exit 1 }
