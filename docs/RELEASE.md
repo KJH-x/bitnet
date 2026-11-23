@@ -1,8 +1,8 @@
 # 构建、签名与分发
 
-仅在明确要求时打包。每轮从上次实际打包的版本提升补丁号一次；普通版和同轮的 `vello-cpu` 共用该版本。重大变动或重构、用户指定，或用户同意建议时，可调整版本策略。上次打包为 0.1.5，下一轮默认 0.1.6。先更新工作区版本和锁文件，再构建。
+仅在明确要求时打包。每轮从上次实际打包的版本提升补丁号一次；普通版和同轮的 `vello-cpu` 共用该版本。重大变动或重构、用户指定，或用户同意建议时，可调整版本策略。上次打包为 0.1.6，下一轮默认 0.1.7。先更新工作区版本和锁文件，再构建。
 
-输出目录形如 `dist/BitNet-0.1.6-windows-x64`，Vello CPU 版为 `dist/BitNet-0.1.6-windows-x64-vello-cpu`，安装文件也带版本号。Windows 用 `-Renderer vello-cpu`、Linux 用 `RENDERER=vello-cpu` 标注实际使用该绘制后端的产物。普通推送只触发构建与测试检查；开发包须手动启用工作流的 `package` 选项。
+输出目录形如 `dist/BitNet-0.1.7-windows-x64`，Vello CPU 版为 `dist/BitNet-0.1.7-windows-x64-vello-cpu`，安装文件也带版本号。Windows 用 `-Renderer vello-cpu`、Linux 用 `RENDERER=vello-cpu` 标注实际使用该绘制后端的产物。普通推送只触发构建与测试检查；开发包须手动启用工作流的 `package` 选项。
 
 构建脚本只生成文件，不安装包、不注册服务、不发布到公网。CI 覆盖 Windows x86/x64/ARM64，Ubuntu amd64/arm64、Debian 12 i386，以及 macOS Intel/Apple Silicon。CI 定义已提供，首次远程执行及各系统安装验收仍待完成。
 

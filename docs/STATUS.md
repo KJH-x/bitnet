@@ -1,5 +1,9 @@
 # 实现与验收状态
 
+2026-11-23，BitNet 0.1.6 的 Windows x64 开发包（`tiny-skia` 与 `vello-cpu` 两个变体）使用同一源码与开发 Minisign 密钥构建，两包各自通过 Minisign 自校验与 `SHA256SUMS` 逐文件核对。产物为 `dist/BitNet-0.1.6-windows-x64/` 与 `dist/BitNet-0.1.6-windows-x64-vello-cpu/`，含 Setup、Portable、ZIP、Client/Service MSI 与 `build-info.json`；后者记录渲染后端（`renderer`）、是否包含 iced-mcp 桥接（`mcp_bridge_included`，默认不监听）与源码指纹。两个变体的 `Client.msi` 沿用固定文件名，`Service.msi` 带版本与变体后缀。开发机未安装包、未注册服务、未执行真实校园网认证；本轮未重建 Linux 与 macOS 包。
+
+主线与 `experiment/iced-vello-cpu` 分支在 Windows 各自通过 182 项工作区测试（含 vendored iced-mcp 的 26 项）、格式检查与严格 Clippy。Vello 分支由 `1e1bfaa` 与主线 `dc52f4c` 对齐。
+
 IPv6 探测使用系统选路，非公网 IPv6 目标会在连接前跳过。默认附带固定 IPv6 地址的 HTTPS 直连检测。认证网卡地址与站点所见出口分别显示。Windows 已用本机只读接口核对 Hyper-V 外部交换机的物理端口、虚拟网卡和实际路由。主线与 Vello CPU 分支的 Windows、WSL 测试通过。当前网络直连 Cloudflare IPv6 地址超时，Mihomo fake-IP 场景下的公网回显仍待实网验证。
 
 Windows「网络 → 高级 → IPv6」新增「续租 IPv6」：对已连接且已启用 IPv6 的指定网卡重启 IPv6 绑定，重新触发路由器发现，再请求 DHCPv6 续租。命令成功不代表已经拿到可用 IPv6；校园网未登录时是否能收到路由通告或租约，待另一台实机验证。
