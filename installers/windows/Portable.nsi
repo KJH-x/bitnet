@@ -103,6 +103,10 @@ launch:
   ${IfNot} ${Errors}
     StrCpy $Options "--show"
   ${EndIf}
+  ${GetOptions} $Args "--iced-mcp" $0
+  ${IfNot} ${Errors}
+    StrCpy $Options "$Options --iced-mcp"
+  ${EndIf}
   SetOutPath "$Payload"
   ClearErrors
   Exec '"$Payload\bitnet-gui.exe" $Options'

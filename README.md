@@ -75,3 +75,6 @@ target/debug/bitctl.exe --data-dir $env:BITNET_DATA_DIR stop
 - [依赖许可与来源](docs/LICENSES.md)
 
 代码采用 MIT 许可证。校园网客户端的上游跟进目标是 [BITERNET（bitoolkit/biternet）](https://github.com/bitoolkit/biternet)，原名 BitGateway，协议库现名 `biternet-client`。本项目的 SRUN 编解码移植自迁移前的 `bitgateway-client`，原始提交、版权和许可见 [gateway NOTICE](crates/bitnet-gateway/NOTICE)。`KJH-x/BIT-Connect` 与本地 netdiag 用作需求和设计参考。
+## GUI 自动化
+
+桌面程序内置 [iced-mcp](https://github.com/allient/iced-mcp) 桥接。运行 `bitnet-gui --iced-mcp` 前，设置 `BITNET_SIMULATE_ONLY=1`、独立测试目录的绝对路径 `BITNET_DATA_DIR` 和至少 32 字符的随机 `ICED_MCP_TOKEN`。可用 `ICED_MCP_PORT` 指定空闲端口，再用 `iced-mcp-server` 和同一令牌连接 `127.0.0.1`。普通启动不监听端口。桥接不提供系统剪贴板或应用消息日志。

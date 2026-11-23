@@ -135,7 +135,7 @@ impl StatusView {
                     "互联网 {} · DNS {} · IPv6 {}",
                     health(&snapshot.health.internet),
                     health(&snapshot.health.dns),
-                    ipv6_health(snapshot.health.ipv6_status)
+                    ipv6_health(snapshot.health.observed_ipv6_status())
                 ),
             ),
         ];
@@ -551,9 +551,10 @@ fn health(value: &Health) -> &'static str {
 
 fn ipv6_health(value: Ipv6Status) -> &'static str {
     match value {
-        Ipv6Status::Unknown => "未测",
+        Ipv6Status::Unknown => "待确认",
         Ipv6Status::Disabled => "未启用",
-        Ipv6Status::LinkLocalOnly | Ipv6Status::GlobalUnreachable => "无互联网",
+        Ipv6Status::LinkLocalOnly => "仅限本地",
+        Ipv6Status::GlobalUnreachable => "探测失败",
         Ipv6Status::GlobalNotPreferred => "非首选",
         Ipv6Status::Normal => "正常",
     }

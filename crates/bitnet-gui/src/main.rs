@@ -30,6 +30,26 @@ use zeroize::Zeroize;
 
 fn main() -> iced::Result {
     let launch = Startup::from_args(std::env::args_os().skip(1));
+    let automation = if launch.automation {
+        let mut config = iced_mcp::Config::from_env();
+        if launch.mode != Mode::User
+            || !preview_only()
+            || !std::env::var_os("BITNET_DATA_DIR")
+                .is_some_and(|dir| std::path::Path::new(&dir).is_absolute())
+            || config
+                .token
+                .as_ref()
+                .is_none_or(|token| token.trim().len() < 32)
+        {
+            eprintln!("--iced-mcp requires an isolated simulation, an absolute BITNET_DATA_DIR and an ICED_MCP_TOKEN of at least 32 characters");
+            std::process::exit(2);
+        }
+        config.message_log = 0;
+        config.background = false;
+        Some(config)
+    } else {
+        None
+    };
     #[cfg(windows)]
     let (_instance, receiver) =
         match single_instance::acquire(launch.activate_existing(), preview_only()) {
@@ -42,7 +62,7 @@ fn main() -> iced::Result {
                 std::process::exit(1);
             }
         };
-    iced::daemon(
+    let app = iced::daemon(
         move || {
             let (state, task) = App::new(launch);
             #[cfg(windows)]
@@ -75,8 +95,11 @@ fn main() -> iced::Result {
     .style(|_, theme| design::app_style(theme))
     .subscription(App::subscription)
     .font(include_bytes!("../assets/fonts/BitNetHanSansSC-Regular-3755.otf").as_slice())
-    .font(include_bytes!("../assets/fonts/BitNetHanSansSC-Medium-3755.otf").as_slice())
-    .run()
+    .font(include_bytes!("../assets/fonts/BitNetHanSansSC-Medium-3755.otf").as_slice());
+    match automation {
+        Some(config) => iced_mcp::attach(app).config(config).run(),
+        None => app.run(),
+    }
 }
 
 fn preview_only() -> bool {
@@ -214,21 +237,25 @@ enum StartupVisibility {
 struct Startup {
     mode: Mode,
     visibility: StartupVisibility,
+    automation: bool,
 }
 
 impl Startup {
     fn from_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Self {
-        let (mut system, mut autostart, mut show, mut hide) = (false, false, false, false);
+        let (mut system, mut autostart, mut show, mut hide, mut automation) =
+            (false, false, false, false, false);
         for arg in args {
             match arg.to_str() {
                 Some("--system") => system = true,
                 Some("--autostart") => autostart = true,
                 Some("--show") => show = true,
+                Some("--iced-mcp") => automation = true,
                 Some("--hidden" | "--silent") => hide = true,
                 _ => {}
             }
         }
         Self {
+            automation,
             mode: if system { Mode::System } else { Mode::User },
             visibility: if show {
                 StartupVisibility::Show
@@ -1309,7 +1336,11 @@ impl App {
             return Task::none();
         }
         if let Some(target) = action.ipv6_target() {
-            if self.ipv6_maintenance_adapter(target).is_none() {
+            let adapter = self.ipv6_maintenance_adapter(target);
+            if adapter.is_none()
+                || (matches!(action, MaintenanceAction::RenewIpv6 { .. })
+                    && !adapter.is_some_and(|item| item.up && item.ipv6_enabled == Some(true)))
+            {
                 self.error(AppError::new(
                     ErrorCode::Unavailable,
                     self.t(
@@ -1336,7 +1367,8 @@ impl App {
             | MaintenanceAction::SetAutostart { .. }
             | MaintenanceAction::EnableIpv6 { .. }
             | MaintenanceAction::DisableIpv6 { .. }
-            | MaintenanceAction::ResetIpv6 { .. } => Scope::System,
+            | MaintenanceAction::ResetIpv6 { .. }
+            | MaintenanceAction::RenewIpv6 { .. } => Scope::System,
             _ => current_scope,
         };
         Task::perform(
@@ -1656,10 +1688,18 @@ impl App {
                 let personal = std::mem::take(&mut self.personal_after_stop) && result.is_ok();
                 match result {
                     Ok(result) => {
-                        let message = match result.details["ipv6_enabled"].as_bool() {
-                            Some(true) => self.t("IPv6 已启用", "IPv6 enabled").into(),
-                            Some(false) => self.t("IPv6 已关闭", "IPv6 disabled").into(),
-                            None => result.message,
+                        let message = if result.details["ipv6_renewed"] == true {
+                            self.t(
+                                "IPv6 续租已完成，请查看连接检测结果",
+                                "IPv6 renewal finished. Check connection status.",
+                            )
+                            .into()
+                        } else {
+                            match result.details["ipv6_enabled"].as_bool() {
+                                Some(true) => self.t("IPv6 已启用", "IPv6 enabled").into(),
+                                Some(false) => self.t("IPv6 已关闭", "IPv6 disabled").into(),
+                                None => result.message,
+                            }
                         };
                         self.show_notice(false, message);
                     }

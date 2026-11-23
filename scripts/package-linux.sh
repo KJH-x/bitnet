@@ -2,7 +2,8 @@
 # Build-only: never executes maintainer scripts, starts services, or installs packages.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-version=${VERSION:-0.1.5}
+source_version=$(python3 "$root/scripts/package-version.py" --for-package)
+version=${VERSION:-$source_version}
 arch=${ARCH:-$(dpkg --print-architecture)}
 glibc_min=${GLIBC_MIN:-$(getconf GNU_LIBC_VERSION | awk '{print $2}')}
 case "$arch" in amd64|arm64|i386) ;; *) echo 'Supported package architectures: amd64 arm64 i386' >&2; exit 2;; esac
@@ -12,7 +13,7 @@ python3 - "$root/Cargo.toml" "$version" <<'PY'
 import re, sys
 from pathlib import Path
 match = re.search(r'(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"', Path(sys.argv[1]).read_text(encoding='utf-8'))
-if not match or match[1] != sys.argv[2]:
+if not match or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", sys.argv[2]) or match[1] != sys.argv[2]:
     raise SystemExit('Package version must match workspace.package.version')
 PY
 minisign=${MINISIGN:-minisign}
@@ -27,9 +28,11 @@ test -n "${BITNET_RELEASE_PUBLIC_KEY:-}"; test -f "$secret"; test -f "$public"
 if [ -n "${BITNET_UPDATE_FEED:-}" ]; then
     grep -aF "$BITNET_RELEASE_PUBLIC_KEY" "$bin/bitmaint" >/dev/null || { echo 'Rebuild bitmaint with this public key' >&2; exit 2; }
 fi
-suffix=${OUTPUT_SUFFIX:-}
-case "$suffix" in *[!a-z0-9-]*) echo 'Invalid package output suffix' >&2; exit 2;; esac
-out=$root/dist/linux-$arch${suffix:+-$suffix}
+renderer=${RENDERER:-}
+case "$renderer" in ''|vello-cpu) ;; *) echo 'Unknown renderer variant' >&2; exit 2;; esac
+suffix=${renderer:+-$renderer}
+out=$root/dist/BitNet-$version-linux-$arch$suffix
+test ! -f "$out/SHA256SUMS" || { echo "Packages already exist for $version; increment the version before packaging again" >&2; exit 2; }
 target=$(case "$arch" in amd64) printf x86_64-unknown-linux-gnu;; arm64) printf aarch64-unknown-linux-gnu;; i386) printf i686-unknown-linux-gnu;; esac)
 licenses=$root/build/licenses/linux-$arch
 mkdir -p "$licenses/native"
@@ -103,6 +106,16 @@ if [ "${EXTRA_FORMATS:-0}" = 1 ]; then
     sh "$root/scripts/package-linux-extras.sh" "$stage" "$out" "$version" "$arch" "$glibc_min"
     case "$arch" in amd64) rpmarch=x86_64;; arm64) rpmarch=aarch64;; esac
     set -- "$@" "$out/BitNet-$version-linux-$arch.AppImage" "$out/bitnet-$version-1.$rpmarch.rpm"
+fi
+if [ -n "$suffix" ]; then
+    for asset do
+        case "$asset" in *.tar.gz) ext=.tar.gz ;; *) ext=.${asset##*.} ;; esac
+        mv -- "$asset" "${asset%"$ext"}$suffix$ext"
+    done
+    set -- "$out"/*"$suffix.deb" "$out"/*"$suffix.tar.gz"
+    if [ "${EXTRA_FORMATS:-0}" = 1 ]; then
+        set -- "$@" "$out"/*"$suffix.AppImage" "$out"/*"$suffix.rpm"
+    fi
 fi
 for asset do
     "$minisign" -S -s "$secret" -m "$asset" -x "$asset.minisig" >/dev/null 2>&1

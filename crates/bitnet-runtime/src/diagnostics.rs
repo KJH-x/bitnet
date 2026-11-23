@@ -727,12 +727,16 @@ fn render(
                 format!("{} → {}", row[1], row[2]),
             ]
         }));
+    let ipv6_status = snapshot.health.observed_ipv6_status();
     for detail in [
-        &snapshot.health.internet_detail,
-        &snapshot.health.dns_detail,
-        &snapshot.health.ipv6_detail,
+        snapshot.health.internet_detail.as_ref(),
+        snapshot.health.dns_detail.as_ref(),
+        snapshot.health.ipv6_detail.as_ref().filter(|_| {
+            ipv6_status == snapshot.health.ipv6_status
+                && ipv6_status != bitnet_core::Ipv6Status::Normal
+        }),
     ] {
-        if let Some(detail) = detail.as_ref().filter(|text| !text.is_empty()) {
+        if let Some(detail) = detail.filter(|text| !text.is_empty()) {
             findings.push(detail.clone());
         }
     }
@@ -772,14 +776,14 @@ fn render(
             "IPv6".into(),
             format!(
                 "{:?} · local {} · public {}",
-                snapshot.health.ipv6_status,
+                ipv6_status,
                 snapshot
                     .health
                     .local_ipv6
                     .map_or_else(|| "—".into(), |ip| ip.to_string()),
                 snapshot
                     .health
-                    .public_ipv6
+                    .confirmed_ipv6()
                     .map_or_else(|| "—".into(), |ip| ip.to_string()),
             ),
             ipv6_time.clone(),
@@ -800,11 +804,23 @@ fn render(
         ]
     }));
     checks.extend(snapshot.health.ipv6_probes.iter().map(|probe| {
+        let result = if probe.literal_https_reachable {
+            translate(
+                "公网 IPv6 直连成功",
+                "Direct public IPv6 connection succeeded",
+            )
+            .to_owned()
+        } else if probe.non_public_target {
+            translate("目标地址不在公网，已跳过", "Skipped non-public target").to_owned()
+        } else {
+            probe
+                .outcome
+                .map_or_else(|| "—".into(), |value| format!("{value:?}"))
+        };
         vec![
             format!("IPv6 {:?} #{}", probe.kind, probe.target),
             format!(
-                "{:?} · status {} · address {} · {}/{} connections · {} ms",
-                probe.outcome,
+                "{result} · status {} · address {} · {}/{} connections · {} ms",
                 probe
                     .status
                     .map_or_else(|| "—".into(), |value| value.to_string()),

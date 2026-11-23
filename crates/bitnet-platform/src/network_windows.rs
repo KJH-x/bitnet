@@ -134,11 +134,79 @@ fn dns_mode_distinguishes_configured_families_without_guessing() {
     assert_eq!(static_dns_mode(", ", false), None);
 }
 
+// Without a bound IP protocol, INCLUDE_ALL_INTERFACES also returns NDIS filter drivers.
+// Keep the physical uplink of an external switch, but omit those driver layers.
+fn inventory_adapter(if_type: u32, ip_flags: u32, if_flags: Option<u8>) -> bool {
+    const HARDWARE_INTERFACE: u8 = 1;
+    const FILTER_INTERFACE: u8 = 2;
+    ip_flags & (IP_ADAPTER_IPV4_ENABLED | IP_ADAPTER_IPV6_ENABLED) != 0
+        || (matches!(if_type, IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211)
+            && if_flags.is_some_and(|flags| {
+                flags & (HARDWARE_INTERFACE | FILTER_INTERFACE) == HARDWARE_INTERFACE
+            }))
+}
+
+fn is_virtual_adapter(if_type: u32, description: &str, hardware: Option<bool>) -> bool {
+    matches!(
+        if_type,
+        IF_TYPE_TUNNEL | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_PPP
+    ) || super::is_tunnel(description)
+        || !hardware.unwrap_or_else(|| {
+            !["hyper-v", "vmware", "virtualbox", "wi-fi direct"]
+                .iter()
+                .any(|driver| description.contains(driver))
+        })
+}
+
 pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
+    Ok(adapter_inventory()?
+        .into_iter()
+        .map(|adapter| adapter.interface)
+        .collect())
+}
+
+struct AdapterEntry {
+    interface: NetworkInterface,
+    system_route_eligible: bool,
+}
+
+fn allows_system_route(if_type: u32, description: &str, virtual_adapter: bool) -> bool {
+    // A Hyper-V management adapter can be the host's L3 endpoint on an external switch.
+    !virtual_adapter
+        || (if_type == IF_TYPE_ETHERNET_CSMACD
+            && description.starts_with("hyper-v virtual ethernet adapter"))
+}
+
+#[test]
+fn external_switch_port_and_host_adapter_have_distinct_roles() {
+    let ethernet = IF_TYPE_ETHERNET_CSMACD;
+    let hyper_v = "hyper-v virtual ethernet adapter #3";
+    assert!(inventory_adapter(ethernet, 0, Some(1)));
+    assert!(!inventory_adapter(ethernet, 0, Some(3)));
+    assert!(inventory_adapter(
+        ethernet,
+        IP_ADAPTER_IPV4_ENABLED,
+        Some(0)
+    ));
+    assert!(!is_virtual_adapter(
+        ethernet,
+        "realtek gaming controller",
+        Some(true)
+    ));
+    assert!(is_virtual_adapter(ethernet, hyper_v, Some(false)));
+    assert!(is_virtual_adapter(ethernet, hyper_v, None));
+    assert!(allows_system_route(ethernet, hyper_v, true));
+    assert!(!allows_system_route(ethernet, "mihomo", true));
+}
+
+fn adapter_inventory() -> Result<Vec<AdapterEntry>, AppError> {
     unsafe {
         let mut size = 16 * 1024u32;
         let mut storage = Vec::<u64>::new();
-        let flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
+        let flags = GAA_FLAG_INCLUDE_ALL_INTERFACES
+            | GAA_FLAG_INCLUDE_GATEWAYS
+            | GAA_FLAG_SKIP_ANYCAST
+            | GAA_FLAG_SKIP_MULTICAST;
         let mut code = 111;
         for _ in 0..3 {
             if size > 16 * 1024 * 1024 {
@@ -169,6 +237,21 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
         let mut row = storage.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
         while !row.is_null() {
             let a = &*row;
+            row = a.Next;
+            let flags = a.Anonymous2.Flags;
+            let mut interface_row = MIB_IF_ROW2 {
+                InterfaceLuid: a.Luid,
+                ..MIB_IF_ROW2::default()
+            };
+            let interface_row =
+                (GetIfEntry2Ex(MibIfEntryNormalWithoutStatistics, &mut interface_row) == 0)
+                    .then_some(interface_row);
+            let if_flags = interface_row
+                .as_ref()
+                .map(|row| row.InterfaceAndOperStatusFlags._bitfield);
+            if !inventory_adapter(a.IfType, flags, if_flags) {
+                continue;
+            }
             let name = wide_string(a.FriendlyName);
             let description = wide_string(a.Description);
             let id = if a.AdapterName.is_null() {
@@ -221,25 +304,11 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
             let wireless = a.IfType == IF_TYPE_IEEE80211;
             let ssid = if wireless { wifi_ssid(&a.Luid) } else { None };
             let description = description.to_ascii_lowercase();
-            let mut interface_row = MIB_IF_ROW2 {
-                InterfaceLuid: a.Luid,
-                ..MIB_IF_ROW2::default()
-            };
-            // HardwareInterface is bit 0 of InterfaceAndOperStatusFlags.
-            let software = GetIfEntry2(&mut interface_row) == 0
-                && interface_row.InterfaceAndOperStatusFlags._bitfield & 1 == 0;
-            let alternate_adapter = software
+            let virtual_adapter =
+                is_virtual_adapter(a.IfType, &description, if_flags.map(|flags| flags & 1 != 0));
+            let alternate_adapter = virtual_adapter
                 || !matches!(a.IfType, IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211)
-                || [
-                    "bluetooth",
-                    "wi-fi direct",
-                    "vmware",
-                    "virtualbox",
-                    "hyper-v",
-                ]
-                .iter()
-                .any(|kind| description.contains(kind));
-            let flags = a.Anonymous2.Flags;
+                || description.contains("bluetooth");
             let ipv4_mode = (flags & IP_ADAPTER_IPV4_ENABLED != 0).then_some({
                 if flags & IP_ADAPTER_DHCP_ENABLED == 0 {
                     Ipv4Assignment::Manual
@@ -261,29 +330,32 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                 ipv6_mode: dns_mode(&id, true),
                 servers,
             };
-            out.push(NetworkInterface {
+            let index = interface_row
+                .as_ref()
+                .map_or(a.Anonymous1.Anonymous.IfIndex, |row| row.InterfaceIndex);
+            let interface = NetworkInterface {
                 id,
                 name,
-                index: a.Anonymous1.Anonymous.IfIndex,
+                index,
                 ipv4: ips,
                 gateway,
                 up: a.OperStatus == IfOperStatusUp,
                 wireless,
                 ssid,
-                virtual_adapter: matches!(
-                    a.IfType,
-                    IF_TYPE_TUNNEL | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_PPP
-                ) || super::is_tunnel(&description),
+                virtual_adapter,
                 alternate_adapter,
                 dns,
                 dns_config: Some(dns_config),
                 ipv6,
                 ipv4_mode,
                 ipv6_enabled: Some(flags & IP_ADAPTER_IPV6_ENABLED != 0),
+            };
+            out.push(AdapterEntry {
+                interface,
+                system_route_eligible: allows_system_route(a.IfType, &description, virtual_adapter),
             });
-            row = a.Next;
         }
-        out.sort_by_key(|a| a.index);
+        out.sort_by_key(|adapter| adapter.interface.index);
         Ok(out)
     }
 }
@@ -392,11 +464,12 @@ pub(super) fn preferred_binding(target: Ipv4Addr) -> Result<Option<NetworkBindin
         let Some(source_ip) = ipv4((&source as *const SOCKADDR_INET).cast()) else {
             return Ok(None);
         };
-        let Some(interface) = interfaces()?.into_iter().find(|a| {
-            a.index == route.InterfaceIndex
-                && a.up
-                && !a.virtual_adapter
-                && a.ipv4.contains(&source_ip)
+        let Some(entry) = adapter_inventory()?.into_iter().find(|entry| {
+            let adapter = &entry.interface;
+            entry.system_route_eligible
+                && adapter.index == route.InterfaceIndex
+                && adapter.up
+                && adapter.ipv4.contains(&source_ip)
         }) else {
             return Ok(None);
         };
@@ -404,8 +477,8 @@ pub(super) fn preferred_binding(target: Ipv4Addr) -> Result<Option<NetworkBindin
             return Ok(None);
         }
         Ok(Some(NetworkBinding {
-            interface_id: interface.id,
-            interface_index: interface.index,
+            interface_id: entry.interface.id,
+            interface_index: entry.interface.index,
             source_ip,
         }))
     }

@@ -1,18 +1,23 @@
 param(
     [ValidateSet('x86','x64','arm64')][string]$Arch='x64',
-    [string]$Version='0.1.5', [switch]$Development,
+    [string]$Version, [switch]$Development,
     [string]$SecretKey=$env:BITNET_RELEASE_SECRET_KEY_FILE,
     [string]$PublicKey=$env:BITNET_RELEASE_PUBLIC_KEY_FILE,
     [string]$Wix=$env:BITNET_WIX,
     [string]$Minisign=$env:BITNET_MINISIGN,
     [string]$MakeNsis=$env:BITNET_MAKENSIS,
     [switch]$SkipBuild,
-    [ValidatePattern('^[a-z0-9-]+$')][string]$OutputSuffix
+    [ValidateSet('vello-cpu')][string]$Renderer
 )
 $ErrorActionPreference='Stop'
 $root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$sourceVersion=[regex]::Match((Get-Content "$root\Cargo.toml" -Raw),'(?ms)\[workspace\.package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
-if($sourceVersion -ne $Version) {throw 'Package version must match workspace.package.version; update source before building a release'}
+$sourceVersion=(& python "$PSScriptRoot\package-version.py" --for-package)
+if($LASTEXITCODE) {throw 'No new package version is available'}
+if(-not $Version) {$Version=$sourceVersion}
+if($Version -notmatch '^\d+\.\d+\.\d+$' -or $sourceVersion -ne $Version) {throw 'Package version must match workspace.package.version; update source before building a release'}
+$variant=if($Renderer) {"-$Renderer"} else {""}
+$out=Join-Path $root "dist\BitNet-$Version-windows-$Arch$variant"
+if(Test-Path -LiteralPath "$out\SHA256SUMS") {throw "Packages already exist for $Version; increment the version before packaging again"}
 $tools=Join-Path $root '.local\tools'
 if(-not $Minisign) {$Minisign=Join-Path $tools 'minisign\minisign-win64\x86_64\minisign.exe'}
 if(-not $MakeNsis) {$MakeNsis=Join-Path $tools 'nsis-3.13\makensis.exe'}
@@ -58,8 +63,6 @@ foreach($name in $clientPrograms) {if(-not (Test-Path "$stage\$name.exe")) {thro
 if(-not [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("$stage\bitmaint.exe")).Contains($publicLines[0])) {
     throw 'bitmaint was not compiled with this release public key; rebuild without -SkipBuild'
 }
-$outName=if($OutputSuffix) {"windows-$Arch-$OutputSuffix"} else {"windows-$Arch"}
-$out=Join-Path $root "dist\$outName"
 New-Item -ItemType Directory -Force $out | Out-Null
 $licenses=Join-Path $root "build\licenses\windows-$Arch"
 & python "$PSScriptRoot\generate-notices.py" --target $triple --output-dir $licenses --strict
@@ -70,7 +73,7 @@ function WixBuild([string]$Source,[string]$Output,[string[]]$Definitions) {
     if($Wix.EndsWith('.dll')) {& "$tools\dotnet-9.0.300\dotnet.exe" $Wix @args} else {& $Wix @args}
     if($LASTEXITCODE) {throw "MSI build failed: $Source"}
 }
-$service=Join-Path $out 'Service.msi'
+$service=Join-Path $out "BitNet-$Version-windows-$Arch$variant-Service.msi"
 $client=Join-Path $out 'Client.msi'
 $hash=[Security.Cryptography.SHA1]::Create().ComputeHash([Text.Encoding]::Unicode.GetBytes('BITNET'))
 $parts=0..4 | ForEach-Object {[BitConverter]::ToUInt32($hash,$_ * 4)}
@@ -94,7 +97,7 @@ if($LASTEXITCODE) {throw 'Service MSI signing failed'}
 if($LASTEXITCODE) {throw 'Service MSI signature self-check failed'}
 WixBuild "$root\installers\windows\Client.wxs" $client ($definitions+@('-d',"ServiceMsi=$service",'-d',"ServiceSignature=$service.minisig"))
 & "$PSScriptRoot\inspect-windows-packages.ps1" -Directory $out
-$setup=Join-Path $out "BitNetSetup-$Version-windows-$Arch.exe"
+$setup=Join-Path $out "BitNetSetup-$Version-windows-$Arch$variant.exe"
 & $MakeNsis /INPUTCHARSET UTF8 "/DCLIENT_MSI=$client" "/DOUTPUT=$setup" "$root\installers\windows\Setup.nsi"
 if($LASTEXITCODE) {throw 'NSIS wrapper build failed'}
 $portable=Join-Path $root "build\portable-windows-$Arch-$([Guid]::NewGuid().ToString('N'))"
@@ -106,9 +109,9 @@ Copy-Item "$root\crates\bitnet-gui\assets\fonts\LICENSE.txt" "$portable\licenses
 Copy-Item "$licenses\THIRD-PARTY-NOTICES.*" "$portable\licenses"
 Copy-Item $service "$portable\packages\Service.msi"
 Copy-Item "$service.minisig" "$portable\packages\Service.msi.minisig"
-$zip=Join-Path $out "BitNet-$Version-windows-$Arch.zip"
+$zip=Join-Path $out "BitNet-$Version-windows-$Arch$variant.zip"
 Compress-Archive -Path "$portable\*" -DestinationPath $zip -CompressionLevel Optimal -Force
-$portableExe=Join-Path $out "BitNetPortable-$Version-windows-$Arch.exe"
+$portableExe=Join-Path $out "BitNetPortable-$Version-windows-$Arch$variant.exe"
 $payloadHashes=$clientPrograms | ForEach-Object {
     (Get-FileHash -LiteralPath "$portable\$_.exe" -Algorithm SHA256).Hash
 }
@@ -123,5 +126,5 @@ foreach($asset in @($client,$setup,$zip,$portableExe)) {
     if($LASTEXITCODE) {throw 'Release artifact signature self-check failed'}
 }
 @($service,$client,$setup,$zip,$portableExe) | ForEach-Object {$item=Get-Item $_; "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant(),$item.Name} | Set-Content -Encoding ascii "$out\SHA256SUMS"
-@{version=$Version;arch=$Arch;development=[bool]$Development;public_key=$publicLines[0];source_sha256=$fingerprint.source_sha256;wix_source='7.0.0/b8977d6f88e7b68e000bac226a2814f236770570';static_crt_imports_checked=$true;installation_tested=$false} | ConvertTo-Json | Set-Content -Encoding utf8 "$out\build-info.json"
+@{version=$Version;arch=$Arch;development=[bool]$Development;renderer=$(if($Renderer){$Renderer}else{'tiny-skia'});mcp_bridge_included=$true;public_key=$publicLines[0];source_sha256=$fingerprint.source_sha256;wix_source='7.0.0/b8977d6f88e7b68e000bac226a2814f236770570';static_crt_imports_checked=$true;installation_tested=$false} | ConvertTo-Json | Set-Content -Encoding utf8 "$out\build-info.json"
 Write-Output "Built and signature-checked Windows packages: $out. Nothing was installed."

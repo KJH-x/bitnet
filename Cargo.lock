@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bitnet-core",
  "bitnet-launcher",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-gateway"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.22.1",
  "bitnet-core",
@@ -491,12 +491,13 @@ dependencies = [
 
 [[package]]
 name = "bitnet-gui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bitnet-core",
  "bitnet-launcher",
  "bitnet-runtime",
  "iced",
+ "iced-mcp",
  "ksni",
  "notify-rust",
  "raw-window-handle",
@@ -512,14 +513,14 @@ dependencies = [
 
 [[package]]
 name = "bitnet-launcher"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bitnet-core",
 ]
 
 [[package]]
 name = "bitnet-platform"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -535,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-runtime"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.22.1",
  "bitnet-core",
@@ -565,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-tui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bitnet-core",
  "bitnet-launcher",
@@ -579,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "bitnet-web"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bitnet-core",
  "bitnet-platform",
@@ -2259,6 +2260,31 @@ dependencies = [
  "iced_widget",
  "iced_winit",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "iced-mcp"
+version = "0.3.1"
+dependencies = [
+ "base64 0.22.1",
+ "block2 0.5.1",
+ "futures",
+ "iced",
+ "iced-mcp-protocol",
+ "iced_winit",
+ "objc2 0.5.3",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+ "png",
+ "serde_json",
+]
+
+[[package]]
+name = "iced-mcp-protocol"
+version = "0.3.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

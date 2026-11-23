@@ -2,8 +2,15 @@ param([Parameter(Mandatory)][string]$Directory)
 $ErrorActionPreference='Stop'
 $directoryPath=(Resolve-Path -LiteralPath $Directory).Path
 $installer=New-Object -ComObject WindowsInstaller.Installer
-$client=$installer.OpenDatabase((Join-Path $directoryPath 'Client.msi'),0)
-$service=$installer.OpenDatabase((Join-Path $directoryPath 'Service.msi'),0)
+function OpenPackage([string]$Kind) {
+    $packages=@(Get-ChildItem -LiteralPath $directoryPath -File | Where-Object {
+        $_.Name -eq "$Kind.msi" -or $_.Name -like "BitNet-*-$Kind.msi"
+    })
+    if($packages.Count -ne 1) {throw "Expected one $Kind MSI"}
+    return $installer.OpenDatabase($packages[0].FullName,0)
+}
+$client=OpenPackage Client
+$service=OpenPackage Service
 function Property($Database,[string]$Name) {
     $view=$Database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$Name'")
     $view.Execute(); $record=$view.Fetch()

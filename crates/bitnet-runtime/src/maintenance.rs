@@ -30,6 +30,7 @@ pub enum MaintenanceAction {
     EnableIpv6 { interface: InterfaceTarget },
     DisableIpv6 { interface: InterfaceTarget },
     ResetIpv6 { interface: InterfaceTarget },
+    RenewIpv6 { interface: InterfaceTarget },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +141,8 @@ impl MaintenanceAction {
         match self {
             Self::EnableIpv6 { interface }
             | Self::DisableIpv6 { interface }
-            | Self::ResetIpv6 { interface } => Some(interface),
+            | Self::ResetIpv6 { interface }
+            | Self::RenewIpv6 { interface } => Some(interface),
             _ => None,
         }
     }
@@ -179,6 +181,7 @@ pub fn action_name(action: &MaintenanceAction) -> &'static str {
         MaintenanceAction::EnableIpv6 { .. } => "ipv6-enable",
         MaintenanceAction::DisableIpv6 { .. } => "ipv6-disable",
         MaintenanceAction::ResetIpv6 { .. } => "ipv6-reset",
+        MaintenanceAction::RenewIpv6 { .. } => "ipv6-renew",
     }
 }
 
@@ -197,7 +200,10 @@ pub fn parse_action_with_interface(
             "Purge is valid only for service removal",
         ));
     }
-    if matches!(name, "ipv6-enable" | "ipv6-disable" | "ipv6-reset") {
+    if matches!(
+        name,
+        "ipv6-enable" | "ipv6-disable" | "ipv6-reset" | "ipv6-renew"
+    ) {
         let interface = interface.ok_or_else(|| {
             err(
                 ErrorCode::InvalidInput,
@@ -207,6 +213,7 @@ pub fn parse_action_with_interface(
         return Ok(match name {
             "ipv6-enable" => MaintenanceAction::EnableIpv6 { interface },
             "ipv6-disable" => MaintenanceAction::DisableIpv6 { interface },
+            "ipv6-renew" => MaintenanceAction::RenewIpv6 { interface },
             _ => MaintenanceAction::ResetIpv6 { interface },
         });
     }
@@ -1843,6 +1850,7 @@ async fn ipv6_action(
         120,
     )?;
     match run_exit_code(plan).await? {
+        0 if matches!(action, MaintenanceAction::RenewIpv6 { .. }) => Ok(ipv6_renewed()),
         0 => {
             let enabled = !matches!(action, MaintenanceAction::DisableIpv6 { .. });
             Ok(MaintenanceResult {
@@ -1867,6 +1875,14 @@ async fn ipv6_action(
             ErrorCode::Unavailable,
             "Windows could not change and verify the IPv6 binding",
         )),
+    }
+}
+
+#[cfg(windows)]
+fn ipv6_renewed() -> MaintenanceResult {
+    MaintenanceResult {
+        message: "Windows completed IPv6 renewal on the selected adapter".into(),
+        details: json!({"ipv6_renewed":true,"reboot_required":false}),
     }
 }
 
@@ -2098,6 +2114,7 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
                 ""
             }
         );
+        let ipv6_renew = matches!(action, MaintenanceAction::RenewIpv6 { .. });
         let ipv6_enabled = action.ipv6_target().map(|interface| {
             use std::fmt::Write as _;
             let _ = write!(
@@ -2161,6 +2178,9 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
                     ));
                 }
                 return Err(err(ErrorCode::Unavailable, "Elevated maintenance failed"));
+            }
+            if ipv6_renew {
+                return Ok(ipv6_renewed());
             }
             if let Some(enabled) = ipv6_enabled {
                 return Ok(MaintenanceResult {
