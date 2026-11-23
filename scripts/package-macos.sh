@@ -3,15 +3,17 @@
 set -eu
 test "$(uname -s)" = Darwin || { echo 'macOS packaging requires a macOS build host' >&2; exit 2; }
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-version=${VERSION:-0.1.5}; arch=${ARCH:-$(uname -m)}
+source_version=$(python3 "$root/scripts/package-version.py" --for-package)
+version=${VERSION:-$source_version}; arch=${ARCH:-$(uname -m)}
 case "$arch" in x86_64|aarch64|arm64) ;; *) exit 2;; esac
-bin=${BIN_DIR:-$root/target/release}; stage=$root/build/macos-$arch; out=$root/dist/macos-$arch
+bin=${BIN_DIR:-$root/target/release}; stage=$root/build/macos-$arch; out=$root/dist/BitNet-$version-macos-$arch
+test ! -f "$out/SHA256SUMS" || { echo "Packages already exist for $version; increment the version before packaging again" >&2; exit 2; }
 python3 "$root/scripts/fingerprint-source.py" --check "$bin/bitnet-build-source.json" >/dev/null
 python3 - "$root/Cargo.toml" "$version" <<'PY'
 import re, sys
 from pathlib import Path
 match = re.search(r'(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"', Path(sys.argv[1]).read_text(encoding='utf-8'))
-if not match or match[1] != sys.argv[2]:
+if not match or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", sys.argv[2]) or match[1] != sys.argv[2]:
     raise SystemExit('Package version must match workspace.package.version')
 PY
 minisign=${MINISIGN:-minisign}
@@ -62,7 +64,7 @@ if [ -n "${CODESIGN_IDENTITY:-}" ]; then
 fi
 mkdir -p "$stage/service-payload"
 cp -R "$stage/payload/Library" "$stage/service-payload/Library"
-service=$out/Service.pkg
+service=$out/BitNet-$version-macos-$arch-Service.pkg
 pkgbuild --root "$stage/service-payload" --scripts "$stage/scripts" --identifier top.nsapi.bitnet.service --version "$version" --install-location / --ownership recommended "$service"
 if [ -n "${INSTALLER_SIGN_IDENTITY:-}" ]; then productsign --sign "$INSTALLER_SIGN_IDENTITY" "$service" "$out/Service-signed.pkg"; mv "$out/Service-signed.pkg" "$service"; fi
 "$minisign" -S -s "$secret" -m "$service" -x "$service.minisig" >/dev/null 2>&1
@@ -74,7 +76,7 @@ if [ -n "${CODESIGN_IDENTITY:-}" ]; then codesign --force --options runtime --ti
 pkg=$out/BitNet-$version-macos-$arch.pkg
 mkdir -p "$stage/client-payload"
 cp -R "$stage/payload/Applications" "$stage/client-payload/Applications"
-client=$out/Client.pkg
+client=$out/BitNet-$version-macos-$arch-Client.pkg
 pkgbuild --root "$stage/client-payload" --identifier top.nsapi.bitnet.client --version "$version" --install-location / --ownership recommended "$client"
 if [ -n "${INSTALLER_SIGN_IDENTITY:-}" ]; then productsign --sign "$INSTALLER_SIGN_IDENTITY" "$client" "$out/Client-signed.pkg"; mv "$out/Client-signed.pkg" "$client"; fi
 # Explicit full installation is a product containing the same disjoint component receipts.

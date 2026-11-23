@@ -4,6 +4,11 @@ on:
     branches: ['**']
   pull_request:
   workflow_dispatch:
+    inputs:
+      package:
+        description: "Build development packages (requires a new version)"
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       production:
@@ -32,8 +37,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - if: matrix.arch == 'x64'
         run: cargo test --workspace
-      - run: ./scripts/bootstrap-tools.ps1
-      - run: ./scripts/build-wix-source.ps1 -PlatformToolset v143
+      - if: inputs.production || inputs.package
+        run: ./scripts/bootstrap-tools.ps1
+      - if: inputs.production || inputs.package
+        run: ./scripts/build-wix-source.ps1 -PlatformToolset v143
       - if: inputs.production
         run: python scripts/prepare-ci-signing.py
         env:
@@ -43,12 +50,18 @@ jobs:
         run: ./scripts/package-windows.ps1 -Arch ${{ matrix.arch }}
         env:
           BITNET_UPDATE_FEED: ${{ vars.BITNET_UPDATE_FEED }}
-      - if: '!inputs.production'
+      - if: inputs.package && !inputs.production
         run: ./scripts/package-windows.ps1 -Arch ${{ matrix.arch }} -Development
+      - name: Resolve package version
+        if: inputs.production || inputs.package
+        id: version
+        shell: bash
+        run: echo "version=$(python3 scripts/package-version.py)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
+        if: inputs.production || inputs.package
         with:
           name: windows-${{ matrix.arch }}-${{ inputs.production && 'production' || 'development' }}
-          path: dist/windows-${{ matrix.arch }}/
+          path: dist/BitNet-${{ steps.version.outputs.version }}-windows-${{ matrix.arch }}/
   linux:
     runs-on: ${{ matrix.runner }}
     environment: ${{ inputs.production && 'release' || 'development' }}
@@ -73,22 +86,30 @@ jobs:
         env:
           BITNET_SIGNING_SECRET: ${{ secrets.BITNET_SIGNING_SECRET }}
           BITNET_SIGNING_PUBLIC: ${{ vars.BITNET_SIGNING_PUBLIC }}
-      - if: '!inputs.production'
+      - if: inputs.package && !inputs.production
         run: sh scripts/prepare-signing.sh --development && cat .local/release-keys/public.env >> "$GITHUB_ENV"
-      - run: sh scripts/bootstrap-appimage.sh >> "$GITHUB_ENV"
+      - if: inputs.production || inputs.package
+        run: sh scripts/bootstrap-appimage.sh >> "$GITHUB_ENV"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: python3 scripts/fingerprint-source.py --write .local/build-source-before.json
       - run: cargo build --release --workspace --bins
       - run: python3 scripts/fingerprint-source.py --check .local/build-source-before.json --write target/release/bitnet-build-source.json
-      - run: EXTRA_FORMATS=1 ARCH=${{ matrix.arch }} sh scripts/package-linux.sh
+      - if: inputs.production || inputs.package
+        run: EXTRA_FORMATS=1 ARCH=${{ matrix.arch }} sh scripts/package-linux.sh
+      - name: Resolve package version
+        if: inputs.production || inputs.package
+        id: version
+        shell: bash
+        run: echo "version=$(python3 scripts/package-version.py)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
+        if: inputs.production || inputs.package
         with:
           name: linux-${{ matrix.arch }}-${{ inputs.production && 'production' || 'development' }}
-          path: dist/linux-${{ matrix.arch }}/
+          path: dist/BitNet-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}/
   linux-i386:
-    if: '!inputs.production'
+    if: inputs.package && !inputs.production
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -109,10 +130,16 @@ jobs:
             cargo build --release --workspace --bins
             python3 scripts/fingerprint-source.py --check .local/build-source-before.json --write target/release/bitnet-build-source.json
             DEVELOPMENT=1 ARCH=i386 sh scripts/package-linux.sh'
+      - name: Resolve package version
+        if: inputs.production || inputs.package
+        id: version
+        shell: bash
+        run: echo "version=$(python3 scripts/package-version.py)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
+        if: inputs.production || inputs.package
         with:
           name: linux-i386-development
-          path: dist/linux-i386/
+          path: dist/BitNet-${{ steps.version.outputs.version }}-linux-i386/
   macos:
     runs-on: ${{ matrix.runner }}
     environment: ${{ inputs.production && 'release' || 'development' }}
@@ -136,7 +163,7 @@ jobs:
         env:
           BITNET_SIGNING_SECRET: ${{ secrets.BITNET_SIGNING_SECRET }}
           BITNET_SIGNING_PUBLIC: ${{ vars.BITNET_SIGNING_PUBLIC }}
-      - if: '!inputs.production'
+      - if: inputs.package && !inputs.production
         run: sh scripts/prepare-signing.sh --development && cat .local/release-keys/public.env >> "$GITHUB_ENV"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -144,8 +171,15 @@ jobs:
       - run: python3 scripts/fingerprint-source.py --write .local/build-source-before.json
       - run: cargo build --release --workspace --bins
       - run: python3 scripts/fingerprint-source.py --check .local/build-source-before.json --write target/release/bitnet-build-source.json
-      - run: ARCH=${{ matrix.arch }} sh scripts/package-macos.sh
+      - if: inputs.production || inputs.package
+        run: ARCH=${{ matrix.arch }} sh scripts/package-macos.sh
+      - name: Resolve package version
+        if: inputs.production || inputs.package
+        id: version
+        shell: bash
+        run: echo "version=$(python3 scripts/package-version.py)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
+        if: inputs.production || inputs.package
         with:
           name: macos-${{ matrix.arch }}-${{ inputs.production && 'production' || 'development' }}
-          path: dist/macos-${{ matrix.arch }}/
+          path: dist/BitNet-${{ steps.version.outputs.version }}-macos-${{ matrix.arch }}/
