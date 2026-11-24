@@ -4,7 +4,7 @@
 
 主线与 `experiment/iced-vello-cpu` 分支在 Windows 各自通过 182 项工作区测试（含 vendored iced-mcp 的 26 项）、格式检查与严格 Clippy。Vello 分支由 `1e1bfaa` 与主线 `dc52f4c` 对齐。
 
-IPv6 探测使用系统选路，非公网 IPv6 目标会在连接前跳过。默认附带固定 IPv6 地址的 HTTPS 直连检测。认证网卡地址与站点所见出口分别显示。Windows 已用本机只读接口核对 Hyper-V 外部交换机的物理端口、虚拟网卡和实际路由。主线与 Vello CPU 分支的 Windows、WSL 测试通过。当前网络直连 Cloudflare IPv6 地址超时，Mihomo fake-IP 场景下的公网回显仍待实网验证。
+IPv6 探测使用系统选路，域名解析到可路由的 fake-IP 时继续请求站点，出口协议按实际回显判定。默认附带固定 IPv6 地址的 HTTPS 直连检测。认证网卡地址与站点所见出口分别显示。Windows 已用本机只读接口核对 Hyper-V 外部交换机的物理端口、虚拟网卡和实际路由。主线与 Vello CPU 分支的 Windows、WSL 测试通过。本机按同一系统路由验证了两个探测站点，BitNet 与 Chrome 均收到了公网 IPv6 回显。此时 DNS 返回公网地址。回归测试覆盖 fake-IP 答案保留和转发后回显判定，Mihomo TUN 的实网回显仍待核对。Cloudflare 字面量检测在本机超时。
 
 Windows「网络 → 高级 → IPv6」新增「续租 IPv6」：对已连接且已启用 IPv6 的指定网卡重启 IPv6 绑定，重新触发路由器发现，再请求 DHCPv6 续租。命令成功不代表已经拿到可用 IPv6；校园网未登录时是否能收到路由通告或租约，待另一台实机验证。
 
