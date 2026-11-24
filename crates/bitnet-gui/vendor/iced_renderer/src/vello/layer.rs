@@ -219,18 +219,17 @@ impl Layer {
             &previous.quads,
             &current.quads,
             |(quad, _)| {
-                let Some(bounds) = quad.bounds.expand(1.0).intersection(&layer_bounds) else {
-                    return vec![];
-                };
-
-                vec![if quad.shadow.color.a > 0.0 {
-                    bounds.expand(
-                        quad.shadow.offset.x.abs().max(quad.shadow.offset.y.abs())
-                            + quad.shadow.blur_radius,
-                    )
-                } else {
-                    bounds
-                }]
+                let mut bounds = quad.bounds;
+                if quad.shadow.color.a > 0.0 {
+                    let shadow = (bounds + quad.shadow.offset)
+                        .expand(quad.shadow.blur_radius.max(0.0) * super::SHADOW_EXTENT);
+                    bounds = bounds.union(&shadow);
+                }
+                bounds
+                    .expand(1.0)
+                    .intersection(&layer_bounds)
+                    .into_iter()
+                    .collect()
             },
             |(quad_a, background_a), (quad_b, background_b)| {
                 quad_a == quad_b && background_a == background_b
@@ -617,12 +616,46 @@ mod tests {
                     height: 12.0
                 },
                 Rectangle {
-                    x: -8.0,
-                    y: -8.0,
-                    width: 26.0,
-                    height: 26.0
+                    x: -1.0,
+                    y: -6.0,
+                    width: 22.0,
+                    height: 22.0
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn shadow_remains_visible_when_its_quad_is_outside_the_clip() {
+        let clip = Rectangle {
+            x: 10.0,
+            y: 0.0,
+            width: 40.0,
+            height: 40.0,
+        };
+        let previous = layer(clip);
+        let mut current = layer(clip);
+        let mut panel = quad(Rectangle {
+            x: -20.0,
+            y: 12.0,
+            width: 10.0,
+            height: 10.0,
+        });
+        panel.shadow = Shadow {
+            color: Color::BLACK,
+            offset: Vector::new(18.0, 0.0),
+            blur_radius: 4.0,
+        };
+        current.quads.push((panel, background()));
+
+        assert_eq!(
+            Layer::damage(&previous, &current),
+            vec![Rectangle {
+                x: 9.0,
+                y: 1.0,
+                width: 10.0,
+                height: 32.0
+            }]
         );
     }
 

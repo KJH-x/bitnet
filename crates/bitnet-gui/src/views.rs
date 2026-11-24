@@ -1537,22 +1537,18 @@ impl App {
                             _ => provider.to_owned(),
                         };
                         let transport = match probe.local_is_v6 {
-                            Some(true) => " · IPv6",
-                            Some(false) => " · IPv4",
+                            Some(true) => self.t(" · 本机连接 IPv6", " · Local socket IPv6"),
+                            Some(false) => self.t(" · 本机连接 IPv4", " · Local socket IPv4"),
                             None => "",
                         };
                         let outcome = if probe.literal_https_reachable {
                             self.t("直连成功", "Direct connection succeeded")
                         } else if probe.non_public_target {
-                            self.t(
-                                "目标地址不在公网，未测到真实 IPv6",
-                                "No public IPv6 target to test",
-                            )
-                        } else if probe.kind == Ipv6ProbeKind::DualStack
-                            && probe.local_is_v6 == Some(false)
-                            && probe.outcome == Some(bitnet_core::ProbeOutcome::Match)
-                        {
-                            self.t("站点通过 IPv4 响应", "Site reached over IPv4")
+                            self.t("检测地址不可用", "Probe address unavailable")
+                        } else if probe.reported_ipv4 || probe.dual_stack_reported_ipv4() {
+                            self.t("站点回显 IPv4", "Site reported IPv4")
+                        } else if probe.confirmed_address().is_some() {
+                            self.t("站点回显公网 IPv6", "Site reported a public IPv6 address")
                         } else {
                             probe
                                 .outcome

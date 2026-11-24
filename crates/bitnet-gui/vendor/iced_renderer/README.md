@@ -8,4 +8,6 @@ This Cargo patch replaces the `iced_renderer` package in Iced at `bb97596ddb79c2
 
 On Windows, Vello rasterizes only changed regions into the retained Softbuffer buffer, then copies the whole buffer to the window on every paint request. The window surface itself can be invalidated when restored from the tray even when the retained buffer has not changed.
 
+Each quad draws one shadow under its fill and border. Vello draws the blurred rectangle inside the active clip. Damage includes the offset shadow and the full 2.5σ blur extent, bounded by the layer clip with antialiasing padding. For an opaque window, repainting the background inside the damage clip replaces the previous pixels before drawing translucent content.
+
 Run the renderer’s unit tests from the repository root with `cargo test --locked -p iced_renderer --lib`.

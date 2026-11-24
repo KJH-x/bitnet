@@ -704,6 +704,8 @@ pub struct Ipv6ProbeObservation {
     #[serde(default, skip_serializing_if = "is_false")]
     pub non_public_target: bool,
     #[serde(default, skip_serializing_if = "is_false")]
+    pub reported_ipv4: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub literal_https_reachable: bool,
     pub attempted: usize,
     pub succeeded: usize,
@@ -719,10 +721,15 @@ impl Ipv6ProbeObservation {
                 && self
                     .outcome
                     .is_none_or(|outcome| outcome == ProbeOutcome::Match)
-                && self.local_is_v6 != Some(false)
-                && (self.kind != Ipv6ProbeKind::DualStack || self.local_is_v6 == Some(true))
                 && is_public_ipv6(*address)
         })
+    }
+
+    pub fn dual_stack_reported_ipv4(&self) -> bool {
+        self.kind == Ipv6ProbeKind::DualStack
+            && self.succeeded > 0
+            && self.reported_address.is_none()
+            && (self.reported_ipv4 || self.local_is_v6 == Some(false))
     }
 }
 
@@ -780,11 +787,11 @@ impl HealthStatus {
                 .iter()
                 .any(|probe| probe.literal_https_reachable)
         {
-            return if self.ipv6_probes.iter().any(|probe| {
-                probe.kind == Ipv6ProbeKind::DualStack
-                    && probe.succeeded > 0
-                    && probe.local_is_v6 == Some(false)
-            }) {
+            return if self
+                .ipv6_probes
+                .iter()
+                .any(Ipv6ProbeObservation::dual_stack_reported_ipv4)
+            {
                 Ipv6Status::GlobalNotPreferred
             } else {
                 Ipv6Status::Normal
@@ -1175,6 +1182,23 @@ mod tests {
         })).unwrap());
         assert_eq!(health.observed_ipv6_status(), Ipv6Status::Normal);
         assert_eq!(health.confirmed_ipv6(), None);
+    }
+
+    #[test]
+    fn dual_stack_preference_uses_the_echo_instead_of_the_proxy_socket() {
+        let mut probe: Ipv6ProbeObservation = serde_json::from_value(serde_json::json!({
+            "target": 1, "kind": "dual_stack", "attempted": 1, "succeeded": 1,
+            "timed_out": false, "elapsed_ms": 10, "outcome": "match",
+            "reported_address": "2001:4860::1234", "local_is_v6": false
+        }))
+        .unwrap();
+        assert!(probe.confirmed_address().is_some());
+        assert!(!probe.dual_stack_reported_ipv4());
+        probe.reported_address = None;
+        probe.local_is_v6 = Some(true);
+        probe.reported_ipv4 = true;
+        assert!(probe.confirmed_address().is_none());
+        assert!(probe.dual_stack_reported_ipv4());
     }
 
     #[test]

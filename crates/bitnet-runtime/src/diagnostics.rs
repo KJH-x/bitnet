@@ -811,7 +811,9 @@ fn render(
             )
             .to_owned()
         } else if probe.non_public_target {
-            translate("目标地址不在公网，已跳过", "Skipped non-public target").to_owned()
+            translate("检测地址不可用", "Probe address unavailable").to_owned()
+        } else if probe.reported_ipv4 || probe.dual_stack_reported_ipv4() {
+            translate("站点回显 IPv4", "Site reported IPv4").to_owned()
         } else {
             probe
                 .outcome

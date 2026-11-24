@@ -30,6 +30,8 @@ use std::collections::VecDeque;
 use std::num::NonZeroU32;
 
 const ACCURACY: f64 = 0.1;
+// Vello CPU 0.4 clips the Gaussian to 2.5 standard deviations.
+const SHADOW_EXTENT: f32 = 2.5;
 
 pub struct Renderer {
     settings: renderer::Settings,
@@ -82,27 +84,30 @@ impl Renderer {
             renderer.push_clip_path(&into_rect(layer.bounds).to_path(ACCURACY));
 
             for (quad, background) in &layer.quads {
-                renderer.set_paint(into_background(background, quad.bounds));
+                let shadow = quad.shadow;
+                if shadow.color.a > 0.0 {
+                    let bounds = quad.bounds + shadow.offset;
+                    let radius = quad.border.radius;
+                    renderer.set_paint(into_color(shadow.color));
 
-                #[cfg(not(feature = "multithreading"))]
-                {
-                    let shadow = quad.shadow;
-
-                    if shadow.color.a > 0.0 {
-                        renderer.set_filter_effect(
-                            vello_cpu::filter_effects::Filter::from_primitive(
-                                vello_cpu::filter_effects::FilterPrimitive::DropShadow {
-                                    dx: shadow.offset.x,
-                                    dy: shadow.offset.y,
-                                    std_deviation: shadow.blur_radius,
-                                    color: into_color(shadow.color),
-                                    edge_mode: vello_cpu::filter_effects::EdgeMode::None,
-                                },
-                            ),
+                    if shadow.blur_radius > 0.0 {
+                        renderer.fill_blurred_rounded_rect(
+                            &into_rect(bounds),
+                            radius
+                                .top_left
+                                .max(radius.top_right)
+                                .max(radius.bottom_right)
+                                .max(radius.bottom_left),
+                            shadow.blur_radius,
                         );
+                    } else if radius == border::Radius::default() {
+                        renderer.fill_rect(&into_rect(bounds));
+                    } else {
+                        renderer.fill_path(&into_rounded_rect(bounds, radius));
                     }
                 }
 
+                renderer.set_paint(into_background(background, quad.bounds));
                 if quad.border.radius == border::Radius::default() {
                     renderer.fill_rect(&into_rect(quad.bounds));
 
@@ -132,9 +137,6 @@ impl Renderer {
                         renderer.stroke_path(&border_rect);
                     }
                 }
-
-                #[cfg(not(feature = "multithreading"))]
-                renderer.reset_filter_effect();
             }
 
             renderer.reset_transform();
@@ -630,6 +632,7 @@ impl Frame {
         graphics::damage::diff(
             &self.layers,
             layers,
+            // Everything drawn by an added or removed layer is clipped to these bounds.
             |layer| vec![layer.bounds],
             layer::Layer::damage,
         )
@@ -739,7 +742,6 @@ impl graphics::Compositor for Compositor {
         if background_color.a < 1.0 {
             // Transparent window: incremental rendering can't preserve
             // history, so render the whole scene and present it in full.
-            // TODO: Clear damage regions manually
             surface.frames.clear();
 
             draw_to_buffer(
@@ -879,13 +881,8 @@ impl renderer::Headless for Renderer {
     }
 }
 
-/// Draws the scene into `buffer`, optionally clipping it to the given damage
-/// regions (logical coordinates).
-///
-/// When `damage` is `None` the whole scene is rendered and the target is
-/// cleared first. When it is `Some` the scene is clipped to the union of the
-/// regions and rasterized with `SrcOver`, so that pixels outside the damaged
-/// regions are preserved.
+/// Draws the scene into `buffer`. Damage rectangles are in physical pixels.
+/// An empty damage slice requests a full redraw.
 fn draw_to_buffer(
     renderer: &mut Renderer,
     vello: &mut vello_cpu::RenderContext,
@@ -934,8 +931,8 @@ fn draw_to_buffer(
     )
     .expect("Buffer size matches renderer dimensions");
 
-    // Undamaged pixels are only preserved when rasterizing with `SrcOver`; a
-    // full render clears the target first.
+    // Renderer::draw paints the opaque background inside the integer damage
+    // clip before painting shadows. SrcOver preserves the pixels outside it.
     if damage.is_empty() {
         vello.render(pixmap, resources);
     } else {
@@ -1135,6 +1132,123 @@ mod damage_clip {
     fn incremental_render_preserves_undamaged_pixels() {
         assert_incremental(1.0);
         assert_incremental(2.0);
+    }
+
+    #[test]
+    fn moved_and_removed_shadow_matches_full_frames() {
+        let viewport = Viewport::with_physical_size(
+            Size::new(300, 240),
+            renderer::Scale {
+                window: 1.25,
+                application: 1.0,
+            },
+        );
+        let width = viewport.physical_width();
+        let height = viewport.physical_height();
+        let background = Color::from_rgb(0.7, 0.72, 0.75);
+        let mut vello = vello_cpu::RenderContext::new(width as u16, height as u16);
+        let mut resources = vello_cpu::Resources::new();
+        let mut renderer = Renderer::new(renderer::Settings::default());
+        let mut back = vec![0; (width * height * 4) as usize];
+        let mut full = back.clone();
+        let mut last_frame: Option<Frame> = None;
+        let hover_damage: Vec<_> = physical_damage(
+            vec![Rectangle {
+                x: 36.0,
+                y: 48.0,
+                width: 29.0,
+                height: 42.0,
+            }],
+            &viewport,
+        )
+        .collect();
+
+        for panel in [Some((57.5, 62.0)), Some((122.0, 74.5)), None] {
+            renderer.reset(Rectangle::with_size(viewport.logical_size()));
+            if let Some((x, y)) = panel {
+                renderer.start_layer(Rectangle {
+                    x: 30.5,
+                    y: 32.5,
+                    width: 188.0,
+                    height: 132.0,
+                });
+                renderer.fill_quad(
+                    Quad {
+                        bounds: Rectangle {
+                            x,
+                            y,
+                            width: 52.0,
+                            height: 40.0,
+                        },
+                        border: border::rounded(6).width(1).color(Color::BLACK),
+                        shadow: core::Shadow {
+                            color: Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+                            offset: core::Vector::new(4.0, 8.0),
+                            blur_radius: 18.0,
+                        },
+                        ..Quad::default()
+                    },
+                    Color::WHITE,
+                );
+                renderer.end_layer();
+            }
+
+            let layers = renderer.layers();
+            let damage: Vec<_> = last_frame
+                .as_ref()
+                .map(|frame| physical_damage(frame.damage(layers), &viewport).collect())
+                .unwrap_or_default();
+            last_frame = Some(Frame {
+                background,
+                layers: layers.to_vec(),
+            });
+
+            draw_to_buffer(
+                &mut renderer,
+                &mut vello,
+                &mut resources,
+                &viewport,
+                background,
+                &mut back,
+                &damage,
+            );
+            for _ in 0..8 {
+                draw_to_buffer(
+                    &mut renderer,
+                    &mut vello,
+                    &mut resources,
+                    &viewport,
+                    background,
+                    &mut back,
+                    &hover_damage,
+                );
+            }
+            draw_to_buffer(
+                &mut renderer,
+                &mut vello,
+                &mut resources,
+                &viewport,
+                background,
+                &mut full,
+                &[],
+            );
+
+            if panel == Some((57.5, 62.0)) {
+                let outside_clip = pixel(&full, width, 30, 102);
+                let inside_shadow = pixel(&full, width, 65, 102);
+                assert!(
+                    inside_shadow[0] < outside_clip[0],
+                    "expected a visible shadow"
+                );
+            }
+            assert_eq!(
+                back.chunks_exact(4)
+                    .zip(full.chunks_exact(4))
+                    .position(|(a, b)| a != b),
+                None,
+                "incremental frame diverged after drawing panel {panel:?}"
+            );
+        }
     }
 
     #[test]
