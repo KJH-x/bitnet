@@ -1,5 +1,7 @@
 # 实现与验收状态
 
+2026-11-24，BitNet 0.1.7 的 Windows x64 开发包（`tiny-skia` 与 `vello-cpu` 两个变体）使用各自分支源码与同一开发 Minisign 密钥构建，两包各自通过 Minisign 自校验与 `SHA256SUMS` 逐文件核对。产物为 `dist/BitNet-0.1.7-windows-x64/` 与 `dist/BitNet-0.1.7-windows-x64-vello-cpu/`，`build-info.json` 记录版本、渲染后端、`mcp_bridge_included` 与源码指纹。本轮改动：IPv6 偏好改由站点回显判定（不再以本机 socket 协议为准），fake-IP 域名照常请求并按回显判断出口协议；Vello 分支修复弹窗阴影在局部重绘时重复叠加（840×600 模拟窗口 36 次悬停对照，修复前后由 43,115 像素偏差降为逐像素一致，托盘恢复同样一致）。两分支在 Windows 各自通过 185 项工作区测试与严格 Clippy；Vello 分支由 `9a40c74` 与主线 `ed52db4` 对齐。开发机未安装包、未注册服务、未执行真实校园网认证；未重建 Linux 与 macOS 包。
+
 2026-11-23，BitNet 0.1.6 的 Windows x64 开发包（`tiny-skia` 与 `vello-cpu` 两个变体）使用同一源码与开发 Minisign 密钥构建，两包各自通过 Minisign 自校验与 `SHA256SUMS` 逐文件核对。产物为 `dist/BitNet-0.1.6-windows-x64/` 与 `dist/BitNet-0.1.6-windows-x64-vello-cpu/`，含 Setup、Portable、ZIP、Client/Service MSI 与 `build-info.json`；后者记录渲染后端（`renderer`）、是否包含 iced-mcp 桥接（`mcp_bridge_included`，默认不监听）与源码指纹。两个变体的 `Client.msi` 沿用固定文件名，`Service.msi` 带版本与变体后缀。开发机未安装包、未注册服务、未执行真实校园网认证；本轮未重建 Linux 与 macOS 包。
 
 主线与 `experiment/iced-vello-cpu` 分支在 Windows 各自通过 182 项工作区测试（含 vendored iced-mcp 的 26 项）、格式检查与严格 Clippy。Vello 分支由 `1e1bfaa` 与主线 `dc52f4c` 对齐。
