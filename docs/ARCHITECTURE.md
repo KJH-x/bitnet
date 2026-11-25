@@ -23,7 +23,7 @@ flowchart LR
   M --> P[验签 / 安装器 / 系统授权]
 ```
 
-Iced 使用 tiny-skia 软件渲染，关闭 wgpu，不依赖浏览器或 WebView。引擎使用单线程异步运行时，状态与外网健康分别检查；GUI 每两秒读取本地快照，不另起认证循环。后台单次响应、IPC 帧、等待队列、网络超时、日志、历史条数和下载均有上限。
+Iced 使用 Vello CPU 光栅化软件渲染（`iced_renderer` 由仓库内 `crates/bitnet-gui/vendor/iced_renderer` 以 Cargo patch 替换），关闭 wgpu，不依赖浏览器或 WebView。引擎使用单线程异步运行时，状态与外网健康分别检查；GUI 每两秒读取本地快照，不另起认证循环。后台单次响应、IPC 帧、等待队列、网络超时、日志、历史条数和下载均有上限。
 
 进程数据目录锁避免同一实例重复启动。主动认证还按标准化网关 origin 与源 IPv4 组合争用本机认证域锁：Windows 使用显式跨用户权限的命名 mutex；Linux 使用内核 abstract AF_UNIX 地址占用，跨越 PrivateTmp；macOS 使用持有的 flock 文件，拒绝链接并核对 inode，释放时不删除。不同用户不会因个人数据目录不同而绕过同域排他。macOS 锁文件所有者恶意删除自身文件属于同身份恶意程序边界，真实跨用户测试尚未完成。
 
