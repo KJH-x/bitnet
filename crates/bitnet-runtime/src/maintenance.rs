@@ -5,7 +5,10 @@ mod ipv6;
 pub mod updates;
 use bitnet_core::{AppError, ErrorCode, NetworkInterface, Scope};
 use fs2::FileExt;
-pub use ipv6::{acknowledge_ipv6_stack_reset, ipv6_stack_reset_status, Ipv6StackResetStatus};
+pub use ipv6::{
+    acknowledge_ipv6_stack_reset, ipv6_stack_reset_status, is_reset_id, reset_id_from_backup,
+    Ipv6StackResetStatus,
+};
 use serde_json::json;
 use std::io::Read;
 use std::{

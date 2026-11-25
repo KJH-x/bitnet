@@ -7,17 +7,57 @@ use bitnet_core::{HealthStatus, MAX_IPV6_TARGETS};
 use diagnostics::{Ipv6RepairKind, Report};
 use maintenance::Ipv6StackResetStatus;
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::time::{sleep, timeout_at, Instant};
 
 const RECHECK_WINDOW: Duration = Duration::from_secs(30);
 const REPORT_LIFETIME: Duration = Duration::from_secs(60);
+const RECHECK_FILE: &str = "ipv6-recheck.json";
+const RECHECK_SCHEMA: u32 = 1;
+/// A restart fix that nobody rechecked for a week no longer describes this boot.
+const RECHECK_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const RECHECK_MAX_BYTES: usize = MAX_IPV6_TARGETS * 2048 + 512;
+
+fn now_ms() -> u64 {
+    bitnet_core::now_ms() as u64
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ProbeSettings {
     ipv6_targets: Vec<String>,
     timeout_secs: u64,
+}
+
+/// Targets that a guided stack reset saved for the recheck after Windows restarts.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RecheckRecord {
+    schema: u32,
+    /// Identifier of the protected reset transaction that saved these targets.
+    reset_id: String,
+    written_ms: u64,
+    settings: ProbeSettings,
+}
+
+/// Why a saved recheck target must not be reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecheckRejection {
+    OtherReset,
+    UnsupportedSchema,
+    Expired,
+    Damaged,
+    InvalidSettings,
+}
+
+enum StoredSettings {
+    Restored(ProbeSettings),
+    Absent,
+    Rejected(RecheckRejection),
 }
 
 impl From<&Settings> for ProbeSettings {
@@ -39,27 +79,91 @@ impl ProbeSettings {
         settings
     }
 
-    fn backup_path() -> Result<PathBuf, AppError> {
+    fn recheck_path(data_dir: &Path) -> PathBuf {
+        data_dir.join(RECHECK_FILE)
+    }
+
+    fn save_for_reboot(&self, reset_id: &str) -> Result<(), AppError> {
         let paths = bitnet_platform::paths(Scope::User)?;
-        Ok(paths.data_dir.join("ipv6-recheck.json"))
+        self.save_at(&paths.data_dir, reset_id)
     }
 
-    fn save_for_reboot(&self) -> Result<(), AppError> {
-        let path = Self::backup_path()?;
-        let data = serde_json::to_vec(self)
-            .map_err(|_| AppError::new(ErrorCode::Internal, "无法记录重启后的检测目标"))?;
-        bitnet_platform::write_private_file(&path, &data)
-    }
-
-    fn for_reboot() -> Option<Self> {
-        let path = Self::backup_path().ok()?;
-        let bytes = bitnet_platform::read_private_file(&path).ok()??;
-        if bytes.len() > MAX_IPV6_TARGETS * 2048 + 512 {
-            return None;
+    fn save_at(&self, data_dir: &Path, reset_id: &str) -> Result<(), AppError> {
+        // Only the protected reset may name the transaction a recheck belongs to.
+        if !maintenance::is_reset_id(reset_id) {
+            return Err(AppError::new(
+                ErrorCode::InvalidInput,
+                "无法把复测目标绑定到本次 IPv6 重置",
+            ));
         }
-        let settings: Self = serde_json::from_slice(&bytes).ok()?;
-        settings.settings().validate().ok()?;
-        Some(settings)
+        let record = RecheckRecord {
+            schema: RECHECK_SCHEMA,
+            reset_id: reset_id.to_owned(),
+            written_ms: now_ms(),
+            settings: self.clone(),
+        };
+        let data = serde_json::to_vec(&record)
+            .map_err(|_| AppError::new(ErrorCode::Internal, "无法记录重启后的检测目标"))?;
+        if data.len() > RECHECK_MAX_BYTES {
+            return Err(AppError::new(
+                ErrorCode::InvalidInput,
+                "重启后的检测目标过大",
+            ));
+        }
+        // A brand-new profile has no data directory yet, and the atomic writer
+        // refuses to create one implicitly.
+        bitnet_platform::prepare_private_directory(data_dir)?;
+        bitnet_platform::write_private_file(&Self::recheck_path(data_dir), &data)
+    }
+
+    fn for_reboot(reset_id: &str) -> StoredSettings {
+        match bitnet_platform::paths(Scope::User) {
+            Ok(paths) => Self::restore_at(&paths.data_dir, reset_id),
+            Err(_) => StoredSettings::Absent,
+        }
+    }
+
+    fn restore_at(data_dir: &Path, reset_id: &str) -> StoredSettings {
+        let path = Self::recheck_path(data_dir);
+        let bytes = match bitnet_platform::read_private_file(&path) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return StoredSettings::Absent,
+            Err(_) => return Self::reject(&path, RecheckRejection::Damaged),
+        };
+        let record = if bytes.len() <= RECHECK_MAX_BYTES {
+            serde_json::from_slice::<RecheckRecord>(&bytes).ok()
+        } else {
+            None
+        };
+        let Some(record) = record else {
+            return Self::reject(&path, RecheckRejection::Damaged);
+        };
+        if record.schema != RECHECK_SCHEMA {
+            return Self::reject(&path, RecheckRejection::UnsupportedSchema);
+        }
+        if record.reset_id != reset_id {
+            return Self::reject(&path, RecheckRejection::OtherReset);
+        }
+        if now_ms().saturating_sub(record.written_ms) > RECHECK_MAX_AGE.as_millis() as u64 {
+            return Self::reject(&path, RecheckRejection::Expired);
+        }
+        if record.settings.settings().validate().is_err() {
+            return Self::reject(&path, RecheckRejection::InvalidSettings);
+        }
+        StoredSettings::Restored(record.settings)
+    }
+
+    /// A record that cannot be tied to the current reset is discarded instead of
+    /// silently probing the targets of an older transaction.
+    fn reject(path: &Path, reason: RecheckRejection) -> StoredSettings {
+        let _ = std::fs::remove_file(path);
+        StoredSettings::Rejected(reason)
+    }
+
+    fn discard_saved() {
+        if let Ok(paths) = bitnet_platform::paths(Scope::User) {
+            let _ = std::fs::remove_file(Self::recheck_path(&paths.data_dir));
+        }
     }
 }
 
@@ -170,6 +274,7 @@ pub(crate) struct Ipv6Repair {
     last_target: Option<InterfaceTarget>,
     before: Option<String>,
     boot_status: Option<Ipv6StackResetStatus>,
+    acknowledged: Option<bool>,
     pub(crate) show_evidence: bool,
     pub(crate) result: Option<RepairResult>,
 }
@@ -181,11 +286,20 @@ impl Ipv6Repair {
         self.finished_at = None;
         self.last_target = None;
         self.attempted = None;
+        self.acknowledged = None;
         self.show_evidence = false;
     }
 
     pub(crate) fn before(&self) -> Option<&str> {
         self.before.as_deref()
+    }
+
+    /// Whether the protected reset record was acknowledged for the last
+    /// recheck after a restart. `None` until such a recheck finishes. The
+    /// repair view renders it once the frontend merge lands.
+    #[allow(dead_code)]
+    pub(crate) fn acknowledged(&self) -> Option<bool> {
+        self.acknowledged
     }
 }
 
@@ -395,14 +509,8 @@ impl App {
             );
             return Task::none();
         }
-        if request.requires_advanced() {
-            if self.repair_action(true).is_none() {
-                return Task::none();
-            }
-            if let Err(error) = context.settings.save_for_reboot() {
-                self.error(error);
-                return Task::none();
-            }
+        if request.requires_advanced() && self.repair_action(true).is_none() {
+            return Task::none();
         }
         self.busy = true;
         self.request_epoch = self.request_epoch.wrapping_add(1);
@@ -429,13 +537,15 @@ impl App {
         match result {
             Ok(result) if request.requires_advanced() => {
                 self.busy = false;
-                self.ipv6_repair.result = Some(RepairResult::RebootRequired(
-                    result.details["ipv6_backup_dir"]
-                        .as_str()
-                        .map(PathBuf::from)
-                        .unwrap_or_default(),
-                    false,
-                ));
+                let backup_dir = result.details["ipv6_backup_dir"]
+                    .as_str()
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                self.remember_recheck_targets(
+                    &backup_dir,
+                    result.details["ipv6_reset_id"].as_str(),
+                );
+                self.ipv6_repair.result = Some(RepairResult::RebootRequired(backup_dir, false));
                 Self::observe_ipv6_stack_reset()
             }
             Ok(_) => {
@@ -486,7 +596,6 @@ impl App {
                 let report = context.report(selected, true).await;
                 let recovered = report.ipv6.recovered;
                 let result = if let Some(status) = after_boot {
-                    let _ = maintenance::acknowledge_ipv6_stack_reset(&status.id);
                     RepairResult::AfterReboot {
                         recovered,
                         interrupted: status.interrupted,
@@ -514,10 +623,81 @@ impl App {
         }
         self.busy = false;
         if matches!(result, RepairResult::AfterReboot { .. }) {
-            self.ipv6_repair.boot_status = None;
+            self.acknowledge_reset();
         }
         self.ipv6_repair.result = Some(result);
         self.accept_diagnostics(run, report)
+    }
+
+    fn remember_recheck_targets(&mut self, backup_dir: &Path, reset_id: Option<&str>) {
+        let reset_id = reset_id
+            .filter(|id| maintenance::is_reset_id(id))
+            .or_else(|| maintenance::reset_id_from_backup(backup_dir));
+        let Some(reset_id) = reset_id else {
+            let message = self.t(
+                "无法确认本次 IPv6 重置的标识，重启后将使用当前的检测目标。",
+                "The IPv6 reset could not be identified, so the recheck will use the current targets.",
+            );
+            self.show_notice(true, message.into());
+            return;
+        };
+        let settings = self.ipv6_repair.context.as_ref().map_or_else(
+            || self.new_probe_context().settings,
+            |context| context.settings.clone(),
+        );
+        if let Err(error) = settings.save_for_reboot(reset_id) {
+            self.error(error);
+        }
+    }
+
+    /// The reset record is acknowledged only after its recheck finished, so a
+    /// failed acknowledgment leaves the pending state for the next start.
+    fn acknowledge_reset(&mut self) {
+        let Some(id) = self
+            .ipv6_repair
+            .boot_status
+            .as_ref()
+            .map(|status| status.id.clone())
+        else {
+            self.ipv6_repair.acknowledged = None;
+            return;
+        };
+        self.ipv6_repair.boot_status = None;
+        match maintenance::acknowledge_ipv6_stack_reset(&id) {
+            Ok(()) => {
+                self.ipv6_repair.acknowledged = Some(true);
+                ProbeSettings::discard_saved();
+            }
+            Err(error) => {
+                self.ipv6_repair.acknowledged = Some(false);
+                self.error(error);
+            }
+        }
+    }
+
+    fn recheck_rejection_notice(&self, rejection: RecheckRejection) -> &'static str {
+        match rejection {
+            RecheckRejection::OtherReset => self.t(
+                "保存的复测目标属于另一次重置，已丢弃并使用当前设置。",
+                "The saved recheck target belongs to another reset and was discarded.",
+            ),
+            RecheckRejection::UnsupportedSchema => self.t(
+                "保存的复测目标来自其他版本，已丢弃并使用当前设置。",
+                "The saved recheck target is from another version and was discarded.",
+            ),
+            RecheckRejection::Expired => self.t(
+                "保存的复测目标已过期，已丢弃并使用当前设置。",
+                "The saved recheck target expired and was discarded.",
+            ),
+            RecheckRejection::Damaged => self.t(
+                "保存的复测目标无法读取，已丢弃并使用当前设置。",
+                "The saved recheck target could not be read and was discarded.",
+            ),
+            RecheckRejection::InvalidSettings => self.t(
+                "保存的复测目标无效，已丢弃并使用当前设置。",
+                "The saved recheck target was invalid and was discarded.",
+            ),
+        }
     }
 
     pub(crate) fn observe_ipv6_stack_reset() -> Task<Message> {
@@ -561,9 +741,187 @@ impl App {
             return Task::none();
         };
         let mut context = self.new_probe_context();
-        if let Some(settings) = ProbeSettings::for_reboot() {
-            context.settings = settings;
+        match ProbeSettings::for_reboot(&status.id) {
+            StoredSettings::Restored(settings) => context.settings = settings,
+            StoredSettings::Absent => (),
+            StoredSettings::Rejected(rejection) => {
+                let message = self.recheck_rejection_notice(rejection);
+                self.show_notice(true, message.into());
+            }
         }
         self.recheck_ipv6(context, None, Some(status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    const RESET: &str = "reset-2468-1700000000000-0";
+    const OTHER_RESET: &str = "reset-2468-1700000000001-0";
+
+    /// Fixture directories live under the ignored target tree so tests never
+    /// write into a real user profile.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/gui-recheck-tests");
+            fs::create_dir_all(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let path = root.join(format!(
+                "fixture-{}-{}-{}",
+                std::process::id(),
+                bitnet_core::now_ms(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        /// A profile directory that does not exist yet, like a first launch.
+        fn data_dir(&self) -> PathBuf {
+            self.0.join("BitNet")
+        }
+
+        fn record(&self) -> PathBuf {
+            ProbeSettings::recheck_path(&self.data_dir())
+        }
+
+        fn write(&self, bytes: &[u8]) {
+            fs::create_dir_all(self.data_dir()).unwrap();
+            fs::write(self.record(), bytes).unwrap();
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let allowed = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/gui-recheck-tests")
+                .canonicalize()
+                .unwrap();
+            if let Ok(resolved) = self.0.canonicalize() {
+                if resolved.parent() == Some(allowed.as_path()) && resolved.starts_with(&allowed) {
+                    let _ = fs::remove_dir_all(resolved);
+                }
+            }
+        }
+    }
+
+    fn targets() -> ProbeSettings {
+        ProbeSettings::from(&Settings::default())
+    }
+
+    fn record_bytes(reset_id: &str, written_ms: u64, settings: &ProbeSettings) -> Vec<u8> {
+        serde_json::to_vec(&RecheckRecord {
+            schema: RECHECK_SCHEMA,
+            reset_id: reset_id.into(),
+            written_ms,
+            settings: settings.clone(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_new_profile_can_save_the_recheck_targets_for_a_reset() {
+        let scratch = Scratch::new();
+        assert!(!scratch.data_dir().exists());
+        targets().save_at(&scratch.data_dir(), RESET).unwrap();
+        assert!(scratch.record().is_file());
+        match ProbeSettings::restore_at(&scratch.data_dir(), RESET) {
+            StoredSettings::Restored(restored) => assert_eq!(restored, targets()),
+            _ => panic!("a saved target must be restored for the same reset"),
+        }
+    }
+
+    #[test]
+    fn targets_saved_for_another_reset_are_discarded() {
+        let scratch = Scratch::new();
+        targets().save_at(&scratch.data_dir(), OTHER_RESET).unwrap();
+        assert!(matches!(
+            ProbeSettings::restore_at(&scratch.data_dir(), RESET),
+            StoredSettings::Rejected(RecheckRejection::OtherReset)
+        ));
+        assert!(!scratch.record().exists());
+        assert!(matches!(
+            ProbeSettings::restore_at(&scratch.data_dir(), RESET),
+            StoredSettings::Absent
+        ));
+    }
+
+    #[test]
+    fn a_missing_profile_directory_reports_no_saved_targets() {
+        let scratch = Scratch::new();
+        assert!(matches!(
+            ProbeSettings::restore_at(&scratch.data_dir(), RESET),
+            StoredSettings::Absent
+        ));
+    }
+
+    #[test]
+    fn damaged_or_oversized_records_are_rejected() {
+        let scratch = Scratch::new();
+        scratch.write(b"{\"schema\":1,\"reset_id\":");
+        assert!(matches!(
+            ProbeSettings::restore_at(&scratch.data_dir(), RESET),
+            StoredSettings::Rejected(RecheckRejection::Damaged)
+        ));
+        assert!(!scratch.record().exists());
+
+        let mut oversized = record_bytes(RESET, now_ms(), &targets());
+        oversized.resize(RECHECK_MAX_BYTES + 1, b' ');
+        scratch.write(&oversized);
+        assert!(matches!(
+            ProbeSettings::restore_at(&scratch.data_dir(), RESET),
+            StoredSettings::Rejected(RecheckRejection::Damaged)
+        ));
+        assert!(!scratch.record().exists());
+    }
+
+    #[test]
+    fn records_from_another_schema_or_past_their_lifetime_are_rejected() {
+        let scratch = Scratch::new();
+        let mut unknown = record_bytes(RESET, now_ms(), &targets());
+        unknown = String::from_utf8(unknown)
+            .unwrap()
+            .replace("\"schema\":1", "\"schema\":99")
+            .into_bytes();
+        scratch.write(&unknown);
+        assert!(matches!(
+            ProbeSettings::restore_at(&scratch.data_dir(), RESET),
+            StoredSettings::Rejected(RecheckRejection::UnsupportedSchema)
+        ));
+
+        let expired = now_ms() - RECHECK_MAX_AGE.as_millis() as u64 - 1;
+        scratch.write(&record_bytes(RESET, expired, &targets()));
+        assert!(matches!(
+            ProbeSettings::restore_at(&scratch.data_dir(), RESET),
+            StoredSettings::Rejected(RecheckRejection::Expired)
+        ));
+        assert!(!scratch.record().exists());
+    }
+
+    #[test]
+    fn saved_targets_must_still_validate_and_name_a_reset() {
+        let scratch = Scratch::new();
+        let invalid = ProbeSettings {
+            ipv6_targets: vec!["file:///tmp/ipv6".into()],
+            timeout_secs: 5,
+        };
+        scratch.write(&record_bytes(RESET, now_ms(), &invalid));
+        assert!(matches!(
+            ProbeSettings::restore_at(&scratch.data_dir(), RESET),
+            StoredSettings::Rejected(RecheckRejection::InvalidSettings)
+        ));
+
+        let unbound = targets().save_at(&scratch.data_dir(), "reset-2468");
+        assert_eq!(unbound.unwrap_err().code, ErrorCode::InvalidInput);
+        assert!(!scratch.record().exists());
     }
 }
