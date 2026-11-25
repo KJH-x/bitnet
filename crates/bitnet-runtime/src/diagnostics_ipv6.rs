@@ -150,11 +150,14 @@ pub(super) async fn reference_probe(health: &HealthStatus, settings: &Settings) 
         {
             return prior_https;
         }
-        let settings = Settings {
+        // This internal check uses the fixed literal only; the education group
+        // is measured by the regular IPv6 observations.
+        let mut settings = Settings {
             ipv6_targets: vec![DNS_FREE_IPV6_TARGET.to_owned()],
             request_timeout_secs: 3,
             ..Settings::default()
         };
+        settings.education_probes.clear();
         let mut result = HealthStatus::default();
         health_probe::run_ipv6(&settings, None, &[], &mut result).await;
         result
@@ -218,8 +221,7 @@ fn is_dns_failure(result: Option<DnsProbeResult>) -> bool {
 pub(super) async fn confirm_dns_failure(health: &HealthStatus, settings: &Settings) -> bool {
     let failed = {
         let mut domains = health
-            .ipv6_probes
-            .iter()
+            .connectivity_ipv6_probes()
             .filter_map(|probe| probe.dns_result)
             .peekable();
         domains.peek().is_some() && domains.all(|result| is_dns_failure(Some(result)))
@@ -639,6 +641,31 @@ pub(super) fn evidence_rows(
             ),
         ]
     }));
+    // Education-network results are joined to their configuration entry by the
+    // stable identifier, so reordering the configured list cannot misattribute
+    // a result.
+    rows.extend(health.ipv6_probes.iter().filter_map(|probe| {
+        let id = probe.probe_id.as_deref()?;
+        Some(vec![
+            "Education IPv6 measurement point".into(),
+            format!("{id} · {:?}", probe.kind),
+            format!(
+                "echo {} · status {} · outcome {} · socket {} → {} · {} ms",
+                probe
+                    .echo
+                    .map_or_else(|| "unknown".into(), |echo| format!("{echo:?}")),
+                probe
+                    .status
+                    .map_or_else(|| "—".into(), |code| format!("HTTP {code}")),
+                probe
+                    .outcome
+                    .map_or_else(|| "—".into(), |outcome| format!("{outcome:?}")),
+                show(probe.local_address),
+                show(probe.peer_address),
+                probe.elapsed_ms
+            ),
+        ])
+    }));
     if health.ipv6_checked_at.is_some() {
         rows.push(vec![
             "Fixed IPv6 TCP / HTTPS".into(),
@@ -777,6 +804,33 @@ mod tests {
         assert_eq!(report.recommendation, None);
         let report = assess(&native, observed(None), None, None, &reference, true, true);
         assert_eq!(report.recommendation, Some(Ipv6RepairKind::FlushDns));
+    }
+
+    #[test]
+    fn education_measurement_results_are_listed_by_stable_identifier() {
+        let health: HealthStatus = serde_json::from_value(serde_json::json!({
+            "internet": "unknown", "dns": "unknown", "ipv6": "unknown",
+            "ipv6_checked_at": 100,
+            "ipv6_probes": [
+                {"target": 2, "kind": "education", "probe_id": "fiti", "status": 200,
+                 "outcome": "match", "echo": "invalid", "attempted": 1, "succeeded": 1,
+                 "timed_out": false, "elapsed_ms": 12},
+                {"target": 1, "kind": "education", "probe_id": "cernet", "status": 200,
+                 "outcome": "unexpected_body", "echo": "challenge", "attempted": 1,
+                 "succeeded": 0, "timed_out": false, "elapsed_ms": 9}
+            ]
+        }))
+        .unwrap();
+        let rows = evidence_rows(&NativeIpv6::default(), &health, &ReferenceProbe::default());
+        let probes: Vec<_> = rows
+            .iter()
+            .filter(|row| row[0] == "Education IPv6 measurement point")
+            .collect();
+        assert_eq!(probes.len(), 2);
+        assert!(probes[0][1].starts_with("fiti"));
+        assert!(probes[0][2].contains("Invalid"));
+        assert!(probes[1][1].starts_with("cernet"));
+        assert!(probes[1][2].contains("Challenge"));
     }
 
     #[test]

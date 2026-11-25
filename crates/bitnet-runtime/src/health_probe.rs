@@ -1,8 +1,8 @@
 use bitnet_core::{
     is_cernet_ipv6, is_public_ipv6, now_secs, parse_ipv6_target, DnsProbeObservation,
     DnsProbeResult, Health, HealthExpect, HealthProbeExpectation, HealthProbeObservation,
-    HealthStatus, HealthTarget, Ipv6ProbeKind, Ipv6ProbeObservation, Ipv6Status, NetworkInterface,
-    ProbeOutcome, Settings, DNS_FREE_IPV6_TARGET,
+    HealthStatus, HealthTarget, Ipv6EchoKind, Ipv6ProbeKind, Ipv6ProbeObservation, Ipv6Status,
+    NetworkInterface, ProbeOutcome, Settings, DNS_FREE_IPV6_TARGET,
 };
 use futures_util::future::join_all;
 use hyper_util::client::legacy::connect::HttpInfo;
@@ -158,14 +158,20 @@ pub(crate) fn update_ipv6_status(
             "所选网卡只有链路本地 IPv6 地址",
             "The selected adapter has only link-local IPv6 addresses",
         ),
-        Ipv6Status::Unknown if health.ipv6_probes.is_empty() => (
+        Ipv6Status::Unknown if health.connectivity_ipv6_probes().next().is_none() => (
             "尚未测试公网 IPv6 连接",
             "Public IPv6 connectivity has not been tested",
         ),
-        Ipv6Status::Unknown if health.ipv6_probes.iter().any(|p| p.non_public_target) => (
-            "有检测地址不可用，详情见各站点结果",
-            "A probe address was unusable. See the site results.",
-        ),
+        Ipv6Status::Unknown
+            if health
+                .connectivity_ipv6_probes()
+                .any(|p| p.non_public_target) =>
+        {
+            (
+                "有检测地址不可用，详情见各站点结果",
+                "A probe address was unusable. See the site results.",
+            )
+        }
         Ipv6Status::Unknown => (
             "未测到有效的公网 IPv6 回显",
             "No valid public IPv6 echo received",
@@ -343,12 +349,14 @@ struct Ipv6Target {
     index: usize,
     url: url::Url,
     kind: Ipv6ProbeKind,
+    /// Stable identifier of the configured education-network probe.
+    probe_id: Option<String>,
 }
 
-fn ipv6_probe_targets(urls: &[String]) -> Vec<Ipv6Target> {
+fn ipv6_probe_targets(settings: &Settings) -> Vec<Ipv6Target> {
     let mut targets = Vec::new();
     let mut detailed = false;
-    for (index, configured) in urls.iter().enumerate() {
+    for (index, configured) in settings.ipv6_targets.iter().enumerate() {
         let Ok(url) = parse_ipv6_target(configured) else {
             continue;
         };
@@ -364,6 +372,7 @@ fn ipv6_probe_targets(urls: &[String]) -> Vec<Ipv6Target> {
             } else {
                 Ipv6ProbeKind::Address
             },
+            probe_id: None,
         });
         if is_test_ipv6 && !detailed {
             detailed = true;
@@ -382,14 +391,27 @@ fn ipv6_probe_targets(urls: &[String]) -> Vec<Ipv6Target> {
                 index: index + 1,
                 url: large_packet,
                 kind: Ipv6ProbeKind::LargePacket,
+                probe_id: None,
             });
             targets.push(Ipv6Target {
                 index: index + 1,
                 url: url::Url::parse("http://ds.test-ipv6.com/ip/?callback=cb")
                     .expect("fixed dual stack URL"),
                 kind: Ipv6ProbeKind::DualStack,
+                probe_id: None,
             });
         }
+    }
+    for (index, probe) in settings.education_probes.iter().enumerate() {
+        let Ok(url) = parse_ipv6_target(&probe.url) else {
+            continue;
+        };
+        targets.push(Ipv6Target {
+            index: index + 1,
+            url,
+            kind: Ipv6ProbeKind::Education,
+            probe_id: Some(probe.id.clone()),
+        });
     }
     targets
 }
@@ -424,7 +446,7 @@ fn same_host_https_upgrade(source: &url::Url, target: &url::Url) -> bool {
 async fn ipv6_observations(settings: &Settings) -> Vec<Ipv6ProbeObservation> {
     let timeout = Duration::from_secs(settings.request_timeout_secs.min(8));
     join_all(
-        ipv6_probe_targets(&settings.ipv6_targets)
+        ipv6_probe_targets(settings)
             .iter()
             .map(|target| ipv6_probe(target, timeout)),
     )
@@ -435,6 +457,7 @@ async fn ipv6_observations(settings: &Settings) -> Vec<Ipv6ProbeObservation> {
 struct ProviderResponse {
     status: Option<u16>,
     reported: Option<IpAddr>,
+    echo: Option<Ipv6EchoKind>,
     local_address: Option<IpAddr>,
     peer_address: Option<IpAddr>,
     literal_https_reachable: bool,
@@ -493,16 +516,25 @@ async fn provider_request(
         }
         return Err((result, ProbeOutcome::UnexpectedBody));
     }
-    result.reported = parse_reported_ip(&body, callback.as_deref());
-    if probe != Ipv6ProbeKind::DualStack
-        && !matches!(result.reported, Some(IpAddr::V6(address)) if is_public_ipv6(address))
-    {
-        return Err((result, ProbeOutcome::UnexpectedBody));
+    let reply = classify_echo(&body, callback.as_deref());
+    result.echo = Some(reply.kind());
+    result.reported = reply.address();
+    if probe == Ipv6ProbeKind::Education {
+        // A reachable measurement point is evidence on its own, but a challenge
+        // page is not: it proves only that a gate answered.
+        if reply.kind() == Ipv6EchoKind::Challenge {
+            return Err((result, ProbeOutcome::UnexpectedBody));
+        }
+        return Ok(result);
     }
-    if probe == Ipv6ProbeKind::DualStack
-        && !matches!(result.reported, Some(IpAddr::V4(_)))
-        && !matches!(result.reported, Some(IpAddr::V6(address)) if is_public_ipv6(address))
-    {
+    let accepted = match probe {
+        Ipv6ProbeKind::DualStack => {
+            matches!(reply, EchoReply::Public(_))
+                || matches!(reply, EchoReply::NonPublic(IpAddr::V4(_)))
+        }
+        _ => matches!(reply, EchoReply::Public(_)),
+    };
+    if !accepted {
         return Err((result, ProbeOutcome::UnexpectedBody));
     }
     if probe == Ipv6ProbeKind::LargePacket && body.len() < 1280 {
@@ -516,23 +548,124 @@ fn has_dns_reply_header(body: &[u8]) -> bool {
     body.len() >= 12 && body[..2] == [0, 0] && body[2] & 0x80 != 0
 }
 
-fn parse_reported_ip(body: &[u8], callback: Option<&str>) -> Option<IpAddr> {
-    let text = std::str::from_utf8(body).ok()?.trim();
-    if let Ok(address) = text.parse() {
-        return Some(address);
+/// What an echo endpoint's body contained. Only `Public` proves a public IPv6
+/// address, and a challenge page is never treated as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EchoReply {
+    Public(Ipv6Addr),
+    NonPublic(IpAddr),
+    Truncated,
+    Invalid,
+    Challenge,
+}
+
+impl EchoReply {
+    fn kind(self) -> Ipv6EchoKind {
+        match self {
+            Self::Public(_) => Ipv6EchoKind::PublicAddress,
+            Self::NonPublic(_) => Ipv6EchoKind::NonPublicAddress,
+            Self::Truncated => Ipv6EchoKind::Truncated,
+            Self::Invalid => Ipv6EchoKind::Invalid,
+            Self::Challenge => Ipv6EchoKind::Challenge,
+        }
     }
-    // Test IPv6's endpoint returns JSONP. Only parse the JSON payload as data.
+
+    fn address(self) -> Option<IpAddr> {
+        match self {
+            Self::Public(address) => Some(IpAddr::V6(address)),
+            Self::NonPublic(address) => Some(address),
+            Self::Truncated | Self::Invalid | Self::Challenge => None,
+        }
+    }
+}
+
+fn classify_echo(body: &[u8], callback: Option<&str>) -> EchoReply {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return EchoReply::Invalid;
+    };
+    let text = text.trim().trim_start_matches('\u{feff}');
+    if text.is_empty() {
+        return EchoReply::Invalid;
+    }
+    if let Some(reply) = classify_echo_text(text) {
+        return reply;
+    }
+    // Test IPv6's endpoint returns JSONP. Only the JSON payload is parsed as data.
     let json = match callback
         .and_then(|name| text.strip_prefix(name))
         .and_then(|rest| rest.strip_prefix('('))
     {
         Some(payload) => payload
             .strip_suffix(");")
-            .or_else(|| payload.strip_suffix(')'))?,
+            .or_else(|| payload.strip_suffix(')'))
+            .unwrap_or_default(),
         None => text,
+    }
+    .trim();
+    if let Ok(reply) = serde_json::from_str::<serde_json::Value>(json) {
+        let value = ["processedString", "ip"]
+            .iter()
+            .find_map(|key| reply.get(*key).and_then(serde_json::Value::as_str));
+        return value
+            .and_then(classify_echo_text)
+            .unwrap_or(EchoReply::Invalid);
+    }
+    if looks_like_challenge(text) {
+        EchoReply::Challenge
+    } else if looks_truncated(text, json) {
+        EchoReply::Truncated
+    } else {
+        EchoReply::Invalid
+    }
+}
+
+/// Classifies a single plain token. `None` means the text is not an address at
+/// all, so the caller can look for JSON or a challenge page instead.
+fn classify_echo_text(value: &str) -> Option<EchoReply> {
+    // Providers decorate the address with extra prose such as "… (CERNET)";
+    // the address must still be the leading, complete token.
+    let token = value.split_whitespace().next().unwrap_or_default();
+    let token = token.split('%').next().unwrap_or_default();
+    if let Ok(address) = token.parse::<IpAddr>() {
+        return Some(match address {
+            IpAddr::V6(address) if is_public_ipv6(address) => EchoReply::Public(address),
+            address => EchoReply::NonPublic(address),
+        });
+    }
+    (!token.is_empty() && looks_like_address_prefix(token)).then_some(EchoReply::Truncated)
+}
+
+/// An address-shaped fragment: hex digits and colons, and no complete address.
+fn looks_like_address_prefix(token: &str) -> bool {
+    token.contains(':')
+        && token
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() || matches!(character, ':' | '.'))
+}
+
+fn looks_like_challenge(text: &str) -> bool {
+    const MARKERS: [&str; 9] = [
+        "captcha",
+        "recaptcha",
+        "cf_chl",
+        "cf-chl",
+        "challenge-platform",
+        "just a moment",
+        "checking your browser",
+        "enable javascript",
+        "turnstile",
+    ];
+    let lower = text.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Whether the body stopped before the payload its opening delimiter announced.
+fn looks_truncated(text: &str, json: &str) -> bool {
+    let unclosed = |value: &str| {
+        (value.starts_with('{') || value.starts_with('['))
+            && !(value.ends_with('}') || value.ends_with(']'))
     };
-    let reply: serde_json::Value = serde_json::from_str(json).ok()?;
-    reply.get("ip")?.as_str()?.parse().ok()
+    unclosed(json) || (text.contains('(') && !text.trim_end().ends_with(')'))
 }
 
 fn probe_destinations(answers: &[IpAddr], from_dns: bool) -> Vec<SocketAddr> {
@@ -561,6 +694,7 @@ async fn ipv6_probe(target: &Ipv6Target, timeout: Duration) -> Ipv6ProbeObservat
     let mut observation = Ipv6ProbeObservation {
         target: target.index,
         kind: target.kind,
+        probe_id: target.probe_id.clone(),
         dns_result: None,
         addresses: None,
         resolved_addresses: Vec::new(),
@@ -571,6 +705,7 @@ async fn ipv6_probe(target: &Ipv6Target, timeout: Duration) -> Ipv6ProbeObservat
         literal_https_reachable: false,
         status: None,
         outcome: None,
+        echo: None,
         reported_address: None,
         attempted: 0,
         succeeded: 0,
@@ -622,6 +757,7 @@ async fn ipv6_probe(target: &Ipv6Target, timeout: Duration) -> Ipv6ProbeObservat
             };
         observation.status = response.status;
         observation.outcome = Some(outcome);
+        observation.echo = response.echo;
         observation.local_address = response.local_address;
         observation.peer_address = response.peer_address;
         observation.local_is_v6 = response.local_address.map(|ip| ip.is_ipv6());
@@ -637,6 +773,7 @@ async fn ipv6_probe(target: &Ipv6Target, timeout: Duration) -> Ipv6ProbeObservat
     if time::timeout(timeout, work).await.is_err() {
         observation.timed_out = true;
         observation.outcome = Some(ProbeOutcome::Timeout);
+        observation.echo = Some(Ipv6EchoKind::Timeout);
         if observation.dns_result.is_none()
             && matches!(target.url.host(), Some(url::Host::Domain(_)))
         {
@@ -794,6 +931,115 @@ mod tests {
         ]));
     }
 
+    #[test]
+    fn processed_string_echoes_are_parsed_strictly() {
+        let public = "2001:da8:204::1".parse::<Ipv6Addr>().unwrap();
+        let cases: [(&str, EchoReply); 12] = [
+            (
+                r#"{"processedString":"2001:da8:204::1","organization":"CERNET"}"#,
+                EchoReply::Public(public),
+            ),
+            (
+                r#"{"processedString":"2001:da8:204::1 (CERNET)"}"#,
+                EchoReply::Public(public),
+            ),
+            (
+                r#"{"processedString":"10.0.0.8 (Campus)"}"#,
+                EchoReply::NonPublic("10.0.0.8".parse().unwrap()),
+            ),
+            (
+                r#"{"processedString":"fdfe:dcba:9876::1"}"#,
+                EchoReply::NonPublic("fdfe:dcba:9876::1".parse().unwrap()),
+            ),
+            (
+                r#"{"processedString":"2001:da8:204"}"#,
+                EchoReply::Truncated,
+            ),
+            (
+                r#"{"processedString":"2001:da8:zzzz::1"}"#,
+                EchoReply::Invalid,
+            ),
+            (r#"{"processedString":""}"#, EchoReply::Invalid),
+            (
+                r#"<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>"#,
+                EchoReply::Challenge,
+            ),
+            (r#"{"ip":"2001:da8:204::1""#, EchoReply::Truncated),
+            ("2001:da8:204::1", EchoReply::Public(public)),
+            (
+                r#"cb({"processedString":"2001:da8:204::1"});"#,
+                EchoReply::Public(public),
+            ),
+            ("", EchoReply::Invalid),
+        ];
+        for (body, expected) in cases {
+            let callback = body.contains("cb(").then_some("cb");
+            assert_eq!(classify_echo(body.as_bytes(), callback), expected, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_pages_and_truncated_echoes_are_not_success() {
+        for (body, echo, education_outcome) in [
+            (
+                "<html><body>Checking your browser. Enable JavaScript.</body></html>",
+                Ipv6EchoKind::Challenge,
+                ProbeOutcome::UnexpectedBody,
+            ),
+            (
+                r#"{"processedString":"2001:da8:204"}"#,
+                Ipv6EchoKind::Truncated,
+                ProbeOutcome::Match,
+            ),
+            (
+                r#"{"processedString":"10.0.0.8"}"#,
+                Ipv6EchoKind::NonPublicAddress,
+                ProbeOutcome::Match,
+            ),
+        ] {
+            for (kind, expected) in [
+                (Ipv6ProbeKind::Address, ProbeOutcome::UnexpectedBody),
+                (Ipv6ProbeKind::Education, education_outcome),
+            ] {
+                let (result, outcome) = provider_fixture("127.0.0.1:0", body, kind, "/ip").await;
+                assert_eq!(result.echo, Some(echo), "{body} {kind:?}");
+                assert_eq!(outcome, expected, "{body} {kind:?}");
+                assert_eq!(
+                    result.reported.is_some(),
+                    echo == Ipv6EchoKind::NonPublicAddress
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn education_measurement_points_accept_any_page_but_not_a_challenge() {
+        let (result, outcome) = provider_fixture(
+            "127.0.0.1:0",
+            "<!DOCTYPE html><html><body>CERNET</body></html>",
+            Ipv6ProbeKind::Education,
+            "/",
+        )
+        .await;
+        assert_eq!(outcome, ProbeOutcome::Match);
+        assert_eq!(result.echo, Some(Ipv6EchoKind::Invalid));
+        assert_eq!(result.reported, None);
+
+        let (result, outcome) = provider_fixture(
+            "127.0.0.1:0",
+            r#"{"processedString":"2001:da8:204::1"}"#,
+            Ipv6ProbeKind::Education,
+            "/ip",
+        )
+        .await;
+        assert_eq!(outcome, ProbeOutcome::Match);
+        assert_eq!(
+            result.reported,
+            Some("2001:da8:204::1".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(result.echo, Some(Ipv6EchoKind::PublicAddress));
+    }
+
     #[tokio::test]
     async fn unusable_literals_are_skipped_before_connecting() {
         for (url, non_public, family_count) in [
@@ -806,6 +1052,7 @@ mod tests {
                     index: 1,
                     url: parse_ipv6_target(url).unwrap(),
                     kind: Ipv6ProbeKind::Address,
+                    probe_id: None,
                 },
                 Duration::from_secs(1),
             )
@@ -934,9 +1181,14 @@ mod tests {
 
     #[test]
     fn dedicated_defaults_produce_ipv6_only_and_detailed_test_ipv6_probes() {
-        let targets = ipv6_probe_targets(&Settings::default().ipv6_targets);
+        let settings = Settings::default();
+        let targets = ipv6_probe_targets(&settings);
+        let echo_targets = &targets[..5];
         assert_eq!(
-            targets.iter().map(|target| target.kind).collect::<Vec<_>>(),
+            echo_targets
+                .iter()
+                .map(|target| target.kind)
+                .collect::<Vec<_>>(),
             [
                 Ipv6ProbeKind::Address,
                 Ipv6ProbeKind::TestIpv6,
@@ -945,19 +1197,31 @@ mod tests {
                 Ipv6ProbeKind::Address
             ]
         );
-        assert_eq!(targets[2].index, 2);
-        assert!(targets[2]
+        assert_eq!(echo_targets[2].index, 2);
+        assert!(echo_targets[2]
             .url
             .query_pairs()
             .any(|(key, value)| key == "size" && value == "1600"));
-        assert_eq!(targets[3].url.host_str(), Some("ds.test-ipv6.com"));
+        assert_eq!(echo_targets[3].url.host_str(), Some("ds.test-ipv6.com"));
         assert!(same_host_https_upgrade(
-            &targets[0].url,
+            &echo_targets[0].url,
             &url::Url::parse("https://api-ipv6.ip.sb/ip").unwrap()
         ));
         assert!(!same_host_https_upgrade(
-            &targets[0].url,
+            &echo_targets[0].url,
             &url::Url::parse("https://example.com/ip").unwrap()
         ));
+        // The education group keeps its stable identifiers and stays informational.
+        assert_eq!(
+            targets[5..]
+                .iter()
+                .map(|target| (target.kind, target.probe_id.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (Ipv6ProbeKind::Education, Some("cernet")),
+                (Ipv6ProbeKind::Education, Some("cernet2")),
+                (Ipv6ProbeKind::Education, Some("fiti")),
+            ]
+        );
     }
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::io_error;
+use bitnet_core::Ipv6AddressInfo;
 use std::{
     collections::BTreeMap,
     ffi::CStr,
@@ -49,6 +50,7 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                 dns: Vec::new(),
                 dns_config: None,
                 ipv6: Vec::new(),
+                ipv6_details: Vec::new(),
                 ipv4_mode: None,
                 ipv6_enabled: None,
             });
@@ -67,7 +69,16 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
                     }
                     libc::AF_INET6 => {
                         let address = &*a.ifa_addr.cast::<libc::sockaddr_in6>();
-                        item.ipv6.push(Ipv6Addr::from(address.sin6_addr.s6_addr));
+                        let ip = Ipv6Addr::from(address.sin6_addr.s6_addr);
+                        if !item.ipv6.contains(&ip) {
+                            item.ipv6.push(ip);
+                        }
+                        // getifaddrs reports no DAD state, origins or lifetimes,
+                        // so those stay unknown instead of being guessed.
+                        item.ipv6_details.push(Ipv6AddressInfo {
+                            prefix_length: ipv6_prefix_length(a.ifa_netmask),
+                            ..Ipv6AddressInfo::unknown(ip)
+                        });
                         item.ipv6_enabled = Some(true);
                     }
                     _ => {}
@@ -78,6 +89,8 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
         for item in out.values_mut() {
             item.ipv6.sort_unstable();
             item.ipv6.dedup();
+            item.ipv6_details.sort_unstable_by_key(|info| info.address);
+            item.ipv6_details.dedup_by_key(|info| info.address);
             #[cfg(target_os = "linux")]
             if let Some(enabled) = linux_ipv6_enabled(&item.name) {
                 item.ipv6_enabled = Some(enabled);
@@ -112,6 +125,27 @@ pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
         Ok(out.into_values().collect())
     }
 }
+unsafe fn ipv6_prefix_length(netmask: *const libc::sockaddr) -> Option<u8> {
+    if netmask.is_null() || (*netmask).sa_family as i32 != libc::AF_INET6 {
+        return None;
+    }
+    let bytes = (*netmask.cast::<libc::sockaddr_in6>()).sin6_addr.s6_addr;
+    let mut prefix = 0_u8;
+    let mut trailing_zero = false;
+    for byte in bytes {
+        for bit in (0..8).rev() {
+            if byte & (1 << bit) == 0 {
+                trailing_zero = true;
+            } else if trailing_zero {
+                return None;
+            } else {
+                prefix += 1;
+            }
+        }
+    }
+    Some(prefix)
+}
+
 #[cfg(target_os = "linux")]
 fn linux_ipv6_enabled(name: &str) -> Option<bool> {
     let path = std::path::Path::new("/proc/sys/net/ipv6/conf")
@@ -409,5 +443,29 @@ mod tests {
             assert!(!n.id.is_empty());
             assert!(!n.name.is_empty());
         }
+    }
+
+    #[test]
+    fn prefix_length_comes_only_from_a_contiguous_netmask() {
+        let netmask = |bytes: [u8; 16]| {
+            let mut address: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            address.sin6_family = libc::AF_INET6 as u16;
+            address.sin6_addr.s6_addr = bytes;
+            address
+        };
+        let length = |bytes: [u8; 16]| unsafe {
+            ipv6_prefix_length((&netmask(bytes) as *const libc::sockaddr_in6).cast())
+        };
+        let mut host = [0_u8; 16];
+        assert_eq!(length(host), Some(0));
+        host[..8].fill(0xff);
+        assert_eq!(length(host), Some(64));
+        host.fill(0xff);
+        assert_eq!(length(host), Some(128));
+        let mut sparse = [0_u8; 16];
+        sparse[0] = 0xff;
+        sparse[2] = 0xff;
+        assert_eq!(length(sparse), None);
+        assert_eq!(unsafe { ipv6_prefix_length(ptr::null()) }, None);
     }
 }

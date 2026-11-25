@@ -76,6 +76,149 @@ pub struct DnsConfiguration {
     pub ipv6_mode: Option<DnsMode>,
 }
 
+/// Duplicate address detection state reported by the operating system.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Ipv6AddressState {
+    #[default]
+    Unknown,
+    Preferred,
+    Deprecated,
+    Tentative,
+    Duplicate,
+    Invalid,
+}
+
+/// Where a prefix or an interface identifier came from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Ipv6Origin {
+    #[default]
+    Unknown,
+    Other,
+    Manual,
+    WellKnown,
+    Dhcp,
+    RouterAdvertisement,
+    LinkLayerAddress,
+    Random,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Ipv6Scope {
+    #[default]
+    Unknown,
+    Loopback,
+    LinkLocal,
+    UniqueLocal,
+    Global,
+}
+
+impl Ipv6Scope {
+    /// Scope implied by the address block itself. Only the block is described.
+    pub fn of(address: Ipv6Addr) -> Self {
+        if address.is_loopback() {
+            Self::Loopback
+        } else if address.is_unicast_link_local() {
+            Self::LinkLocal
+        } else if address.is_unique_local() {
+            Self::UniqueLocal
+        } else if is_public_ipv6(address) {
+            Self::Global
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// Remaining address lifetime. `Unknown` is not the same as a lifetime of zero.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Ipv6Lifetime {
+    #[default]
+    Unknown,
+    Infinite,
+    Seconds(u32),
+}
+
+impl Ipv6Lifetime {
+    /// IP Helper reports an all-ones lifetime for addresses that never expire.
+    pub fn from_seconds(seconds: u32) -> Self {
+        if seconds == u32::MAX {
+            Self::Infinite
+        } else {
+            Self::Seconds(seconds)
+        }
+    }
+}
+
+/// Presentation class of a local address, derived from its reported state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ipv6AddressPresentation {
+    Preferred,
+    TemporaryPreferred,
+    Deprecated,
+    Tentative,
+    Duplicate,
+    Invalid,
+    Unknown,
+}
+
+/// One unicast IPv6 address on an adapter. Missing facts stay unknown rather
+/// than being inferred from the address text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Ipv6AddressInfo {
+    pub address: Ipv6Addr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_length: Option<u8>,
+    #[serde(default)]
+    pub state: Ipv6AddressState,
+    #[serde(default)]
+    pub prefix_origin: Ipv6Origin,
+    #[serde(default)]
+    pub suffix_origin: Ipv6Origin,
+    #[serde(default)]
+    pub preferred_lifetime: Ipv6Lifetime,
+    #[serde(default)]
+    pub valid_lifetime: Ipv6Lifetime,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub temporary: bool,
+    #[serde(default)]
+    pub scope: Ipv6Scope,
+}
+
+impl Ipv6AddressInfo {
+    /// An address whose additional properties could not be read.
+    pub fn unknown(address: Ipv6Addr) -> Self {
+        Self {
+            address,
+            prefix_length: None,
+            state: Ipv6AddressState::Unknown,
+            prefix_origin: Ipv6Origin::Unknown,
+            suffix_origin: Ipv6Origin::Unknown,
+            preferred_lifetime: Ipv6Lifetime::Unknown,
+            valid_lifetime: Ipv6Lifetime::Unknown,
+            temporary: false,
+            scope: Ipv6Scope::Unknown,
+        }
+    }
+
+    pub fn presentation(&self) -> Ipv6AddressPresentation {
+        match self.state {
+            Ipv6AddressState::Preferred if self.temporary => {
+                Ipv6AddressPresentation::TemporaryPreferred
+            }
+            Ipv6AddressState::Preferred => Ipv6AddressPresentation::Preferred,
+            Ipv6AddressState::Deprecated => Ipv6AddressPresentation::Deprecated,
+            Ipv6AddressState::Tentative => Ipv6AddressPresentation::Tentative,
+            Ipv6AddressState::Duplicate => Ipv6AddressPresentation::Duplicate,
+            Ipv6AddressState::Invalid => Ipv6AddressPresentation::Invalid,
+            Ipv6AddressState::Unknown => Ipv6AddressPresentation::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkInterface {
     pub id: String,
@@ -97,6 +240,9 @@ pub struct NetworkInterface {
     pub dns_config: Option<DnsConfiguration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ipv6: Vec<Ipv6Addr>,
+    /// Per-address IPv6 facts. Older snapshots omit this list entirely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ipv6_details: Vec<Ipv6AddressInfo>,
     /// Configured IPv4 assignment method, when available for this adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv4_mode: Option<Ipv4Assignment>,
@@ -243,6 +389,76 @@ fn validate_ipv6_targets(targets: &[String]) -> Result<(), AppError> {
     Ok(())
 }
 
+pub const MAX_EDUCATION_PROBES: usize = 8;
+
+/// A measurement point that checks IPv6 reachability of education networks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EducationProbe {
+    /// Stable identifier. Results refer to this instead of a list position.
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    /// The endpoint answers with a bot challenge page before its real content.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub needs_challenge: bool,
+}
+
+const DEFAULT_EDUCATION_PROBES: [(&str, &str, &str); 3] = [
+    ("cernet", "CERNET 门户", "https://www.cernet.edu.cn"),
+    ("cernet2", "CERNET2 门户", "https://www.cernet2.edu.cn"),
+    ("fiti", "FITI 门户", "https://www.fiti.edu.cn"),
+];
+
+fn default_education_probes() -> Vec<EducationProbe> {
+    DEFAULT_EDUCATION_PROBES
+        .iter()
+        .map(|(id, name, url)| EducationProbe {
+            id: (*id).into(),
+            name: (*name).into(),
+            url: (*url).into(),
+            needs_challenge: false,
+        })
+        .collect()
+}
+
+fn default_education_probes_match(probes: &[EducationProbe]) -> bool {
+    probes.len() == DEFAULT_EDUCATION_PROBES.len()
+        && probes
+            .iter()
+            .zip(DEFAULT_EDUCATION_PROBES)
+            .all(|(probe, (id, name, url))| {
+                probe.id == id && probe.name == name && probe.url == url && !probe.needs_challenge
+            })
+}
+
+fn validate_education_probes(probes: &[EducationProbe]) -> Result<(), AppError> {
+    if probes.len() > MAX_EDUCATION_PROBES {
+        return Err(AppError::new(ErrorCode::InvalidInput, "教育网测点过多"));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for probe in probes {
+        if probe.id.is_empty()
+            || probe.id.len() > 64
+            || !probe.id.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_' | b'.')
+            })
+        {
+            return Err(AppError::new(ErrorCode::InvalidInput, "教育网测点标识无效"));
+        }
+        if probe.name.is_empty() || probe.name.len() > 128 {
+            return Err(AppError::new(ErrorCode::InvalidInput, "教育网测点名称无效"));
+        }
+        parse_ipv6_target(&probe.url)?;
+        if !ids.insert(&probe.id) {
+            return Err(AppError::new(ErrorCode::InvalidInput, "教育网测点标识重复"));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthExpect {
@@ -352,6 +568,9 @@ pub struct Settings {
     // Older BitNet versions can still read otherwise compatible default settings.
     #[serde(skip_serializing_if = "default_ipv6_targets_match")]
     pub ipv6_targets: Vec<String>,
+    /// Education-network measurement points; the defaults apply when absent.
+    #[serde(skip_serializing_if = "default_education_probes_match")]
+    pub education_probes: Vec<EducationProbe>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub health_expectations: BTreeMap<String, HealthExpect>,
     pub rules: Vec<NetworkRule>,
@@ -393,6 +612,7 @@ impl Default for Settings {
             ],
             health_expectations: BTreeMap::new(),
             ipv6_targets: DEFAULT_IPV6_TARGETS.map(str::to_owned).into(),
+            education_probes: default_education_probes(),
             rules: Vec::new(),
         }
     }
@@ -443,6 +663,25 @@ impl Settings {
         Ok(())
     }
 
+    pub fn set_education_probes(&mut self, probes: Vec<EducationProbe>) -> Result<(), AppError> {
+        let probes: Vec<_> = probes
+            .into_iter()
+            .map(|probe| EducationProbe {
+                id: probe.id.trim().to_owned(),
+                name: probe.name.trim().to_owned(),
+                url: probe.url.trim().to_owned(),
+                needs_challenge: probe.needs_challenge,
+            })
+            .collect();
+        validate_education_probes(&probes)?;
+        self.education_probes = probes;
+        Ok(())
+    }
+
+    pub fn education_probe(&self, id: &str) -> Option<&EducationProbe> {
+        self.education_probes.iter().find(|probe| probe.id == id)
+    }
+
     pub fn validate(&self) -> Result<(), AppError> {
         if self.schema_version != 1 {
             return Err(AppError::new(ErrorCode::Incompatible, "不支持的配置版本"));
@@ -468,6 +707,7 @@ impl Settings {
             return Err(AppError::new(ErrorCode::InvalidInput, "不支持的日志级别"));
         }
         validate_ipv6_targets(&self.ipv6_targets)?;
+        validate_education_probes(&self.education_probes)?;
         if self.rules.len() > 128
             || self.health_targets.len() > MAX_HEALTH_TARGETS
             || self.health_expectations.len() > MAX_HEALTH_TARGETS
@@ -684,6 +924,27 @@ pub enum Ipv6ProbeKind {
     TestIpv6,
     DualStack,
     LargePacket,
+    /// An education-network measurement point; it confirms reachability, not
+    /// necessarily a public IPv6 echo.
+    Education,
+}
+
+/// What a probe response contained. Challenge pages never count as success.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Ipv6EchoKind {
+    /// A complete public IPv6 address.
+    PublicAddress,
+    /// A complete address outside global unicast: IPv4, ULA, link-local.
+    NonPublicAddress,
+    /// An address-looking string that is not a complete address.
+    Truncated,
+    /// A body with neither an address nor a recognizable challenge page.
+    Invalid,
+    /// A bot or JavaScript challenge page instead of the echo.
+    Challenge,
+    /// The request timed out before any body arrived.
+    Timeout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -691,10 +952,15 @@ pub struct Ipv6ProbeObservation {
     pub target: usize,
     #[serde(default)]
     pub kind: Ipv6ProbeKind,
+    /// Stable identifier of the configured education-network probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ProbeOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub echo: Option<Ipv6EchoKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_address: Option<Ipv6Addr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -727,8 +993,15 @@ impl Ipv6ProbeObservation {
                 && self
                     .outcome
                     .is_none_or(|outcome| outcome == ProbeOutcome::Match)
+                && self
+                    .echo
+                    .is_none_or(|echo| echo == Ipv6EchoKind::PublicAddress)
                 && is_public_ipv6(*address)
         })
+    }
+
+    pub fn is_education(&self) -> bool {
+        self.kind == Ipv6ProbeKind::Education
     }
 
     pub fn dual_stack_reported_ipv4(&self) -> bool {
@@ -786,6 +1059,14 @@ impl HealthStatus {
             .find_map(Ipv6ProbeObservation::confirmed_address)
     }
 
+    /// Probes that measure IPv6 internet reachability. Education-network
+    /// measurement points are informational and never decide this verdict.
+    pub fn connectivity_ipv6_probes(&self) -> impl Iterator<Item = &Ipv6ProbeObservation> {
+        self.ipv6_probes
+            .iter()
+            .filter(|probe| !probe.is_education())
+    }
+
     pub fn observed_ipv6_status(&self) -> Ipv6Status {
         if self.confirmed_ipv6().is_some()
             || self
@@ -804,16 +1085,17 @@ impl HealthStatus {
             };
         }
         let ipv6_only = || {
-            self.ipv6_probes
-                .iter()
+            self.connectivity_ipv6_probes()
                 .filter(|p| p.kind != Ipv6ProbeKind::DualStack)
         };
-        let http_replied = self.ipv6_probes.iter().any(|p| p.local_is_v6 == Some(true))
+        let http_replied = self
+            .connectivity_ipv6_probes()
+            .any(|p| p.local_is_v6 == Some(true))
             || ipv6_only().any(|p| p.status.is_some());
         if !http_replied && ipv6_only().any(|p| p.attempted > 0 && !p.non_public_target) {
             return Ipv6Status::GlobalUnreachable;
         }
-        if http_replied || self.ipv6_probes.iter().any(|p| p.non_public_target) {
+        if http_replied || ipv6_only().any(|p| p.non_public_target) {
             return Ipv6Status::Unknown;
         }
         match self.ipv6_status {
@@ -1323,7 +1605,194 @@ mod tests {
         assert!(adapter.binding().is_some());
         assert!(adapter.dns.is_empty());
         assert!(adapter.ipv6.is_empty());
+        assert!(adapter.ipv6_details.is_empty());
         assert_eq!(adapter.ipv4_mode, None);
         assert_eq!(adapter.ipv6_enabled, None);
+    }
+
+    #[test]
+    fn ipv6_address_details_round_trip_and_stay_optional() {
+        let mut adapter: NetworkInterface = serde_json::from_value(serde_json::json!({
+            "id": "ethernet",
+            "name": "Ethernet",
+            "index": 5,
+            "ipv4": ["10.1.2.3"],
+            "up": true,
+            "wireless": false,
+            "virtual_adapter": false
+        }))
+        .unwrap();
+        assert!(adapter.ipv6_details.is_empty());
+        assert!(serde_json::to_value(&adapter)
+            .unwrap()
+            .get("ipv6_details")
+            .is_none());
+
+        adapter.ipv6_details = vec![
+            Ipv6AddressInfo {
+                address: "2001:da8:204::1".parse().unwrap(),
+                prefix_length: Some(64),
+                state: Ipv6AddressState::Preferred,
+                prefix_origin: Ipv6Origin::RouterAdvertisement,
+                suffix_origin: Ipv6Origin::LinkLayerAddress,
+                preferred_lifetime: Ipv6Lifetime::Seconds(3600),
+                valid_lifetime: Ipv6Lifetime::Infinite,
+                temporary: false,
+                scope: Ipv6Scope::Global,
+            },
+            Ipv6AddressInfo::unknown("fdfe:dcba:9876::1".parse().unwrap()),
+        ];
+        let encoded = serde_json::to_value(&adapter).unwrap();
+        assert_eq!(
+            encoded["ipv6_details"][0],
+            serde_json::json!({
+                "address": "2001:da8:204::1",
+                "prefix_length": 64,
+                "state": "preferred",
+                "prefix_origin": "router_advertisement",
+                "suffix_origin": "link_layer_address",
+                "preferred_lifetime": {"seconds": 3600},
+                "valid_lifetime": "infinite",
+                "scope": "global"
+            })
+        );
+        assert_eq!(encoded["ipv6_details"][1]["state"], "unknown");
+        assert_eq!(encoded["ipv6_details"][1]["preferred_lifetime"], "unknown");
+        assert!(encoded["ipv6_details"][1].get("temporary").is_none());
+        let decoded: NetworkInterface = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.ipv6_details, adapter.ipv6_details);
+    }
+
+    #[test]
+    fn ipv6_address_presentation_separates_dad_states() {
+        use Ipv6AddressPresentation::*;
+        let address = "2001:da8:204::1".parse().unwrap();
+        let mut info = Ipv6AddressInfo::unknown(address);
+        assert_eq!(info.presentation(), Unknown);
+        for (state, temporary, expected) in [
+            (Ipv6AddressState::Preferred, false, Preferred),
+            (Ipv6AddressState::Preferred, true, TemporaryPreferred),
+            (Ipv6AddressState::Deprecated, false, Deprecated),
+            (Ipv6AddressState::Tentative, false, Tentative),
+            (Ipv6AddressState::Duplicate, false, Duplicate),
+            (Ipv6AddressState::Invalid, false, Invalid),
+            (Ipv6AddressState::Unknown, false, Unknown),
+        ] {
+            info.state = state;
+            info.temporary = temporary;
+            assert_eq!(info.presentation(), expected, "{state:?}");
+        }
+        for (address, expected) in [
+            ("2001:da8:204::1", Ipv6Scope::Global),
+            ("fe80::1", Ipv6Scope::LinkLocal),
+            ("fdfe:dcba:9876::1", Ipv6Scope::UniqueLocal),
+            ("::1", Ipv6Scope::Loopback),
+            ("ff02::1", Ipv6Scope::Unknown),
+        ] {
+            assert_eq!(Ipv6Scope::of(address.parse().unwrap()), expected);
+        }
+        assert_eq!(Ipv6Lifetime::from_seconds(u32::MAX), Ipv6Lifetime::Infinite);
+        assert_eq!(Ipv6Lifetime::from_seconds(0), Ipv6Lifetime::Seconds(0));
+        assert_eq!(Ipv6Lifetime::default(), Ipv6Lifetime::Unknown);
+    }
+
+    #[test]
+    fn education_probe_group_keeps_legacy_defaults_and_validates_overrides() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.education_probes, default_education_probes());
+        assert!(serde_json::to_value(&settings)
+            .unwrap()
+            .get("education_probes")
+            .is_none());
+        assert!(settings.validate().is_ok());
+        assert_eq!(
+            settings.education_probe("cernet2").map(|p| p.url.as_str()),
+            Some("https://www.cernet2.edu.cn")
+        );
+
+        let grouped = vec![EducationProbe {
+            id: "lab".into(),
+            name: "实验室测点".into(),
+            url: "https://probe.example/ip".into(),
+            needs_challenge: true,
+        }];
+        settings.set_education_probes(grouped.clone()).unwrap();
+        let encoded = serde_json::to_value(&settings).unwrap();
+        assert_eq!(encoded["education_probes"][0]["needs_challenge"], true);
+        assert_eq!(
+            serde_json::from_value::<Settings>(encoded).unwrap(),
+            settings
+        );
+
+        for invalid in [
+            vec![
+                EducationProbe {
+                    id: "lab".into(),
+                    ..grouped[0].clone()
+                },
+                EducationProbe {
+                    id: "lab".into(),
+                    name: "重复".into(),
+                    url: "https://probe.example/other".into(),
+                    needs_challenge: false,
+                },
+            ],
+            vec![EducationProbe {
+                id: "BAD ID".into(),
+                ..grouped[0].clone()
+            }],
+            vec![EducationProbe {
+                name: String::new(),
+                ..grouped[0].clone()
+            }],
+            vec![EducationProbe {
+                url: "https://user:secret@probe.example/ip".into(),
+                ..grouped[0].clone()
+            }],
+            (0..=MAX_EDUCATION_PROBES)
+                .map(|index| EducationProbe {
+                    id: format!("probe-{index}"),
+                    name: format!("probe {index}"),
+                    url: format!("https://probe.example/{index}"),
+                    needs_challenge: false,
+                })
+                .collect(),
+        ] {
+            assert!(settings.set_education_probes(invalid).is_err());
+            assert_eq!(settings.education_probes, grouped);
+        }
+
+        settings.set_education_probes(Vec::new()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["education_probes"],
+            serde_json::json!([])
+        );
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn education_probes_never_decide_the_connectivity_verdict() {
+        let education = serde_json::from_value(serde_json::json!({
+            "target": 1, "kind": "education", "probe_id": "cernet",
+            "attempted": 1, "succeeded": 1, "timed_out": false, "elapsed_ms": 30,
+            "status": 200, "outcome": "match", "echo": "invalid", "local_is_v6": false
+        }))
+        .unwrap();
+        let health = HealthStatus {
+            ipv6_probes: vec![education],
+            ..HealthStatus::default()
+        };
+        assert_eq!(health.observed_ipv6_status(), Ipv6Status::Unknown);
+        assert_eq!(health.confirmed_ipv6(), None);
+
+        let challenge: Ipv6ProbeObservation = serde_json::from_value(serde_json::json!({
+            "target": 1, "kind": "education", "probe_id": "fiti",
+            "attempted": 1, "succeeded": 0, "timed_out": false, "elapsed_ms": 30,
+            "status": 200, "outcome": "unexpected_body", "echo": "challenge",
+            "reported_address": "2001:da8:204::1", "local_is_v6": true
+        }))
+        .unwrap();
+        assert_eq!(challenge.confirmed_address(), None);
+        assert!(challenge.is_education());
     }
 }
