@@ -29,11 +29,63 @@ function ProxyEndpoints([string]$Value) {
 $result = [ordered]@{ adapters = @(); routes = @(); egress = @(); proxies = @()
     processes = @(); sockets = @(); relations = @(); interception = @()
     reachability = @(); controllers = @()
+    ipv6 = [ordered]@{ adapters = @(); addresses = @(); routes = @(); disabled_components = $null }
     unavailable = @() }
 
 $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Select-Object -First 128)
 $interfaces = @(Get-NetIPInterface -ErrorAction SilentlyContinue)
 $addresses = @(Get-NetIPAddress -ErrorAction SilentlyContinue)
+$bindings = @{}
+Get-NetAdapterBinding -IncludeHidden -AllBindings -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($_.ComponentID -in @('ms_tcpip6', 'ms_tcpip', 'vms_pp') -and $_.InstanceID) {
+        $bindings[[string]$_.InstanceID] = [bool]$_.Enabled
+    }
+}
+$disabled = Get-ItemPropertyValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' DisabledComponents
+if ($null -ne $disabled) {
+    $result.ipv6.disabled_components = ([int64]$disabled -band 4294967295)
+}
+foreach ($adapter in $adapters) {
+    $index = [uint32]$adapter.ifIndex
+    if ($ipv6DiagnosticResampleIndex -and $index -ne $ipv6DiagnosticResampleIndex) { continue }
+    $guid = '{' + "$($adapter.InterfaceGuid)".Trim('{}') + '}'
+    $properties = $interfaces | Where-Object { $_.InterfaceIndex -eq $index -and $_.AddressFamily -eq 'IPv6' } |
+        Select-Object -First 1
+    $binding = $bindings["${guid}::ms_tcpip6"]
+    $v4Bound = $bindings["${guid}::ms_tcpip"]
+    $switchPort = $bindings["${guid}::vms_pp"] -and !$v4Bound -and !$binding
+    $physical = $adapter.HardwareInterface -and $adapter.InterfaceType -in @(6, 71)
+    $hyperV = $adapter.InterfaceDescription -like 'Hyper-V Virtual Ethernet Adapter*' -and ($v4Bound -or $binding)
+    $result.ipv6.adapters += [ordered]@{
+        index = $index
+        guid = $guid
+        name = "$($adapter.Name)"
+        link_up = ($adapter.Status -eq 'Up')
+        repair_eligible = [bool](($physical -or $hyperV) -and !$switchPort)
+        binding = $binding
+        dhcp = "$($properties.Dhcp)"
+        managed_address = "$($properties.ManagedAddressConfiguration)"
+        router_discovery = "$($properties.RouterDiscovery)"
+    }
+}
+$result.ipv6.addresses = @($addresses | Where-Object {
+    $_.AddressFamily -eq 'IPv6' -and (!$ipv6DiagnosticResampleIndex -or $_.InterfaceIndex -eq $ipv6DiagnosticResampleIndex)
+} | Select-Object -First 256 | ForEach-Object {
+    [ordered]@{
+        index = [uint32]$_.InterfaceIndex
+        address = ("$($_.IPAddress)" -split '%')[0]
+        state = "$($_.AddressState)"
+        prefix_origin = "$($_.PrefixOrigin)"
+        suffix_origin = "$($_.SuffixOrigin)"
+        skip_as_source = [bool]$_.SkipAsSource
+        preferred_lifetime = "$($_.PreferredLifetime)"
+        valid_lifetime = "$($_.ValidLifetime)"
+    }
+})
+if ($ipv6DiagnosticResampleIndex) {
+    $result | ConvertTo-Json -Depth 5 -Compress
+    exit 0
+}
 $resolvers = @(Get-DnsClientServerAddress -ErrorAction SilentlyContinue)
 $routes = @(Get-NetRoute -ErrorAction SilentlyContinue | Where-Object {
     $_.DestinationPrefix -in @('0.0.0.0/0', '0.0.0.0/1', '128.0.0.0/1', '::/0', '::/1', '8000::/1')
@@ -83,6 +135,27 @@ foreach ($target in $targets) {
     $source = $found | Where-Object IPAddress | Select-Object -First 1
     $result.egress += ,@($target, (Text $route.DestinationPrefix), (Text $route.InterfaceIndex),
         (Text $route.InterfaceAlias), (Text $source.IPAddress), (Text $route.NextHop))
+}
+
+foreach ($target in ($ipv6DiagnosticTargets | Select-Object -First 16)) {
+    $found = @(Find-NetRoute -RemoteIPAddress $target -ErrorAction SilentlyContinue)
+    $route = $found | Where-Object DestinationPrefix | Select-Object -First 1
+    $source = $found | Where-Object IPAddress | Select-Object -First 1
+    $nextHop = if ($route.NextHop) { ("$($route.NextHop)" -split '%')[0] }
+    $neighbor = if ($route -and $nextHop -and $nextHop -notin @('0.0.0.0', '::')) {
+        Get-NetNeighbor -InterfaceIndex $route.InterfaceIndex -IPAddress $nextHop -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty State -First 1
+    }
+    $routeIndex = if ($route) { [uint32]$route.InterfaceIndex }
+    $sourceIp = if ($source.IPAddress) { ("$($source.IPAddress)" -split '%')[0] }
+    $result.ipv6.routes += [ordered]@{
+        destination = "$target"
+        index = $routeIndex
+        prefix = "$($route.DestinationPrefix)"
+        source = $sourceIp
+        next_hop = $nextHop
+        neighbor = "$neighbor"
+    }
 }
 
 $internetSettings = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'

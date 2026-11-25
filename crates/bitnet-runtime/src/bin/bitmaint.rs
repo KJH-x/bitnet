@@ -104,7 +104,7 @@ fn main() {
             .nth(1)
             .is_some_and(|a| a == "--help" || a == "-h")
     {
-        println!("BitNet maintenance\nUsage: bitmaint --scope user|system --action ACTION [--interactive] [--purge] [--interface GUID@index] [--manifest-sha256 SHA256]\nActions: service-install, service-start, service-stop, service-remove, repair,\n         check-update, install-update, rollback-update, autostart-on, autostart-off,\n         gui-autostart-on, gui-autostart-off, ipv6-enable, ipv6-disable, ipv6-reset, ipv6-renew\nIPv6 actions require Windows, system scope and --interface GUID@index.\n--purge is valid only with service-remove. --manifest-sha256 is valid only with install-update.\nNoninteractive operations never elevate.");
+        println!("BitNet maintenance\nUsage: bitmaint --scope user|system --action ACTION [--interactive] [--purge] [--interface GUID@index] [--manifest-sha256 SHA256]\nActions: service-install, service-start, service-stop, service-remove, repair,\n         check-update, install-update, rollback-update, autostart-on, autostart-off,\n         gui-autostart-on, gui-autostart-off, ipv6-enable, ipv6-disable, ipv6-reset, ipv6-renew,\n         ipv6-renew-dhcp, ipv6-restart-adapter, ipv6-flush-dns, ipv6-stack-reset\nIPv6 actions require Windows and system scope. Adapter-specific actions require --interface GUID@index.\n--purge is valid only with service-remove. --manifest-sha256 is valid only with install-update.\nNoninteractive operations never elevate.");
         return;
     }
     let outcome = (|| {
@@ -217,6 +217,44 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(action, MaintenanceAction::RenewIpv6 { .. }));
+        assert!(matches!(
+            parse(&[
+                "--scope",
+                "system",
+                "--action",
+                "ipv6-renew-dhcp",
+                "--interface",
+                selector
+            ])
+            .unwrap()
+            .1,
+            MaintenanceAction::RenewDhcpv6 { .. }
+        ));
+        assert!(matches!(
+            parse(&[
+                "--scope",
+                "system",
+                "--action",
+                "ipv6-restart-adapter",
+                "--interface",
+                selector
+            ])
+            .unwrap()
+            .1,
+            MaintenanceAction::RestartIpv6Adapter { .. }
+        ));
+        assert!(matches!(
+            parse(&["--scope", "system", "--action", "ipv6-flush-dns"])
+                .unwrap()
+                .1,
+            MaintenanceAction::FlushDnsCache
+        ));
+        assert!(matches!(
+            parse(&["--scope", "system", "--action", "ipv6-stack-reset"])
+                .unwrap()
+                .1,
+            MaintenanceAction::ResetIpv6Stack
+        ));
         for args in [
             vec!["--scope", "system", "--action", "ipv6-renew"],
             vec!["--action", "ipv6-enable", "--interface", "Ethernet@18"],
@@ -233,6 +271,10 @@ mod tests {
                 "E47D5E9C-1234-4321-ABCD-1234567890AB@18;exit",
             ],
             vec!["--action", "service-start", "--interface", selector],
+            vec!["--action", "ipv6-renew-dhcp"],
+            vec!["--action", "ipv6-restart-adapter"],
+            vec!["--action", "ipv6-flush-dns", "--interface", selector],
+            vec!["--action", "ipv6-stack-reset", "--interface", selector],
             vec![
                 "--action",
                 "ipv6-enable",

@@ -85,6 +85,7 @@ impl Engine {
         snapshot.capabilities.push("login_once".into());
         snapshot.capabilities.push("network_permissions".into());
         snapshot.capabilities.push("clear_logs".into());
+        snapshot.capabilities.push("probe_ipv6".into());
         let (vault, accounts) = if simulation {
             snapshot.capabilities.push("simulation".into());
             (
@@ -1262,6 +1263,29 @@ impl Engine {
                 self.health_check().await;
                 result?;
             }
+            Command::ProbeIpv6 => {
+                let mut health = self.snapshot.health.clone();
+                if self.simulation {
+                    health.ipv6_checked_at = Some(now_secs());
+                } else {
+                    let interfaces = bitnet_platform::network::interfaces().unwrap_or_default();
+                    let binding = self.snapshot.active_binding.as_ref();
+                    let interface = binding.and_then(|binding| {
+                        interfaces.iter().find(|adapter| {
+                            adapter.id == binding.interface_id
+                                && adapter.index == binding.interface_index
+                        })
+                    });
+                    crate::health_probe::run_ipv6(
+                        &self.snapshot.settings,
+                        interface,
+                        &interfaces,
+                        &mut health,
+                    )
+                    .await;
+                }
+                self.snapshot.health = health;
+            }
             Command::Pause => {
                 self.snapshot.settings.paused = true;
                 self.persist()?;
@@ -2278,10 +2302,11 @@ pub async fn run(scope: Scope, simulation: bool) -> Result<(), AppError> {
                         continue;
                     }
                 }
-                let network_command=matches!(&envelope.request.command,Command::Check|Command::Login{..}|Command::LoginOnce{..}|Command::Logout{..}|Command::EnableAutomatic{..}|Command::SetNetworkPermission{..});
+                let network_command=matches!(&envelope.request.command,Command::Check|Command::ProbeIpv6|Command::Login{..}|Command::LoginOnce{..}|Command::Logout{..}|Command::EnableAutomatic{..}|Command::SetNetworkPermission{..});
                 let mut event=changes.receiver.clone();event.borrow_and_update();
                 let result=if network_command&&network_events_open&&!simulation{
-                    tokio::select!{result=engine.execute(envelope.request.command,&envelope.caller)=>result,_=event.changed()=>{engine.next_check=now_secs()+2;Err(AppError::new(ErrorCode::Cancelled,"网络已变化，旧操作已取消；请先查看当前状态"))}}
+                    let ipv6_only = matches!(&envelope.request.command, Command::ProbeIpv6);
+                    tokio::select!{result=engine.execute(envelope.request.command,&envelope.caller)=>result,_=event.changed()=>{if !ipv6_only { engine.next_check=now_secs()+2; } Err(AppError::new(ErrorCode::Cancelled,"网络已变化，旧操作已取消；请先查看当前状态"))}}
                 }else{engine.execute(envelope.request.command,&envelope.caller).await};
                 if let Err(ref e)=result{if !verification && matches!(e.code,ErrorCode::Network|ErrorCode::GatewayUnavailable|ErrorCode::Credentials|ErrorCode::CredentialsUnavailable){engine.set_error(e.clone());engine.emit();}}
                 let _=envelope.answer.send(Reply{api_version:API_VERSION,request_id,result});

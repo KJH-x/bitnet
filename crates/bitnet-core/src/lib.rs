@@ -701,6 +701,12 @@ pub struct Ipv6ProbeObservation {
     pub dns_result: Option<DnsProbeResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addresses: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_addresses: Vec<IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_address: Option<IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_address: Option<IpAddr>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub non_public_target: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -825,6 +831,9 @@ impl HealthStatus {
         }
         for probe in &mut state.ipv6_probes {
             probe.reported_address = None;
+            probe.resolved_addresses.clear();
+            probe.local_address = None;
+            probe.peer_address = None;
         }
         state
     }
@@ -906,6 +915,7 @@ pub struct ServiceStatus {
 pub enum Command {
     Status,
     Check,
+    ProbeIpv6,
     Login {
         account_id: Option<String>,
         force: bool,

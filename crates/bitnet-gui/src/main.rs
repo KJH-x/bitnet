@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod design;
+mod gui_preferences;
+mod ipv6_repair;
 mod notifications;
 mod settings_actions;
 #[cfg(windows)]
@@ -21,6 +23,7 @@ use bitnet_runtime::diagnostics;
 use bitnet_runtime::maintenance::{self, InterfaceTarget, MaintenanceAction, MaintenanceResult};
 use bitnet_runtime::update_policy::{UpdateOutcome, UpdatePolicy};
 use iced::{widget::text_editor, window, Element, Font, Subscription, Task, Theme};
+use ipv6_repair::{Ipv6Repair, Ipv6RepairRequest, RepairResult};
 use settings_actions::{Action as SettingsAction, CheckTrigger, SettingsActions};
 use std::{
     fmt,
@@ -149,6 +152,11 @@ impl Page {
         Self::Service,
         Self::Settings,
     ];
+
+    fn requires_advanced(self) -> bool {
+        self == Self::Statistics
+    }
+
     fn label(self, english: bool) -> &'static str {
         match (self, english) {
             (Self::Status, false) => "连接",
@@ -171,6 +179,12 @@ impl Page {
     }
 }
 
+impl NetworkSection {
+    fn requires_advanced(self) -> bool {
+        self != Self::Adapters
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Language {
     Chinese,
@@ -186,6 +200,13 @@ enum SettingsTab {
     Updates,
     Transfer,
 }
+
+impl SettingsTab {
+    fn requires_advanced(self) -> bool {
+        !matches!(self, Self::General | Self::Updates)
+    }
+}
+
 impl fmt::Display for Language {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -323,11 +344,36 @@ enum Confirmation {
     DeleteProfile(String),
     Shutdown,
     Maintenance(MaintenanceAction),
+    Ipv6Repair(Ipv6RepairRequest),
     ClearLogs {
         scope: Scope,
         bytes: u64,
     },
     PersonalMode,
+}
+
+impl Confirmation {
+    fn is_advanced(&self) -> bool {
+        match self {
+            Self::Ipv6Repair(request) => request.requires_advanced(),
+            Self::Maintenance(action) => {
+                action.ipv6_target().is_some()
+                    || matches!(
+                        action,
+                        MaintenanceAction::ServiceInstall
+                            | MaintenanceAction::ServiceStop
+                            | MaintenanceAction::ServiceRemove { .. }
+                            | MaintenanceAction::SetAutostart { .. }
+                            | MaintenanceAction::ResetIpv6Stack
+                    )
+            }
+            Self::DeleteRule(_)
+            | Self::DeleteProfile(_)
+            | Self::Shutdown
+            | Self::ClearLogs { .. } => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -473,7 +519,7 @@ enum Message {
     ServiceObserved(bitnet_core::ServiceStatus),
     SetServiceAutostart(bool),
     SwitchPersonal,
-    ToggleNetworkAdvanced,
+    ShowAdvancedChanged(bool),
     HealthDetail(Option<HealthDetail>),
     LanguageChanged(Language),
     AppearanceChanged(Appearance),
@@ -483,9 +529,9 @@ enum Message {
     BeginAutomatic,
     NumberChanged(NumericSetting, String),
     SettingsTabChanged(SettingsTab),
-    ToggleCheckAdvanced,
     RestoreCheckDefaults,
     OpenHealthEditor,
+    HealthPreviewPage(usize),
     HealthEntryChanged(usize, String),
     HealthEntryExpectChanged(usize, HealthCondition),
     HealthEntryValueChanged(usize, String),
@@ -541,7 +587,14 @@ enum Message {
     ImportSettings,
     CopyDiagnostics,
     RunDiagnostics,
-    DiagnosticsReady(Scope, std::sync::Arc<diagnostics::Report>),
+    OpenIpv6Diagnostics,
+    SelectRepairAdapter(InterfaceTarget),
+    ToggleDiagnosticEvidence,
+    AskIpv6Repair(bool),
+    DiagnosticsReady(u64, std::sync::Arc<diagnostics::Report>),
+    GuidedRepairCompleted(Result<MaintenanceResult, AppError>),
+    GuidedRecheckReady(u64, std::sync::Arc<diagnostics::Report>, RepairResult),
+    Ipv6StackResetObserved(Result<Option<maintenance::Ipv6StackResetStatus>, AppError>),
     OpenDiagnostics,
     DiagnosticsOpened(Result<(), AppError>),
     DiagnosticsCopied(bool),
@@ -621,6 +674,28 @@ enum HealthCondition {
     Status,
     BodyEquals,
     BodyContains,
+}
+
+impl HealthCondition {
+    const ALL: [Self; 4] = [
+        Self::AnySuccess,
+        Self::Status,
+        Self::BodyEquals,
+        Self::BodyContains,
+    ];
+
+    fn label(self, english: bool) -> &'static str {
+        match (self, english) {
+            (Self::AnySuccess, false) => "任意 2xx",
+            (Self::AnySuccess, true) => "Any 2xx",
+            (Self::Status, false) => "指定状态码",
+            (Self::Status, true) => "Exact status code",
+            (Self::BodyEquals, false) => "正文完全匹配",
+            (Self::BodyEquals, true) => "Body equals text",
+            (Self::BodyContains, false) => "正文包含文字",
+            (Self::BodyContains, true) => "Body contains text",
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -703,16 +778,17 @@ struct App {
     log_size: Option<(Scope, u64)>,
     diagnostics: Option<std::sync::Arc<diagnostics::Report>>,
     diagnostics_running: bool,
+    ipv6_repair: Ipv6Repair,
     import_content: text_editor::Content,
     confirmation: Option<Confirmation>,
     network_return: Page,
     settings_tab: SettingsTab,
-    settings_checks_advanced: bool,
+    show_advanced: bool,
+    health_preview_offset: usize,
     health_editor: Option<Vec<HealthTarget>>,
     enabling_automatic: bool,
     alternate_adapters: bool,
     network_section: NetworkSection,
-    network_advanced: bool,
     health_detail: Option<HealthDetail>,
     native_service: Option<bitnet_core::ServiceStatus>,
     personal_after_stop: bool,
@@ -773,16 +849,17 @@ impl App {
             log_size: None,
             diagnostics: None,
             diagnostics_running: false,
+            ipv6_repair: Ipv6Repair::default(),
             import_content: text_editor::Content::new(),
             confirmation: None,
             network_return: Page::Status,
             settings_tab: SettingsTab::General,
-            settings_checks_advanced: false,
+            show_advanced: gui_preferences::show_advanced(),
+            health_preview_offset: 0,
             health_editor: None,
             enabling_automatic: false,
             alternate_adapters: false,
             network_section: NetworkSection::Adapters,
-            network_advanced: false,
             health_detail: None,
             native_service: None,
             personal_after_stop: false,
@@ -816,6 +893,9 @@ impl App {
             trust_offset: 0,
         };
         let mut tasks = vec![Self::connect(app.client.clone()), Self::observe_service()];
+        if cfg!(windows) && !preview_only() {
+            tasks.push(Self::observe_ipv6_stack_reset());
+        }
         if app.tray.is_none() || startup.visibility == StartupVisibility::Show {
             tasks.push(app.open_window());
         }
@@ -1320,6 +1400,34 @@ impl App {
         self.draft.dirty = true;
         self.settings_epoch = self.settings_epoch.wrapping_add(1);
     }
+
+    fn apply_advanced_visibility(&mut self, show: bool) {
+        self.show_advanced = show;
+        if show {
+            return;
+        }
+        if self.page.requires_advanced() {
+            self.page = Page::Status;
+        }
+        if self.network_return.requires_advanced() {
+            self.network_return = Page::Status;
+        }
+        if self.settings_tab.requires_advanced() {
+            self.settings_tab = SettingsTab::General;
+        }
+        self.network_section = NetworkSection::Adapters;
+        self.network_offset = 0;
+        self.alternate_adapters = false;
+        self.health_editor = None;
+        self.settings_actions.ipv6_editor = None;
+        if self
+            .confirmation
+            .as_ref()
+            .is_some_and(Confirmation::is_advanced)
+        {
+            self.confirmation = None;
+        }
+    }
     fn maintain(&mut self, action: MaintenanceAction) -> Task<Message> {
         if self.busy || self.connecting {
             return Task::none();
@@ -1480,7 +1588,15 @@ impl App {
                     .unwrap_or_else(Task::none);
                 let update = self.check_desktop_update(CheckTrigger::Scheduled);
                 let log_size = self.refresh_settings_log_size();
-                Task::batch([status, service, notification, update, log_size])
+                let ipv6_recheck = self.recheck_ipv6_after_boot();
+                Task::batch([
+                    status,
+                    service,
+                    notification,
+                    update,
+                    log_size,
+                    ipv6_recheck,
+                ])
             }
             Message::NotificationSent(result) => {
                 if result.is_err() && self.notice.is_none() {
@@ -1496,7 +1612,13 @@ impl App {
             Message::UpdateChecked(request, result, trigger) => {
                 self.desktop_update_checked(request, result, trigger)
             }
-            Message::SettingsAction(action) => self.settings_action(action),
+            Message::SettingsAction(action) => {
+                if self.show_advanced || !action.requires_advanced() {
+                    self.settings_action(action)
+                } else {
+                    Task::none()
+                }
+            }
             Message::Connected(result) => {
                 self.connecting = false;
                 match result {
@@ -1645,6 +1767,9 @@ impl App {
                 self.pending_settings = false;
                 self.refresh()
             }
+            Message::Navigate(page) if page.requires_advanced() && !self.show_advanced => {
+                Task::none()
+            }
             Message::Navigate(page) => match page {
                 Page::Networks => {
                     if self.page != Page::Networks {
@@ -1671,9 +1796,6 @@ impl App {
                 }
                 Page::Settings => {
                     self.enabling_automatic = false;
-                    if self.page != page {
-                        self.settings_checks_advanced = false;
-                    }
                     self.page = page;
                     self.settings_tab_entered()
                 }
@@ -1717,7 +1839,11 @@ impl App {
                 Task::none()
             }
             Message::SetServiceAutostart(enabled) => {
-                self.maintain(MaintenanceAction::SetAutostart { enabled })
+                if self.show_advanced {
+                    self.maintain(MaintenanceAction::SetAutostart { enabled })
+                } else {
+                    Task::none()
+                }
             }
             Message::SwitchPersonal => {
                 if self.busy || self.connecting || self.mode_switch_has_pending_changes() {
@@ -1768,6 +1894,8 @@ impl App {
                 self.statistics = None;
                 self.log_size = None;
                 self.diagnostics = None;
+                self.diagnostics_running = false;
+                self.ipv6_repair.invalidate();
                 self.settings_actions.reset_scope();
                 self.update_policy = UpdatePolicy::new();
                 self.draft = SettingsDraft::new(Settings::default());
@@ -1793,12 +1921,19 @@ impl App {
                 self.health_detail = detail;
                 Task::none()
             }
-            Message::ToggleNetworkAdvanced => {
-                self.network_advanced = !self.network_advanced;
-                if !self.network_advanced {
-                    self.network_section = NetworkSection::Adapters;
-                    self.network_offset = 0;
-                    self.rule = RuleDraft::default();
+            Message::ShowAdvancedChanged(show) => {
+                if self.show_advanced != show {
+                    match gui_preferences::set_show_advanced(show) {
+                        Ok(()) => self.apply_advanced_visibility(show),
+                        Err(_) => self.show_notice(
+                            true,
+                            self.t(
+                                "未能保存显示设置，请重试",
+                                "Could not save the display setting. Try again.",
+                            )
+                            .into(),
+                        ),
+                    }
                 }
                 Task::none()
             }
@@ -1813,6 +1948,9 @@ impl App {
             }
             Message::Run(command) => self.execute(command),
             Message::Ask(confirmation) => {
+                if confirmation.is_advanced() && !self.show_advanced {
+                    return Task::none();
+                }
                 self.confirmation = Some(confirmation);
                 self.open_window()
             }
@@ -1890,6 +2028,7 @@ impl App {
                         expected_scope: scope,
                     })
                 }
+                Some(Confirmation::Ipv6Repair(request)) => self.start_ipv6_repair(request),
                 None => Task::none(),
             },
             Message::Cancel => {
@@ -2042,11 +2181,17 @@ impl App {
                 Task::none()
             }
             Message::LogLevelChanged(level) => {
+                if !self.show_advanced {
+                    return Task::none();
+                }
                 self.draft.settings.log_level = level;
                 self.mark_settings_dirty();
                 Task::none()
             }
             Message::FlagChanged(flag, value) => {
+                if !self.show_advanced && !matches!(flag, SettingFlag::NotifyErrors) {
+                    return Task::none();
+                }
                 match flag {
                     SettingFlag::StartHidden => self.draft.settings.start_hidden = value,
                     SettingFlag::UserAutostart => self.draft.settings.user_autostart = value,
@@ -2059,6 +2204,9 @@ impl App {
                 Task::none()
             }
             Message::NumberChanged(field, value) => {
+                if !self.show_advanced {
+                    return Task::none();
+                }
                 match field {
                     NumericSetting::StatusInterval => self.draft.status_interval = value,
                     NumericSetting::HealthInterval => self.draft.health_interval = value,
@@ -2193,18 +2341,18 @@ impl App {
                 Task::none()
             }
             Message::SettingsTabChanged(tab) => {
-                if self.settings_tab != tab {
-                    self.settings_checks_advanced = false;
+                if tab.requires_advanced() && !self.show_advanced {
+                    return Task::none();
                 }
                 self.settings_tab = tab;
                 self.settings_tab_entered()
             }
-            Message::ToggleCheckAdvanced => {
-                self.settings_checks_advanced = !self.settings_checks_advanced;
+            Message::HealthPreviewPage(offset) => {
+                self.health_preview_offset = offset;
                 Task::none()
             }
             Message::RestoreCheckDefaults => {
-                if self.snapshot_current && !self.busy {
+                if self.show_advanced && self.snapshot_current && !self.busy {
                     let defaults = Settings::default();
                     self.draft.health_interval = defaults.health_interval_secs.to_string();
                     self.draft.retry_maximum = defaults.retry_max_secs.to_string();
@@ -2214,6 +2362,9 @@ impl App {
                 Task::none()
             }
             Message::OpenHealthEditor => {
+                if !self.show_advanced {
+                    return Task::none();
+                }
                 self.clear_notice();
                 self.health_editor = Some(
                     self.draft
@@ -2327,8 +2478,10 @@ impl App {
                 Task::none()
             }
             Message::ToggleAlternateAdapters => {
-                self.alternate_adapters = !self.alternate_adapters;
-                self.network_offset = 0;
+                if self.show_advanced {
+                    self.alternate_adapters = !self.alternate_adapters;
+                    self.network_offset = 0;
+                }
                 Task::none()
             }
             Message::NetworkBack => {
@@ -2337,8 +2490,10 @@ impl App {
                 Task::none()
             }
             Message::NetworkTab(section) => {
-                self.network_section = section;
-                self.network_offset = 0;
+                if self.show_advanced || !section.requires_advanced() {
+                    self.network_section = section;
+                    self.network_offset = 0;
+                }
                 Task::none()
             }
             Message::NetworkPage(offset) => {
@@ -2414,6 +2569,17 @@ impl App {
             }
             Message::TrustPage(offset) => {
                 self.trust_offset = offset;
+                Task::none()
+            }
+            Message::ProfileSave
+            | Message::ProfileSelect(_)
+            | Message::BeginRule
+            | Message::RuleEdit(_)
+            | Message::RuleSave
+            | Message::ImportSettings
+            | Message::WebLogs(_)
+                if !self.show_advanced =>
+            {
                 Task::none()
             }
             Message::ProfileNameChanged(value) => {
@@ -2560,38 +2726,25 @@ impl App {
                     }
                 }
             }
-            Message::RunDiagnostics => {
-                let Some(snapshot) = self
-                    .snapshot
-                    .clone()
-                    .filter(|_| self.snapshot_current && !self.busy && !self.diagnostics_running)
-                else {
-                    return Task::none();
-                };
-                let scope = snapshot.scope;
-                self.diagnostics_running = true;
-                self.diagnostics = None;
-                let english = self.english();
-                Task::perform(diagnostics::collect(snapshot, english), move |report| {
-                    Message::DiagnosticsReady(scope, std::sync::Arc::new(report))
-                })
+            Message::RunDiagnostics => self.run_diagnostics(None),
+            Message::OpenIpv6Diagnostics => {
+                self.health_detail = None;
+                self.enabling_automatic = false;
+                self.page = Page::Diagnostics;
+                self.run_diagnostics(None)
             }
-            Message::DiagnosticsReady(scope, report) => {
-                self.diagnostics_running = false;
-                if !self
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.scope == scope)
-                {
-                    return Task::none();
-                }
-                self.diagnostics = Some(report);
-                self.show_notice(
-                    false,
-                    self.t("诊断报告已生成", "Diagnostic report ready").into(),
-                );
+            Message::SelectRepairAdapter(target) => self.select_repair_adapter(target),
+            Message::ToggleDiagnosticEvidence => {
+                self.ipv6_repair.show_evidence = !self.ipv6_repair.show_evidence;
                 Task::none()
             }
+            Message::AskIpv6Repair(stack_reset) => self.ask_ipv6_repair(stack_reset),
+            Message::DiagnosticsReady(run, report) => self.accept_diagnostics(run, report),
+            Message::GuidedRepairCompleted(result) => self.ipv6_repair_completed(result),
+            Message::GuidedRecheckReady(run, report, result) => {
+                self.ipv6_recheck_ready(run, report, result)
+            }
+            Message::Ipv6StackResetObserved(result) => self.ipv6_stack_reset_observed(result),
             Message::OpenDiagnostics => {
                 let Some(report) = self.diagnostics.clone() else {
                     return Task::none();
@@ -2847,16 +3000,17 @@ mod tests {
             log_size: None,
             diagnostics: None,
             diagnostics_running: false,
+            ipv6_repair: Ipv6Repair::default(),
             import_content: text_editor::Content::new(),
             confirmation: None,
             network_return: Page::Status,
             settings_tab: SettingsTab::General,
-            settings_checks_advanced: false,
+            show_advanced: false,
+            health_preview_offset: 0,
             health_editor: None,
             enabling_automatic: false,
             alternate_adapters: false,
             network_section: NetworkSection::Adapters,
-            network_advanced: false,
             network_offset: 0,
             health_detail: None,
             native_service: None,
@@ -2960,6 +3114,7 @@ mod tests {
     #[test]
     fn health_editor_preserves_legacy_and_custom_response_conditions() {
         let mut app = fixture();
+        app.apply_advanced_visibility(true);
         let legacy = app.draft.settings.configured_health_targets();
         let _ = app.update(Message::OpenHealthEditor);
         let _ = app.update(Message::SaveHealthEditor);
@@ -3208,6 +3363,7 @@ mod tests {
     #[test]
     fn a_save_reply_does_not_discard_edits_made_while_saving() {
         let mut app = fixture();
+        app.apply_advanced_visibility(true);
         app.pending_settings = true;
         app.busy = true;
         app.saved_epoch = 0;
@@ -3218,6 +3374,56 @@ mod tests {
         assert!(app.draft.dirty);
         assert!(app.draft.settings.start_hidden);
         assert!(!app.busy);
+    }
+
+    #[test]
+    fn closing_advanced_settings_preserves_drafts_and_falls_back_to_basic_views() {
+        let mut app = fixture();
+        app.apply_advanced_visibility(true);
+        app.page = Page::Statistics;
+        app.network_return = Page::Statistics;
+        app.settings_tab = SettingsTab::Transfer;
+        app.network_section = NetworkSection::Rules;
+        app.alternate_adapters = true;
+        app.confirmation = Some(Confirmation::DeleteRule("sample".into()));
+        app.health_editor = Some(vec![]);
+        app.settings_actions.ipv6_editor = Some(vec![]);
+        app.draft.health_interval = "42".into();
+        app.mark_settings_dirty();
+        app.busy = true;
+
+        app.apply_advanced_visibility(false);
+
+        assert_eq!(app.page, Page::Status);
+        assert_eq!(app.network_return, Page::Status);
+        assert_eq!(app.settings_tab, SettingsTab::General);
+        assert_eq!(app.network_section, NetworkSection::Adapters);
+        assert!(!app.alternate_adapters);
+        assert!(app.confirmation.is_none());
+        assert!(app.health_editor.is_none());
+        assert!(app.settings_actions.ipv6_editor.is_none());
+        assert_eq!(app.draft.health_interval, "42");
+        assert!(app.draft.dirty);
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn basic_mode_gates_advanced_navigation_but_not_diagnostics() {
+        let mut app = fixture();
+        let _ = app.update(Message::Navigate(Page::Statistics));
+        let _ = app.update(Message::NetworkTab(NetworkSection::Ipv6));
+        let _ = app.update(Message::SettingsTabChanged(SettingsTab::Checks));
+        let _ = app.update(Message::OpenHealthEditor);
+        let _ = app.update(Message::Ask(Confirmation::Shutdown));
+
+        assert_eq!(app.page, Page::Status);
+        assert_eq!(app.network_section, NetworkSection::Adapters);
+        assert_eq!(app.settings_tab, SettingsTab::General);
+        assert!(app.health_editor.is_none());
+        assert!(app.confirmation.is_none());
+
+        let _ = app.update(Message::Navigate(Page::Diagnostics));
+        assert_eq!(app.page, Page::Diagnostics);
     }
 
     #[test]

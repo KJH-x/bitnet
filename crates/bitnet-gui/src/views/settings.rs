@@ -1,20 +1,22 @@
-use super::{action_style, card, pair};
+use super::{action_style, card, page_window, pair};
 use crate::design;
 use crate::settings_actions::{Action, ExportTo};
 use crate::{
-    format_log_size, preview_only, tray, App, Appearance, Confirmation, Language, Message, Mode,
-    NumericSetting, SettingFlag, SettingsTab,
+    format_log_size, preview_only, tray, App, Appearance, Confirmation, HealthCondition,
+    HealthTarget, Language, Message, Mode, NumericSetting, SettingFlag, SettingsTab,
 };
 use bitnet_core::{Command, APP_VERSION};
 use bitnet_launcher::WebAction;
 use iced::{
+    advanced::text as paragraph,
     alignment,
     widget::{
         button, checkbox, column, container, pick_list, row, text, text_editor, text_input,
         toggler, Space,
     },
-    Element, Length, Size,
+    Background, Element, Font, Length, Pixels, Size, Theme,
 };
+use std::sync::OnceLock;
 
 impl SettingsTab {
     const ALL: [Self; 6] = [
@@ -44,6 +46,9 @@ impl App {
         let compact = size.height < 420.0;
         let d = design::get();
         for tab in SettingsTab::ALL {
+            if tab.requires_advanced() && !self.show_advanced {
+                continue;
+            }
             let selected = self.settings_tab == tab;
             tabs = tabs.push(
                 button(text(tab.label(self)).size(d.typography.body))
@@ -54,7 +59,7 @@ impl App {
         }
         let section = match self.settings_tab {
             SettingsTab::General => self.general_settings(),
-            SettingsTab::Checks => self.check_settings(),
+            SettingsTab::Checks => self.check_settings(size.width),
             SettingsTab::Trust => self.trust_settings(size),
             SettingsTab::Diagnostics => self.diagnostics_settings(),
             SettingsTab::Updates => self.update_settings(),
@@ -218,6 +223,12 @@ impl App {
                 ),
         ]
         .spacing(d.space.xs);
+        body = body.push(
+            toggler(self.show_advanced)
+                .label(self.t("显示高级设置", "Show advanced settings"))
+                .text_size(d.typography.body)
+                .on_toggle(Message::ShowAdvancedChanged),
+        );
         if resume {
             body = body.push(
                 button(text(
@@ -230,8 +241,9 @@ impl App {
                 .style(design::flat_button),
             );
         }
-        body =
-            body.push(Self::rule(false))
+        if self.show_advanced {
+            body = body
+                .push(Self::rule(false))
                 .push(
                     text(self.t("启动与窗口", "Startup and window")).font(design::family_medium()),
                 )
@@ -252,34 +264,34 @@ impl App {
                             Message::FlagChanged(SettingFlag::StartHidden, value)
                         })),
                 );
-        if hidden_unavailable {
-            body = body.push(setting_hint(self.t(
-                "先开启登录时启动 BitNet，才能选择隐藏窗口。",
-                "Enable sign-in startup to choose whether the window stays hidden.",
-            )));
-        }
-        body = body.push(
-            checkbox(self.draft.settings.user_autostart)
-                .label(self.t(
-                    "系统登录时启动个人后台",
-                    "Start the personal engine at sign-in",
-                ))
-                .on_toggle_maybe(
-                    can_edit
-                        .then_some(|value| Message::FlagChanged(SettingFlag::UserAutostart, value)),
-                ),
-        );
-        if self.mode == Mode::System {
-            body = body.push(setting_hint(self.t(
-                "切回个人后台后可修改这些启动选项。",
-                "Switch to the personal engine to edit these startup options.",
-            )));
-        }
-        if !self.tray.as_ref().is_some_and(tray::Tray::is_available) {
-            body = body.push(setting_hint(self.t(
-                "系统托盘不可用，自动启动时也会显示窗口。",
-                "Automatic startup opens the window while the system tray is unavailable.",
-            )));
+            if hidden_unavailable {
+                body = body.push(setting_hint(self.t(
+                    "先开启登录时启动 BitNet，才能选择隐藏窗口。",
+                    "Enable sign-in startup to choose whether the window stays hidden.",
+                )));
+            }
+            body = body.push(
+                checkbox(self.draft.settings.user_autostart)
+                    .label(self.t(
+                        "系统登录时启动个人后台",
+                        "Start the personal engine at sign-in",
+                    ))
+                    .on_toggle_maybe(can_edit.then_some(|value| {
+                        Message::FlagChanged(SettingFlag::UserAutostart, value)
+                    })),
+            );
+            if self.mode == Mode::System {
+                body = body.push(setting_hint(self.t(
+                    "切回个人后台后可修改这些启动选项。",
+                    "Switch to the personal engine to edit these startup options.",
+                )));
+            }
+            if !self.tray.as_ref().is_some_and(tray::Tray::is_available) {
+                body = body.push(setting_hint(self.t(
+                    "系统托盘不可用，自动启动时也会显示窗口。",
+                    "Automatic startup opens the window while the system tray is unavailable.",
+                )));
+            }
         }
         card(
             body.push(Self::rule(false))
@@ -294,9 +306,9 @@ impl App {
         .into()
     }
 
-    fn check_settings(&self) -> Element<'_, Message> {
+    fn check_settings(&self, width: f32) -> Element<'_, Message> {
         let d = design::get();
-        let targets = &self.draft.settings.health_targets;
+        let targets = self.draft.settings.configured_health_targets();
         let target_label = if self.english() {
             format!("Health check URLs ({})", targets.len())
         } else {
@@ -331,9 +343,7 @@ impl App {
         ]
         .spacing(d.card.gap);
 
-        for target in targets.iter().take(2) {
-            body = body.push(sub_item(target));
-        }
+        body = body.push(self.health_preview(targets, width));
 
         let ipv6_target_count = self.draft.settings.ipv6_targets.len();
         body = body.push(setting_row(
@@ -359,51 +369,119 @@ impl App {
                 .style(design::field)
                 .into(),
         ));
-        let mut advanced = row![
-            toggler(self.settings_checks_advanced)
-                .label(self.t("高级参数", "Advanced parameters"))
-                .text_size(d.typography.body)
-                .on_toggle(|_| Message::ToggleCheckAdvanced),
+        let defaults = row![
             Space::new().width(Length::Fill),
+            button(text(self.t("恢复默认参数", "Restore defaults")).size(d.typography.body))
+                .on_press_maybe(
+                    (self.snapshot_current && !self.busy).then_some(Message::RestoreCheckDefaults),
+                )
+                .style(design::flat_button),
         ]
         .align_y(alignment::Vertical::Center);
-        if self.settings_checks_advanced {
-            advanced = advanced.push(
-                button(text(self.t("恢复默认参数", "Restore defaults")).size(d.typography.body))
-                    .on_press_maybe(
-                        (self.snapshot_current && !self.busy)
-                            .then_some(Message::RestoreCheckDefaults),
-                    )
-                    .style(design::flat_button),
-            );
-        }
-        body = body.push(Self::rule(false)).push(advanced);
-        if self.settings_checks_advanced {
-            body = body
-                .push(setting_number(
-                    NumericSetting::HealthInterval,
-                    &self.draft.health_interval,
-                    self.t(
-                        "健康探测间隔（30–86400 秒）",
-                        "Health interval (30–86400 s)",
-                    ),
-                ))
-                .push(setting_number(
-                    NumericSetting::RetryMaximum,
-                    &self.draft.retry_maximum,
-                    self.t(
-                        "最长重试等待（5–3600 秒）",
-                        "Maximum retry delay (5–3600 s)",
-                    ),
-                ))
-                .push(setting_number(
-                    NumericSetting::RequestTimeout,
-                    &self.draft.request_timeout,
-                    self.t("单请求超时（1–60 秒）", "Request timeout (1–60 s)"),
-                ));
-        }
+        body = body
+            .push(Self::rule(false))
+            .push(defaults)
+            .push(setting_number(
+                NumericSetting::HealthInterval,
+                &self.draft.health_interval,
+                self.t(
+                    "健康探测间隔（30–86400 秒）",
+                    "Health interval (30–86400 s)",
+                ),
+            ))
+            .push(setting_number(
+                NumericSetting::RetryMaximum,
+                &self.draft.retry_maximum,
+                self.t(
+                    "最长重试等待（5–3600 秒）",
+                    "Maximum retry delay (5–3600 s)",
+                ),
+            ))
+            .push(setting_number(
+                NumericSetting::RequestTimeout,
+                &self.draft.request_timeout,
+                self.t("单请求超时（1–60 秒）", "Request timeout (1–60 s)"),
+            ));
 
         card(body).padding(10).into()
+    }
+
+    fn health_preview(
+        &self,
+        targets: Vec<bitnet_core::HealthTarget>,
+        width: f32,
+    ) -> Element<'_, Message> {
+        let d = design::get();
+        let english = self.english();
+        let (method_width, ascii_width) = health_preview_metrics(english);
+        let available = width - 20.0 - 2.0 * d.space.md - 4.0 * d.space.sm;
+        let value_width = (available - method_width - 52.0 * ascii_width)
+            .clamp(10.0 * ascii_width, 25.0 * ascii_width);
+        let total = targets.len();
+        let shown = page_window(total, self.health_preview_offset, HEALTH_PREVIEW_CAPACITY);
+        let mut preview = column![].spacing(d.space.xs);
+        if total == 0 {
+            preview = preview.push(preview_cell(
+                self.t("未设置探测地址", "No probe URLs configured")
+                    .to_owned(),
+                Length::Fill,
+                alignment::Horizontal::Left,
+                false,
+            ));
+        }
+        for target in targets.into_iter().skip(shown.start).take(shown.len()) {
+            let target = HealthTarget::from(target);
+            let value = if target.condition == HealthCondition::AnySuccess {
+                "—".to_owned()
+            } else {
+                target.value.replace(['\r', '\n'], " ")
+            };
+            preview = preview.push(
+                row![
+                    preview_cell(target.url, Length::Fill, alignment::Horizontal::Left, true),
+                    preview_cell(
+                        target.condition.label(english).to_owned(),
+                        Length::Fixed(method_width),
+                        alignment::Horizontal::Center,
+                        false,
+                    ),
+                    preview_cell(
+                        value,
+                        Length::Fixed(value_width),
+                        alignment::Horizontal::Center,
+                        true
+                    ),
+                ]
+                .spacing(d.space.sm)
+                .align_y(alignment::Vertical::Center),
+            );
+        }
+        if total > HEALTH_PREVIEW_CAPACITY {
+            preview = preview.push(
+                container(self.page_controls(
+                    total,
+                    shown,
+                    HEALTH_PREVIEW_CAPACITY,
+                    Message::HealthPreviewPage,
+                ))
+                .width(Length::Fill)
+                .align_x(alignment::Horizontal::Right),
+            );
+        }
+
+        container(
+            container(preview)
+                .width(Length::Fill)
+                .padding([d.space.xs, d.space.sm])
+                .clip(true)
+                .style(|theme: &Theme| container::Style {
+                    background: Some(Background::Color(design::app_style(theme).background_color)),
+                    ..container::Style::default()
+                }),
+        )
+        .width(Length::Fill)
+        .padding([0.0, d.space.md])
+        .into()
     }
 
     fn diagnostics_settings(&self) -> Element<'_, Message> {
@@ -494,27 +572,32 @@ impl App {
     fn update_settings(&self) -> Element<'_, Message> {
         let engine = self.snapshot.as_ref();
         let available = self.settings_actions.update_release.as_deref();
-        let mut details = column![
-            pair(self.t("桌面客户端", "Desktop client"), APP_VERSION),
-            pair(
-                self.t("当前后台引擎", "Connected engine"),
-                engine.map_or("—", |s| s.app_version.as_str()),
-            ),
-            pair(
-                self.t("接口版本", "API version"),
-                engine.map_or_else(|| "—".into(), |s| s.api_version.to_string()),
-            ),
-            checkbox(self.draft.settings.check_updates)
-                .label(self.t("允许检查新版本", "Allow update checks"))
-                .on_toggle(|value| Message::FlagChanged(SettingFlag::CheckUpdates, value)),
-            checkbox(self.draft.settings.auto_update)
-                .label(self.t(
-                    "自动安装无需提权的个人版更新",
-                    "Install personal updates without elevation"
+        let mut details =
+            column![pair(self.t("桌面客户端", "Desktop client"), APP_VERSION)].spacing(7);
+        if self.show_advanced {
+            details = details
+                .push(pair(
+                    self.t("当前后台引擎", "Connected engine"),
+                    engine.map_or("—", |s| s.app_version.as_str()),
                 ))
-                .on_toggle(|value| Message::FlagChanged(SettingFlag::AutoUpdate, value)),
-        ]
-        .spacing(7);
+                .push(pair(
+                    self.t("接口版本", "API version"),
+                    engine.map_or_else(|| "—".into(), |s| s.api_version.to_string()),
+                ))
+                .push(
+                    checkbox(self.draft.settings.check_updates)
+                        .label(self.t("允许检查新版本", "Allow update checks"))
+                        .on_toggle(|value| Message::FlagChanged(SettingFlag::CheckUpdates, value)),
+                )
+                .push(
+                    checkbox(self.draft.settings.auto_update)
+                        .label(self.t(
+                            "自动安装无需提权的个人版更新",
+                            "Install personal updates without elevation",
+                        ))
+                        .on_toggle(|value| Message::FlagChanged(SettingFlag::AutoUpdate, value)),
+                );
+        }
         if let Some(version) = available {
             details = details.push(pair(self.t("可用版本", "Available version"), version));
         }
@@ -709,6 +792,68 @@ impl App {
 
 const SETTING_LABEL_WIDTH: f32 = 220.0;
 const SETTING_CONTROL_WIDTH: f32 = 148.0;
+const HEALTH_PREVIEW_CAPACITY: usize = 2;
+
+fn health_preview_metrics(english: bool) -> (f32, f32) {
+    use paragraph::Paragraph;
+    type Para = <iced::Renderer as paragraph::Renderer>::Paragraph;
+
+    static ENGLISH: OnceLock<(f32, f32)> = OnceLock::new();
+    static CHINESE: OnceLock<(f32, f32)> = OnceLock::new();
+    let measurements = if english { &ENGLISH } else { &CHINESE };
+    *measurements.get_or_init(|| {
+        let size = design::get().typography.meta;
+        let measure = |label: &str| {
+            Para::with_text(paragraph::Text {
+                content: label,
+                bounds: Size::INFINITE,
+                size: Pixels(size),
+                line_height: paragraph::LineHeight::default(),
+                font: Font::MONOSPACE,
+                align_x: paragraph::Alignment::Left,
+                align_y: alignment::Vertical::Center,
+                shaping: paragraph::Shaping::Auto,
+                wrapping: paragraph::Wrapping::None,
+                ellipsis: paragraph::Ellipsis::None,
+                hint_factor: None,
+            })
+            .min_width()
+        };
+        let width = HealthCondition::ALL
+            .into_iter()
+            .map(|condition| measure(condition.label(english)))
+            .fold(0.0, f32::max)
+            .ceil();
+        let ascii = (measure("0000000000") / 10.0).max(size * 0.5);
+        (width + 2.0, ascii)
+    })
+}
+
+fn preview_cell(
+    value: String,
+    width: Length,
+    horizontal: alignment::Horizontal,
+    ellipsis: bool,
+) -> Element<'static, Message> {
+    container(
+        text(value)
+            .font(Font::MONOSPACE)
+            .size(design::get().typography.meta)
+            .style(design::text_style(design::muted))
+            .width(Length::Fill)
+            .align_x(horizontal)
+            .shaping(paragraph::Shaping::Auto)
+            .wrapping(paragraph::Wrapping::None)
+            .ellipsis(if ellipsis {
+                paragraph::Ellipsis::End
+            } else {
+                paragraph::Ellipsis::None
+            }),
+    )
+    .width(width)
+    .clip(true)
+    .into()
+}
 
 fn setting_control(control: Element<'_, Message>) -> Element<'_, Message> {
     container(container(control).width(Length::Fill.max(SETTING_CONTROL_WIDTH)))
@@ -729,19 +874,6 @@ fn setting_row<'a>(label: String, control: Element<'a, Message>) -> Element<'a, 
     ]
     .spacing(d.space.md)
     .align_y(alignment::Vertical::Center)
-    .into()
-}
-
-/// Indented child rows used when a value is not edited in place.
-fn sub_item<'a>(value: &'a str) -> Element<'a, Message> {
-    let d = design::get();
-    row![
-        Space::new().width(Length::Fixed(SETTING_LABEL_WIDTH + d.space.md)),
-        text(value)
-            .size(d.typography.meta)
-            .font(iced::Font::MONOSPACE)
-            .style(design::text_style(design::muted)),
-    ]
     .into()
 }
 

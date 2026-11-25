@@ -1,8 +1,11 @@
 //! The only installation/startup/update entry point shared by GUI and CLI.
+#[path = "ipv6_maintenance.rs"]
+mod ipv6;
 #[path = "updates.rs"]
 pub mod updates;
 use bitnet_core::{AppError, ErrorCode, NetworkInterface, Scope};
 use fs2::FileExt;
+pub use ipv6::{acknowledge_ipv6_stack_reset, ipv6_stack_reset_status, Ipv6StackResetStatus};
 use serde_json::json;
 use std::io::Read;
 use std::{
@@ -31,6 +34,10 @@ pub enum MaintenanceAction {
     DisableIpv6 { interface: InterfaceTarget },
     ResetIpv6 { interface: InterfaceTarget },
     RenewIpv6 { interface: InterfaceTarget },
+    RenewDhcpv6 { interface: InterfaceTarget },
+    RestartIpv6Adapter { interface: InterfaceTarget },
+    FlushDnsCache,
+    ResetIpv6Stack,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,9 +149,15 @@ impl MaintenanceAction {
             Self::EnableIpv6 { interface }
             | Self::DisableIpv6 { interface }
             | Self::ResetIpv6 { interface }
-            | Self::RenewIpv6 { interface } => Some(interface),
+            | Self::RenewIpv6 { interface }
+            | Self::RenewDhcpv6 { interface }
+            | Self::RestartIpv6Adapter { interface } => Some(interface),
             _ => None,
         }
+    }
+
+    fn is_ipv6_maintenance(&self) -> bool {
+        self.ipv6_target().is_some() || matches!(self, Self::FlushDnsCache | Self::ResetIpv6Stack)
     }
 }
 #[derive(Debug, Clone)]
@@ -182,6 +195,10 @@ pub fn action_name(action: &MaintenanceAction) -> &'static str {
         MaintenanceAction::DisableIpv6 { .. } => "ipv6-disable",
         MaintenanceAction::ResetIpv6 { .. } => "ipv6-reset",
         MaintenanceAction::RenewIpv6 { .. } => "ipv6-renew",
+        MaintenanceAction::RenewDhcpv6 { .. } => "ipv6-renew-dhcp",
+        MaintenanceAction::RestartIpv6Adapter { .. } => "ipv6-restart-adapter",
+        MaintenanceAction::FlushDnsCache => "ipv6-flush-dns",
+        MaintenanceAction::ResetIpv6Stack => "ipv6-stack-reset",
     }
 }
 
@@ -202,7 +219,12 @@ pub fn parse_action_with_interface(
     }
     if matches!(
         name,
-        "ipv6-enable" | "ipv6-disable" | "ipv6-reset" | "ipv6-renew"
+        "ipv6-enable"
+            | "ipv6-disable"
+            | "ipv6-reset"
+            | "ipv6-renew"
+            | "ipv6-renew-dhcp"
+            | "ipv6-restart-adapter"
     ) {
         let interface = interface.ok_or_else(|| {
             err(
@@ -214,6 +236,8 @@ pub fn parse_action_with_interface(
             "ipv6-enable" => MaintenanceAction::EnableIpv6 { interface },
             "ipv6-disable" => MaintenanceAction::DisableIpv6 { interface },
             "ipv6-renew" => MaintenanceAction::RenewIpv6 { interface },
+            "ipv6-renew-dhcp" => MaintenanceAction::RenewDhcpv6 { interface },
+            "ipv6-restart-adapter" => MaintenanceAction::RestartIpv6Adapter { interface },
             _ => MaintenanceAction::ResetIpv6 { interface },
         });
     }
@@ -236,6 +260,8 @@ pub fn parse_action_with_interface(
         "autostart-off" => MaintenanceAction::SetAutostart { enabled: false },
         "gui-autostart-on" => MaintenanceAction::SetGuiAutostart { enabled: true },
         "gui-autostart-off" => MaintenanceAction::SetGuiAutostart { enabled: false },
+        "ipv6-flush-dns" => MaintenanceAction::FlushDnsCache,
+        "ipv6-stack-reset" => MaintenanceAction::ResetIpv6Stack,
         _ => return Err(err(ErrorCode::InvalidInput, "Unknown maintenance action")),
     })
 }
@@ -376,11 +402,11 @@ async fn execute_inner(
     action: MaintenanceAction,
     interactive: bool,
 ) -> Result<MaintenanceResult, AppError> {
-    if action.ipv6_target().is_some() {
+    if action.is_ipv6_maintenance() {
         if !cfg!(windows) {
             return Err(err(
                 ErrorCode::Unavailable,
-                "Managing IPv6 bindings is currently supported on Windows",
+                "IPv6 maintenance is currently supported on Windows",
             ));
         }
         if scope != Scope::System {
@@ -418,8 +444,8 @@ async fn execute_inner(
         return elevate(scope, action).await;
     }
     #[cfg(windows)]
-    if let Some(interface) = action.ipv6_target() {
-        return ipv6_action(&action, interface).await;
+    if action.is_ipv6_maintenance() {
+        return ipv6::execute(&action).await;
     }
     match action {
         MaintenanceAction::SetAutostart { enabled } if scope == Scope::User => {
@@ -1253,12 +1279,20 @@ async fn run(plan: Plan) -> Result<bool, AppError> {
 }
 
 async fn run_exit_code(plan: Plan) -> Result<i32, AppError> {
+    run_os_tool(plan, false).await.map(|(code, _)| code)
+}
+
+async fn run_os_tool(plan: Plan, capture: bool) -> Result<(i32, Vec<u8>), AppError> {
     tokio::task::spawn_blocking(move || {
         let mut command = Command::new(&plan.program);
         command
             .args(plan.args)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(if capture {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::null());
         #[cfg(windows)]
         {
@@ -1285,12 +1319,28 @@ async fn run_exit_code(plan: Plan) -> Result<i32, AppError> {
                     "Could not inspect maintenance process",
                 )
             })? {
-                return status.code().ok_or_else(|| {
+                let code = status.code().ok_or_else(|| {
                     err(
                         ErrorCode::Unavailable,
                         "OS maintenance terminated unexpectedly",
                     )
-                });
+                })?;
+                let mut output = Vec::new();
+                if let Some(stdout) = child.stdout.take() {
+                    stdout.take(129).read_to_end(&mut output).map_err(|_| {
+                        err(
+                            ErrorCode::Unavailable,
+                            "Could not read OS maintenance result",
+                        )
+                    })?;
+                    if output.len() > 128 {
+                        return Err(err(
+                            ErrorCode::Unavailable,
+                            "Unexpected OS maintenance output",
+                        ));
+                    }
+                }
+                return Ok((code, output));
             }
             if start.elapsed() > plan.timeout {
                 let _ = child.kill();
@@ -1604,7 +1654,7 @@ fn secure_directory(path: &Path, system: bool) -> Result<(), AppError> {
         }
     }
     #[cfg(windows)]
-    secure_windows_directory(path, system)?;
+    secure_windows_directory(path, system, false)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1825,68 +1875,6 @@ fn system_plan(program: &str, args: &[&str], seconds: u64) -> Result<Plan, AppEr
 }
 
 #[cfg(windows)]
-async fn ipv6_action(
-    action: &MaintenanceAction,
-    interface: &InterfaceTarget,
-) -> Result<MaintenanceResult, AppError> {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-
-    let command = format!(
-        "$interfaceGuid = '{}'\n$interfaceIndex = {}\n$action = '{}'\n{}",
-        interface.guid,
-        interface.index,
-        action_name(action),
-        include_str!("ipv6_binding.ps1"),
-    );
-    let encoded = STANDARD.encode(
-        command
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>(),
-    );
-    let plan = system_plan(
-        r"WindowsPowerShell\v1.0\powershell.exe",
-        &["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded],
-        120,
-    )?;
-    match run_exit_code(plan).await? {
-        0 if matches!(action, MaintenanceAction::RenewIpv6 { .. }) => Ok(ipv6_renewed()),
-        0 => {
-            let enabled = !matches!(action, MaintenanceAction::DisableIpv6 { .. });
-            Ok(MaintenanceResult {
-                message: if enabled {
-                    "Verified IPv6 enabled on the selected network adapter"
-                } else {
-                    "Verified IPv6 disabled on the selected network adapter"
-                }
-                .into(),
-                details: json!({"ipv6_enabled":enabled,"reboot_required":false}),
-            })
-        }
-        2 => Err(err(
-            ErrorCode::Unavailable,
-            "The selected Windows network adapter changed or is unavailable",
-        )),
-        3 => Err(err(
-            ErrorCode::Busy,
-            "Another IPv6 operation is running on this adapter",
-        )),
-        _ => Err(err(
-            ErrorCode::Unavailable,
-            "Windows could not change and verify the IPv6 binding",
-        )),
-    }
-}
-
-#[cfg(windows)]
-fn ipv6_renewed() -> MaintenanceResult {
-    MaintenanceResult {
-        message: "Windows completed IPv6 renewal on the selected adapter".into(),
-        details: json!({"ipv6_renewed":true,"reboot_required":false}),
-    }
-}
-
-#[cfg(windows)]
 fn program_data() -> Result<PathBuf, AppError> {
     use windows_sys::Win32::{
         System::Com::CoTaskMemFree,
@@ -1915,7 +1903,11 @@ fn program_data() -> Result<PathBuf, AppError> {
     Ok(p)
 }
 #[cfg(windows)]
-fn secure_windows_directory(path: &Path, system: bool) -> Result<(), AppError> {
+fn secure_windows_directory(
+    path: &Path,
+    system: bool,
+    public_metadata: bool,
+) -> Result<(), AppError> {
     use windows_sys::Win32::{
         Foundation::{GetLastError, LocalFree, ERROR_ALREADY_EXISTS},
         Security::{Authorization::*, *},
@@ -1923,7 +1915,9 @@ fn secure_windows_directory(path: &Path, system: bool) -> Result<(), AppError> {
     };
     let p = wide(path);
     let mut descriptor = std::ptr::null_mut();
-    let sddl = if system {
+    let sddl = if public_metadata {
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)"
+    } else if system {
         "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
     } else {
         "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)"
@@ -2114,16 +2108,14 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
                 ""
             }
         );
-        let ipv6_renew = matches!(action, MaintenanceAction::RenewIpv6 { .. });
-        let ipv6_enabled = action.ipv6_target().map(|interface| {
+        if let Some(interface) = action.ipv6_target() {
             use std::fmt::Write as _;
             let _ = write!(
                 arguments,
                 " --interface {}@{}",
                 interface.guid, interface.index
             );
-            !matches!(action, MaintenanceAction::DisableIpv6 { .. })
-        });
+        }
         if let MaintenanceAction::InstallCheckedUpdate { manifest_sha256 } = &action {
             use std::fmt::Write as _;
             let _ = write!(arguments, " --manifest-sha256 {}", manifest_sha256.0);
@@ -2170,28 +2162,11 @@ async fn elevate(scope: Scope, action: MaintenanceAction) -> Result<MaintenanceR
                     "Elevated maintenance did not finish in time",
                 ));
             }
-            if code != 0 && (code != 3010 || ipv6_enabled.is_some()) {
-                if ipv6_enabled.is_some() && code == ErrorCode::Busy.exit_code() as u32 {
-                    return Err(err(
-                        ErrorCode::Busy,
-                        "Another IPv6 operation is running on this adapter",
-                    ));
-                }
+            if action.is_ipv6_maintenance() {
+                return ipv6::elevated_result(&action, code);
+            }
+            if code != 0 && code != 3010 {
                 return Err(err(ErrorCode::Unavailable, "Elevated maintenance failed"));
-            }
-            if ipv6_renew {
-                return Ok(ipv6_renewed());
-            }
-            if let Some(enabled) = ipv6_enabled {
-                return Ok(MaintenanceResult {
-                    message: if enabled {
-                        "Verified IPv6 enabled on the selected network adapter"
-                    } else {
-                        "Verified IPv6 disabled on the selected network adapter"
-                    }
-                    .into(),
-                    details: json!({"ipv6_enabled":enabled,"reboot_required":false}),
-                });
             }
             Ok(MaintenanceResult {
                 message: "Authorized maintenance completed".into(),

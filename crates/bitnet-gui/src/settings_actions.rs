@@ -59,6 +59,12 @@ pub(crate) enum Action {
     ExportSaved(Result<bool, ()>),
 }
 
+impl Action {
+    pub(crate) fn requires_advanced(&self) -> bool {
+        matches!(self, Self::OpenIpv6Editor | Self::Export(_))
+    }
+}
+
 impl SettingsActions {
     fn next_request(&mut self) -> u64 {
         self.request_serial = self.request_serial.wrapping_add(1);

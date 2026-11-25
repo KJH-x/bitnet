@@ -495,6 +495,7 @@ version = "0.1.7"
 dependencies = [
  "bitnet-core",
  "bitnet-launcher",
+ "bitnet-platform",
  "bitnet-runtime",
  "iced",
  "iced-mcp",

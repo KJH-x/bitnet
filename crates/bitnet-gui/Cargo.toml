@@ -8,6 +8,7 @@ description = "BitNet software-rendered desktop interface"
 
 [dependencies]
 bitnet-core.workspace = true
+bitnet-platform.workspace = true
 bitnet-runtime.workspace = true
 bitnet-launcher.workspace = true
 iced-mcp = { path = "vendor/iced-mcp" }
@@ -15,6 +16,7 @@ iced-mcp = { path = "vendor/iced-mcp" }
 iced = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34", default-features = false, features = ["tiny-skia", "tokio", "advanced", "advanced-shaping", "canvas", "crisp"] }
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 zeroize.workspace = true
 time = { version = "0.3", default-features = false }
 
@@ -25,14 +27,12 @@ notify-rust = { version = "=4.17.0", default-features = false }
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
 sha2 = "0.10"
-tokio = { workspace = true, features = ["sync"] }
 windows-sys = { workspace = true, features = ["Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 iced = { git = "https://github.com/iced-rs/iced.git", rev = "bb97596ddb79c23de7a2393a4671aa64a4146e34", default-features = false, features = ["x11", "wayland", "linux-theme-detection"] }
 ksni = "0.3.7"
 notify-rust = { version = "=4.17.0", default-features = false, features = ["z-with-tokio"] }
-tokio.workspace = true
 
 [[bin]]
 name = "bitnet-gui"

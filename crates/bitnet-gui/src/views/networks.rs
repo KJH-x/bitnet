@@ -1,7 +1,7 @@
 use super::*;
 use bitnet_core::{NetworkInterface, NetworkRule};
 use bitnet_runtime::engine::fingerprint_for;
-use iced::widget::{column, mouse_area, row, toggler, tooltip};
+use iced::widget::{column, mouse_area, row, tooltip};
 use std::time::Duration;
 
 struct AdapterRow<'a> {
@@ -218,7 +218,7 @@ impl App {
             NetworkSection::RuleEditor => NetworkSection::Rules,
             other => other,
         };
-        let tabs = if self.network_advanced {
+        let tabs = if self.show_advanced {
             [
                 NetworkSection::Adapters,
                 NetworkSection::Profiles,
@@ -239,17 +239,6 @@ impl App {
                     .style(design::nav_button(selected)),
             );
         }
-        let header = row![
-            navigation.wrap(),
-            Space::new().width(Length::Fill),
-            toggler(self.network_advanced)
-                .label(self.t("高级", "Advanced"))
-                .text_size(d.typography.body)
-                .on_toggle(|_| Message::ToggleNetworkAdvanced),
-        ]
-        .spacing(d.space.sm)
-        .align_y(alignment::Vertical::Center);
-
         let body = match self.network_section {
             NetworkSection::Adapters => self.adapter_page(size),
             NetworkSection::Profiles => self.profile_page(size),
@@ -257,7 +246,9 @@ impl App {
             NetworkSection::RuleEditor => self.rule_editor(),
             NetworkSection::Ipv6 => self.ipv6_page(size),
         };
-        column![header, body].spacing(d.content.gap).into()
+        column![navigation.wrap(), body]
+            .spacing(d.content.gap)
+            .into()
     }
 
     fn network_columns(&self, width: f32) -> (f32, f32, f32) {
@@ -296,7 +287,7 @@ impl App {
                 Some(candidate.id.as_str()) != saved && Some(candidate.id.as_str()) != active
             })
             .count();
-        if !self.alternate_adapters {
+        if !self.show_advanced || !self.alternate_adapters {
             interfaces.retain(|candidate| {
                 !is_alternate_adapter(candidate)
                     || Some(candidate.id.as_str()) == saved
@@ -372,7 +363,7 @@ impl App {
         .spacing(d.space.sm)
         .align_y(alignment::Vertical::Center);
         toolbar = toolbar.push(super::ips_eye_button(self.ips_revealed));
-        if alternate_count > 0 {
+        if self.show_advanced && alternate_count > 0 {
             let label = if self.alternate_adapters {
                 self.t("隐藏备选网卡", "Hide other adapters")
             } else {

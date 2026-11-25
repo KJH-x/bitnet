@@ -1060,6 +1060,9 @@ impl App {
             Page::Statistics,
             Page::Diagnostics,
         ] {
+            if page.requires_advanced() && !self.show_advanced {
+                continue;
+            }
             let selected = page == self.page;
             navigation = navigation.push(
                 button(text(page.tab_label(self.english())).size(d.typography.body))
@@ -1144,11 +1147,11 @@ impl App {
         .spacing(d.card.gap)
         .width(Length::Fixed(280.0));
 
-        let ipv6 = snapshot.health.observed_ipv6_status();
-        let ipv6_address = snapshot
-            .health
+        let ipv6_health = self.ipv6_health_for_view(snapshot);
+        let ipv6 = ipv6_health.observed_ipv6_status();
+        let ipv6_address = ipv6_health
             .local_ipv6
-            .or_else(|| snapshot.health.confirmed_ipv6())
+            .or_else(|| ipv6_health.confirmed_ipv6())
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "—".into());
 
@@ -1189,12 +1192,11 @@ impl App {
             row![left, right].spacing(d.space.xl),
         ]
         .spacing(d.card.gap);
-        let ipv6_caption =
-            if ipv6 == Ipv6Status::Unknown && snapshot.health.ipv6_checked_at.is_some() {
-                self.t("未能确认", "Inconclusive")
-            } else {
-                ipv6_label(ipv6, english)
-            };
+        let ipv6_caption = if ipv6 == Ipv6Status::Unknown && ipv6_health.ipv6_checked_at.is_some() {
+            self.t("未能确认", "Inconclusive")
+        } else {
+            ipv6_label(ipv6, english)
+        };
         let ip_width =
             (size.width - 2.0 * d.card.pad - label_width - badge_width - 4.0 * d.space.sm)
                 .clamp(60.0, 300.0);
@@ -1361,7 +1363,10 @@ impl App {
         let d = design::get();
         let mut evidence = column![].spacing(d.space.sm);
         if let Some(snapshot) = &self.snapshot {
-            let health = &snapshot.health;
+            let health = match detail {
+                HealthDetail::Ipv6 => self.ipv6_health_for_view(snapshot),
+                _ => &snapshot.health,
+            };
             let checked_at = match detail {
                 HealthDetail::Ipv6 => health.ipv6_checked_at,
                 _ => health.checked_at,
@@ -1580,17 +1585,21 @@ impl App {
         let mut content =
             column![iced::widget::scrollable(evidence).height(Length::Shrink.max(285.0))];
         if detail == HealthDetail::Ipv6 {
+            let mut actions = row![button(self.t("诊断与修复", "Diagnose and repair"))
+                .on_press(Message::OpenIpv6Diagnostics)
+                .style(design::solid)]
+            .spacing(d.space.sm)
+            .align_y(alignment::Vertical::Center);
             if let Some(adapter) = self
                 .snapshot
                 .as_ref()
-                .filter(|snapshot| ipv6_maintenance_available(snapshot))
+                .filter(|snapshot| self.show_advanced && ipv6_maintenance_available(snapshot))
                 .and_then(ipv6_adapter)
                 .filter(|adapter| ipv6_maintenance_target(adapter).is_some())
             {
-                content = content
-                    .push(Self::rule(false))
-                    .push(self.ipv6_actions(adapter, false));
+                actions = actions.push(self.ipv6_actions(adapter, false));
             }
+            content = content.push(Self::rule(false)).push(actions.wrap());
         }
         self.dialog(
             title,
@@ -1604,48 +1613,55 @@ impl App {
         let Some(snapshot) = &self.snapshot else {
             return card(text(self.t("尚未连接后台", "Engine disconnected"))).into();
         };
-        let mut details = column![
-            pair(
-                self.t("网关统计流量", "Gateway usage"),
-                snapshot
-                    .session
-                    .bytes_used
-                    .map(format_bytes)
-                    .unwrap_or_else(|| "—".into())
-            ),
-            pair(
-                self.t("网关累计在线时长", "Gateway online total"),
-                snapshot
-                    .session
-                    .online_seconds
-                    .map(format_duration)
-                    .unwrap_or_else(|| "—".into())
-            ),
-            pair(
-                self.t("账户余额", "Balance"),
-                snapshot
-                    .session
-                    .balance
-                    .map(|value| format!("¥ {value:.2}"))
-                    .unwrap_or_else(|| "—".into())
-            ),
-            pair(
+        let mut details = column![].spacing(9);
+        if self.show_advanced {
+            details = details
+                .push(pair(
+                    self.t("网关统计流量", "Gateway usage"),
+                    snapshot
+                        .session
+                        .bytes_used
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "—".into()),
+                ))
+                .push(pair(
+                    self.t("网关累计在线时长", "Gateway online total"),
+                    snapshot
+                        .session
+                        .online_seconds
+                        .map(format_duration)
+                        .unwrap_or_else(|| "—".into()),
+                ))
+                .push(pair(
+                    self.t("账户余额", "Balance"),
+                    snapshot
+                        .session
+                        .balance
+                        .map(|value| format!("¥ {value:.2}"))
+                        .unwrap_or_else(|| "—".into()),
+                ));
+        }
+        details = details
+            .push(pair(
                 self.t("最近成功认证", "Last successful login"),
-                self.relative_time(snapshot.last_success_at)
-            ),
-            pair(self.t("重试次数", "Retry attempts"), snapshot.retry_count),
-            row![
-                button(self.t("打开诊断", "Open diagnostics"))
-                    .on_press(Message::Navigate(Page::Diagnostics))
-                    .style(action_style),
-                button(self.t("账户管理", "Manage accounts"))
-                    .on_press(Message::Navigate(Page::Accounts))
-                    .style(action_style),
-            ]
-            .spacing(8)
-            .wrap(),
-        ]
-        .spacing(9);
+                self.relative_time(snapshot.last_success_at),
+            ))
+            .push(pair(
+                self.t("重试次数", "Retry attempts"),
+                snapshot.retry_count,
+            ))
+            .push(
+                row![
+                    button(self.t("打开诊断", "Open diagnostics"))
+                        .on_press(Message::Navigate(Page::Diagnostics))
+                        .style(action_style),
+                    button(self.t("账户管理", "Manage accounts"))
+                        .on_press(Message::Navigate(Page::Accounts))
+                        .style(action_style),
+                ]
+                .spacing(8)
+                .wrap(),
+            );
         if let Some(error) = &snapshot.last_error {
             details = details.push(
                 container(text(&error.message).size(12))
@@ -1948,12 +1964,7 @@ impl App {
 
     fn health_editor_view<'a>(&'a self, entries: &'a [HealthTarget]) -> Element<'a, Message> {
         let d = design::get();
-        let conditions = [
-            HealthCondition::AnySuccess,
-            HealthCondition::Status,
-            HealthCondition::BodyEquals,
-            HealthCondition::BodyContains,
-        ];
+        let english = self.english();
         let mut content = column![text(self.t(
             "设置每个地址的成功条件，最多添加 8 个地址。",
             "Set a success condition for each URL. You can add up to 8 URLs.",
@@ -1988,22 +1999,8 @@ impl App {
                         .width(Length::Fill),
                     pick_list(
                         Some(entry.condition),
-                        conditions,
-                        move |condition: &HealthCondition| {
-                            match condition {
-                                HealthCondition::AnySuccess => self.t("任意 2xx", "Any 2xx"),
-                                HealthCondition::Status => {
-                                    self.t("指定状态码", "Exact status code")
-                                }
-                                HealthCondition::BodyEquals => {
-                                    self.t("正文完全匹配", "Body equals text")
-                                }
-                                HealthCondition::BodyContains => {
-                                    self.t("正文包含文字", "Body contains text")
-                                }
-                            }
-                            .to_owned()
-                        }
+                        HealthCondition::ALL,
+                        move |condition: &HealthCondition| condition.label(english).to_owned(),
                     )
                     .on_select(move |condition| Message::HealthEntryExpectChanged(index, condition))
                     .text_size(d.typography.meta)
@@ -2107,42 +2104,51 @@ impl App {
         };
 
         let install = if installed {
-            row![
-                control(
-                    self.t("修复安装", "Repair"),
-                    maintenance(MaintenanceAction::Repair, true),
-                    design::flat_button,
-                ),
-                control(
+            let mut actions = row![control(
+                self.t("修复安装", "Repair"),
+                maintenance(MaintenanceAction::Repair, true),
+                design::flat_button,
+            )];
+            if self.show_advanced {
+                actions = actions.push(control(
                     self.t("卸载后台", "Remove service"),
                     maintenance(MaintenanceAction::ServiceRemove { purge: false }, true),
                     design::danger_outline,
-                ),
-            ]
-        } else {
+                ));
+            }
+            actions
+        } else if self.show_advanced {
             row![control(
                 self.t("安装服务", "Install service"),
                 maintenance(MaintenanceAction::ServiceInstall, known),
                 design::solid,
             )]
-        };
-        let run = row![
-            if running {
-                status(self.t("正在运行", "Running"))
+        } else {
+            row![text(if known {
+                self.t("未安装", "Not installed")
             } else {
-                control(
-                    self.t("启动后台", "Start service"),
-                    maintenance(MaintenanceAction::ServiceStart, self.can_start_service()),
-                    design::solid,
-                )
-                .into()
-            },
+                self.t("状态不可用", "Status unavailable")
+            })]
+        };
+        let mut run = row![if running {
+            status(self.t("正在运行", "Running"))
+        } else if installed {
             control(
+                self.t("启动后台", "Start service"),
+                maintenance(MaintenanceAction::ServiceStart, self.can_start_service()),
+                design::solid,
+            )
+            .into()
+        } else {
+            text(self.t("未运行", "Not running")).into()
+        },];
+        if self.show_advanced {
+            run = run.push(control(
                 self.t("停止后台", "Stop service"),
                 maintenance(MaintenanceAction::ServiceStop, installed && known),
                 design::danger_outline,
-            ),
-        ];
+            ));
+        }
         let set_startup = |enabled| {
             (maintenance_ready && known && installed)
                 .then_some(Message::SetServiceAutostart(enabled))
@@ -2216,7 +2222,9 @@ impl App {
                     .then_some(Message::SwitchPersonal),
                 design::flat_button,
             ))
-        } else if connected.is_some_and(|snapshot| snapshot.scope == Scope::User) {
+        } else if self.show_advanced
+            && connected.is_some_and(|snapshot| snapshot.scope == Scope::User)
+        {
             scope_actions.push(control(
                 self.t("停止个人后台", "Stop personal"),
                 maintenance_ready.then_some(Message::Ask(Confirmation::Shutdown)),
@@ -2242,14 +2250,18 @@ impl App {
                     .into(),
                 label_width
             ),
-            labelled_row(
+        ]
+        .spacing(d.card.gap);
+        if self.show_advanced {
+            rows = rows.push(labelled_row(
                 self.t("开机启动", "Start at boot"),
                 boot.spacing(d.space.sm)
                     .align_y(alignment::Vertical::Center)
                     .into(),
-                label_width
-            ),
-            Self::rule(false),
+                label_width,
+            ));
+        }
+        rows = rows.push(Self::rule(false)).push(
             row![
                 text(self.t("当前连接范围", "Connected scope"))
                     .size(d.typography.meta)
@@ -2258,8 +2270,7 @@ impl App {
                 column![scope_value.wrap(), scope_actions.wrap()].spacing(d.space.sm),
             ]
             .spacing(d.space.sm),
-        ]
-        .spacing(d.card.gap);
+        );
         if let Some(detail) = service.and_then(|service| service.detail.as_deref()) {
             rows = rows.push(text(detail).size(d.typography.meta));
         }
@@ -2364,13 +2375,20 @@ impl App {
         let d = design::get();
         let ready = self.diagnostics.is_some();
         let actions = row![
-            button(text(self.t("诊断网络", "Diagnose network")).size(d.typography.body))
-                .on_press_maybe(
-                    (!self.busy && self.snapshot_current && !self.diagnostics_running)
-                        .then_some(Message::RunDiagnostics)
-                )
-                .padding([d.space.xs + 2.0, d.space.md])
-                .style(design::solid),
+            button(
+                text(if ready {
+                    self.t("重新检测", "Check again")
+                } else {
+                    self.t("诊断网络", "Diagnose network")
+                })
+                .size(d.typography.body)
+            )
+            .on_press_maybe(
+                self.can_run_diagnostics()
+                    .then_some(Message::RunDiagnostics)
+            )
+            .padding([d.space.xs + 2.0, d.space.md])
+            .style(design::solid),
             button(
                 text(self.t("在浏览器打开报告", "Open report in browser")).size(d.typography.body)
             )
@@ -2386,6 +2404,10 @@ impl App {
         .align_y(alignment::Vertical::Center)
         .wrap();
 
+        let mut results = column![].spacing(d.space.sm);
+        if let Some(status) = &self.ipv6_repair.result {
+            results = results.push(self.repair_result_view(status));
+        }
         let report: Element<'_, Message> = match &self.diagnostics {
             None => text(if self.diagnostics_running {
                 self.t("正在收集网络信息…", "Collecting network information…")
@@ -2399,17 +2421,169 @@ impl App {
             .style(design::text_style(design::muted))
             .into(),
             Some(report) => {
-                let mut content = column![text(self.t("主要结果", "Key findings"))
+                let assessment = &report.ipv6;
+                let mut content = column![
+                    text(format!(
+                        "IPv6 · {}",
+                        assessment.outcome.label(self.english())
+                    ))
                     .font(design::family_medium())
-                    .size(d.typography.section_title)];
-                for finding in report.findings.iter().take(4) {
-                    content = content.push(text(finding).size(d.typography.body));
+                    .size(d.typography.section_title),
+                    text(&assessment.summary).size(d.typography.body),
+                ]
+                .spacing(d.space.sm);
+                if let Some(adapter) = assessment.target.as_ref().and_then(|target| {
+                    assessment
+                        .adapters
+                        .iter()
+                        .find(|adapter| &adapter.target == target)
+                }) {
+                    content =
+                        content.push(pair(self.t("修复网卡", "Repair adapter"), &adapter.name));
+                } else if !assessment.recovered && !assessment.adapters.is_empty() {
+                    let entries = (0..assessment.adapters.len()).collect::<Vec<_>>();
+                    let adapters = &assessment.adapters;
+                    content = content.push(
+                        pick_list(None::<usize>, entries, move |index| {
+                            adapters[*index].name.clone()
+                        })
+                        .placeholder(self.t("选择需要检查的网卡", "Choose an adapter to check"))
+                        .on_select(move |index| {
+                            Message::SelectRepairAdapter(adapters[index].target.clone())
+                        }),
+                    );
                 }
-                content.spacing(d.space.sm).into()
+                let mut repair_actions = row![].spacing(d.space.sm);
+                if let Some(label) = self.guided_repair_label(false) {
+                    repair_actions = repair_actions.push(
+                        button(label)
+                            .style(design::solid)
+                            .on_press(Message::AskIpv6Repair(false)),
+                    );
+                }
+                if let Some(label) = self.guided_repair_label(true) {
+                    repair_actions = repair_actions.push(
+                        button(label)
+                            .style(design::danger_outline)
+                            .on_press(Message::AskIpv6Repair(true)),
+                    );
+                }
+                repair_actions = repair_actions.push(
+                    button(if self.ipv6_repair.show_evidence {
+                        self.t("收起依据", "Hide evidence")
+                    } else {
+                        self.t("查看依据", "Show evidence")
+                    })
+                    .style(design::flat_button)
+                    .on_press(Message::ToggleDiagnosticEvidence),
+                );
+                content = content.push(repair_actions.wrap());
+                if self.ipv6_repair.show_evidence {
+                    let mut evidence = column![].spacing(d.space.xs);
+                    if let Some(before) = self.ipv6_repair.before() {
+                        evidence = evidence.push(pair(self.t("修复前", "Before repair"), before));
+                    }
+                    if let Some(time) = assessment.checked_at {
+                        evidence = evidence.push(pair(
+                            self.t("检测时间", "Checked"),
+                            self.relative_time(Some(time)),
+                        ));
+                    }
+                    for (label, value) in &assessment.evidence {
+                        evidence = evidence.push(pair(label, value));
+                    }
+                    for finding in &report.findings {
+                        evidence = evidence.push(text(finding).size(d.typography.meta));
+                    }
+                    content = content
+                        .push(iced::widget::scrollable(evidence).height(Length::Shrink.max(148.0)));
+                }
+                content.into()
             }
         };
 
-        card(column![actions, Self::rule(false), report].spacing(d.card.gap)).into()
+        results = results.push(report);
+        card(column![actions, Self::rule(false), results].spacing(d.card.gap)).into()
+    }
+
+    fn repair_result_view<'a>(&'a self, result: &'a RepairResult) -> Element<'a, Message> {
+        let (message, path, role): (&str, Option<&std::path::Path>, fn(&Theme) -> Color) =
+            match result {
+                RepairResult::Applying => (
+                    self.t("正在修复…", "Applying repair…"),
+                    None,
+                    design::accent,
+                ),
+                RepairResult::Rechecking => (
+                    self.t("正在复测 IPv6…", "Checking IPv6 again…"),
+                    None,
+                    design::accent,
+                ),
+                RepairResult::Recovered => (
+                    self.t("IPv6 已恢复", "IPv6 is working again"),
+                    None,
+                    design::success,
+                ),
+                RepairResult::StillUnavailable => (
+                    self.t(
+                        "复测仍未收到公网 IPv6 回显",
+                        "Still no public IPv6 echo after repair",
+                    ),
+                    None,
+                    design::physical,
+                ),
+                RepairResult::Cancelled => (
+                    self.t("已取消修复", "Repair cancelled"),
+                    None,
+                    design::muted,
+                ),
+                RepairResult::Failed(error) => (error.message.as_str(), None, design::danger),
+                RepairResult::RebootRequired(path, interrupted) => (
+                    if *interrupted {
+                        self.t(
+                            "重置未完整结束，重启后检查网络",
+                            "Reset was interrupted. Check the network after restart.",
+                        )
+                    } else {
+                        self.t(
+                            "等待用户重启，重新打开 BitNet 后会复测",
+                            "Restart Windows, then reopen BitNet to recheck IPv6.",
+                        )
+                    },
+                    Some(path.as_path()),
+                    design::physical,
+                ),
+                RepairResult::AfterReboot {
+                    recovered,
+                    interrupted,
+                    backup_dir,
+                } => (
+                    match (*recovered, *interrupted) {
+                        (true, _) => {
+                            self.t("重启后已确认 IPv6 可用", "IPv6 verified after restart")
+                        }
+                        (false, true) => self.t(
+                            "重置未完整结束，重启后仍无法确认 IPv6",
+                            "Reset was interrupted. IPv6 is still unconfirmed after restart.",
+                        ),
+                        (false, false) => self.t(
+                            "重启后仍未收到公网 IPv6 回显",
+                            "No public IPv6 echo after restart",
+                        ),
+                    },
+                    Some(backup_dir.as_path()),
+                    if *recovered {
+                        design::success
+                    } else {
+                        design::physical
+                    },
+                ),
+            };
+        let mut result = column![badge(message, role)].spacing(design::get().space.xs);
+        if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
+            result = result.push(pair(self.t("本地备份", "Local backup"), path.display()));
+        }
+        result.into()
     }
 
     fn network_facts_line(&self) -> Element<'_, Message> {
@@ -2498,6 +2672,10 @@ impl App {
 
     fn confirmation_view(&self, confirmation: &Confirmation) -> Element<'_, Message> {
         let (title, detail) = match confirmation {
+            Confirmation::Ipv6Repair(request) => (
+                self.ipv6_repair_label(&request.action),
+                self.ipv6_repair_confirmation(&request.action),
+            ),
             Confirmation::DeleteProfile(_) => (self.t("删除保存的认证环境？", "Delete this authentication profile?"), self.t("删除该环境快照，不删除账户密码。实际使用的认证目标和当前会话由引擎按统一规则处理。", "Remove this saved profile without deleting account passwords. The engine applies its shared rules to the active configuration and session.")),
             Confirmation::LoginOnce => (self.t("只在当前网络登录一次？", "Connect once on this untrusted network?"), self.t("确认当前网络和认证目标由你信任。本次操作会发送认证材料，但不会保存长期网络信任；后续自动认证仍需明确“信任当前网络”。HTTP 门户无法提供加密的服务器身份保证。", "Confirm that you trust this network and authentication endpoint. This sends authentication material once without saving network trust. Automatic authentication still requires trusting the network. An HTTP portal provides no cryptographic server identity guarantee.")),
             Confirmation::TemporaryLogin { .. } => (self.t("确认仅登录本次？", "Confirm this one-time sign-in?"), self.t("请确认下方网卡和网关属于校园网。凭据只用于此次登录。", "Confirm the adapter and gateway belong to the campus network. Your credentials are used for this sign-in only.")),
@@ -2560,6 +2738,13 @@ impl App {
                     };
                     (title, self.t("Windows 会请求管理员确认。更改期间，远程桌面或正在使用的网络连接可能会断开。", "Windows will ask for administrator approval. Remote Desktop or other active connections may drop."))
                 },
+                MaintenanceAction::RenewDhcpv6 { .. }
+                | MaintenanceAction::RestartIpv6Adapter { .. }
+                | MaintenanceAction::FlushDnsCache
+                | MaintenanceAction::ResetIpv6Stack => (
+                    self.ipv6_repair_label(action),
+                    self.ipv6_repair_confirmation(action),
+                ),
                 MaintenanceAction::CheckUpdate | MaintenanceAction::SetAutostart { .. } | MaintenanceAction::SetGuiAutostart { .. } => (self.t("应用维护操作？", "Apply this maintenance operation?"), self.t("将通过统一维护流程应用更改。", "The shared maintenance workflow will apply this change.")),
             },
         };
@@ -2567,6 +2752,11 @@ impl App {
         let mut contents = column![text(title)
             .size(d.typography.page_title)
             .font(design::family_medium())];
+        if let Confirmation::Ipv6Repair(request) = confirmation {
+            if let Some(name) = &request.adapter_name {
+                contents = contents.push(pair(self.t("网卡", "Adapter"), name));
+            }
+        }
         if let Confirmation::Maintenance(action) = confirmation {
             if let Some(adapter) = action
                 .ipv6_target()

@@ -435,7 +435,8 @@ async fn ipv6_observations(settings: &Settings) -> Vec<Ipv6ProbeObservation> {
 struct ProviderResponse {
     status: Option<u16>,
     reported: Option<IpAddr>,
-    local_is_v6: Option<bool>,
+    local_address: Option<IpAddr>,
+    peer_address: Option<IpAddr>,
     literal_https_reachable: bool,
 }
 
@@ -462,10 +463,10 @@ async fn provider_request(
         .await
         .map_err(|error| (ProviderResponse::default(), request_outcome(error)))?;
     result.status = Some(response.status().as_u16());
-    result.local_is_v6 = response
-        .extensions()
-        .get::<HttpInfo>()
-        .map(|info| info.local_addr().ip().to_canonical().is_ipv6());
+    if let Some(info) = response.extensions().get::<HttpInfo>() {
+        result.local_address = Some(info.local_addr().ip().to_canonical());
+        result.peer_address = Some(info.remote_addr().ip().to_canonical());
+    }
     if !response.status().is_success() {
         return Err((result, ProbeOutcome::UnexpectedStatus));
     }
@@ -562,6 +563,9 @@ async fn ipv6_probe(target: &Ipv6Target, timeout: Duration) -> Ipv6ProbeObservat
         kind: target.kind,
         dns_result: None,
         addresses: None,
+        resolved_addresses: Vec::new(),
+        local_address: None,
+        peer_address: None,
         non_public_target: false,
         reported_ipv4: false,
         literal_https_reachable: false,
@@ -597,6 +601,9 @@ async fn ipv6_probe(target: &Ipv6Target, timeout: Duration) -> Ipv6ProbeObservat
             },
         };
         observation.addresses = Some(answers.len());
+        observation
+            .resolved_addresses
+            .extend(answers.iter().take(8));
         let addresses = probe_destinations(&answers, from_dns);
         if addresses.is_empty() {
             observation.non_public_target = !answers.is_empty();
@@ -615,7 +622,9 @@ async fn ipv6_probe(target: &Ipv6Target, timeout: Duration) -> Ipv6ProbeObservat
             };
         observation.status = response.status;
         observation.outcome = Some(outcome);
-        observation.local_is_v6 = response.local_is_v6;
+        observation.local_address = response.local_address;
+        observation.peer_address = response.peer_address;
+        observation.local_is_v6 = response.local_address.map(|ip| ip.is_ipv6());
         observation.reported_ipv4 = matches!(response.reported, Some(IpAddr::V4(_)));
         observation.literal_https_reachable = response.literal_https_reachable;
         observation.timed_out = outcome == ProbeOutcome::Timeout;
@@ -745,7 +754,7 @@ mod tests {
         let public: IpAddr = "2001:4860::1234".parse().unwrap();
         let (result, outcome) =
             provider_fixture("[::1]:0", "2001:4860::1234", Ipv6ProbeKind::Address, "/ip").await;
-        assert_eq!(result.local_is_v6, Some(true));
+        assert!(result.local_address.is_some_and(|ip| ip.is_ipv6()));
         assert_eq!(result.reported, Some(public));
         assert_eq!(outcome, ProbeOutcome::Match);
         let reply = format!(
@@ -835,7 +844,7 @@ mod tests {
             "/ip/?callback=cb",
         )
         .await;
-        assert_eq!(result.local_is_v6, Some(false));
+        assert!(result.local_address.is_some_and(|ip| ip.is_ipv4()));
         assert_eq!(result.reported, Some("2001:4860::1234".parse().unwrap()));
         assert_eq!(outcome, ProbeOutcome::Match);
     }

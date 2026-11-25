@@ -1,5 +1,7 @@
 //! On-demand diagnostics in the interactive user's context.
-use bitnet_core::{AppError, AuthState, ErrorCode, Health, Scope, Snapshot};
+use bitnet_core::{
+    AppError, AuthState, ErrorCode, Health, HealthStatus, Scope, Settings, Snapshot,
+};
 use futures_util::{stream, StreamExt};
 use serde::Deserialize;
 use std::{
@@ -12,6 +14,10 @@ use std::{
 };
 
 type Rows = Vec<Vec<String>>;
+
+#[path = "diagnostics_ipv6.rs"]
+mod ipv6;
+pub use ipv6::{Ipv6Assessment, Ipv6Outcome, Ipv6RepairAdapter, Ipv6RepairKind};
 
 const DNS_NAME: &str = "www.bit.edu.cn";
 const CAMPUS_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(10, 0, 32, 32), Ipv4Addr::new(10, 0, 32, 33)];
@@ -31,6 +37,7 @@ const OUTPUT_LIMIT: usize = 512 * 1024;
 pub struct Report {
     pub findings: Vec<String>,
     pub text: String,
+    pub ipv6: Ipv6Assessment,
     html: String,
 }
 
@@ -48,6 +55,7 @@ struct NativeEvidence {
     reachability: Rows,
     controllers: Rows,
     unavailable: Vec<String>,
+    ipv6: ipv6::NativeIpv6,
 }
 
 fn t(english: bool, zh: &'static str, en: &'static str) -> &'static str {
@@ -67,11 +75,54 @@ pub async fn collect(snapshot: Snapshot, english: bool) -> Report {
         .capabilities
         .iter()
         .any(|item| item == "simulation");
-    let (native, dns, probes) = if simulation {
-        (NativeEvidence::default(), vec![], vec![])
+    collect_with_ipv6(Some(snapshot), english, simulation, None, None).await
+}
+
+pub async fn probe_ipv6_locally(settings: &Settings, simulation: bool) -> HealthStatus {
+    let mut health = HealthStatus::default();
+    if simulation {
+        return health;
+    }
+    let interfaces = bitnet_platform::network::interfaces().unwrap_or_default();
+    crate::health_probe::run_ipv6(settings, None, &interfaces, &mut health).await;
+    health
+}
+
+pub async fn collect_with_ipv6(
+    snapshot: Option<Snapshot>,
+    english: bool,
+    simulation: bool,
+    fresh_health: Option<HealthStatus>,
+    selected: Option<crate::maintenance::InterfaceTarget>,
+) -> Report {
+    let mut snapshot = snapshot.unwrap_or_else(|| Snapshot::new(Scope::User));
+    let simulation = simulation
+        || snapshot
+            .capabilities
+            .iter()
+            .any(|item| item == "simulation");
+    let fresh = match fresh_health {
+        Some(health) if !simulation => health,
+        _ => probe_ipv6_locally(&snapshot.settings, simulation).await,
+    };
+    let (native, dns, probes, reference, repeated_dns_failure) = if simulation {
+        (
+            NativeEvidence::default(),
+            vec![],
+            vec![],
+            ipv6::ReferenceProbe::default(),
+            false,
+        )
     } else {
-        let native = tokio::task::spawn_blocking(native_evidence);
-        let (native, dns, probes) = tokio::join!(native, check_dns(&snapshot), check_targets());
+        let destinations = ipv6::route_targets(&fresh);
+        let native = tokio::task::spawn_blocking(move || native_evidence(&destinations, None));
+        let (native, dns, probes, reference, repeated_dns_failure) = tokio::join!(
+            native,
+            check_dns(&snapshot),
+            check_targets(),
+            ipv6::reference_probe(&fresh, &snapshot.settings),
+            ipv6::confirm_dns_failure(&fresh, &snapshot.settings),
+        );
         (
             native.unwrap_or_else(|_| NativeEvidence {
                 unavailable: vec!["operating-system evidence".into()],
@@ -79,6 +130,8 @@ pub async fn collect(snapshot: Snapshot, english: bool) -> Report {
             }),
             dns,
             probes,
+            reference,
+            repeated_dns_failure,
         )
     };
     let controller = if simulation {
@@ -86,9 +139,55 @@ pub async fn collect(snapshot: Snapshot, english: bool) -> Report {
     } else {
         read_controller_chains(&native.controllers).await
     };
+    let resampled =
+        if let Some(index) = ipv6::pending_address_check(&native.ipv6, &fresh, selected.as_ref()) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::task::spawn_blocking(move || native_evidence(&[], Some(index)))
+                .await
+                .ok()
+        } else {
+            None
+        };
+    let ipv6 = ipv6::assess(
+        &native.ipv6,
+        fresh,
+        selected.as_ref(),
+        resampled.as_ref().map(|evidence| &evidence.ipv6),
+        &reference,
+        repeated_dns_failure,
+        english,
+    );
+    let mut ipv6_rows = ipv6::evidence_rows(&native.ipv6, &ipv6.health, &reference);
+    if let Some(resampled) = &resampled {
+        ipv6_rows.extend(ipv6::resample_rows(&resampled.ipv6));
+    }
+    snapshot.health.ipv6 = ipv6.health.ipv6.clone();
+    snapshot.health.ipv6_status = ipv6.health.ipv6_status;
+    snapshot.health.ipv6_checked_at = ipv6.health.ipv6_checked_at;
+    snapshot.health.local_ipv6 = ipv6.health.local_ipv6;
+    snapshot.health.public_ipv6 = ipv6.health.public_ipv6;
+    snapshot.health.ipv6_detail = ipv6.health.ipv6_detail.clone();
+    snapshot.health.ipv6_probes = ipv6.health.ipv6_probes.clone();
     render(
-        snapshot, native, dns, probes, controller, english, simulation,
+        snapshot,
+        native,
+        ReportRows {
+            dns,
+            tcp: probes,
+            controller,
+            ipv6: ipv6_rows,
+        },
+        ipv6,
+        english,
+        simulation,
     )
+}
+
+struct ReportRows {
+    dns: Rows,
+    tcp: Rows,
+    controller: Rows,
+    ipv6: Rows,
 }
 
 pub async fn open_in_browser(
@@ -190,14 +289,24 @@ fn capture(program: &Path, args: &[&str], timeout: Duration) -> Option<String> {
 }
 
 #[cfg(windows)]
-fn native_evidence() -> NativeEvidence {
+fn native_evidence(destinations: &[IpAddr], adapter_index: Option<u32>) -> NativeEvidence {
     use base64::Engine as _;
     let collector = include_str!("diagnostics_windows.ps1");
-    let bytes: Vec<u8> = collector
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    let command = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let destinations = destinations
+        .iter()
+        .map(|ip| format!("'{ip}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let code = format!(
+        "$ipv6DiagnosticTargets = @({destinations})\n$ipv6DiagnosticResampleIndex = {}\n{collector}",
+        adapter_index.unwrap_or_default()
+    );
+    // Encode the script as UTF-8 inside a fixed loader to stay within the
+    // Windows command-line length limit.
+    let encoded = base64::engine::general_purpose::STANDARD.encode(code.as_bytes());
+    let command = format!(
+        "& ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))))"
+    );
     std::env::var_os("SystemRoot")
         .map(std::path::PathBuf::from)
         .map(|root| root.join("System32/WindowsPowerShell/v1.0/powershell.exe"))
@@ -209,7 +318,7 @@ fn native_evidence() -> NativeEvidence {
                     "-NoLogo",
                     "-NoProfile",
                     "-NonInteractive",
-                    "-EncodedCommand",
+                    "-Command",
                     &command,
                 ],
                 Duration::from_secs(18),
@@ -225,7 +334,7 @@ fn native_evidence() -> NativeEvidence {
 }
 
 #[cfg(not(windows))]
-fn native_evidence() -> NativeEvidence {
+fn native_evidence(_: &[IpAddr], _: Option<u32>) -> NativeEvidence {
     let seconds = Duration::from_secs(2);
     let mut evidence = NativeEvidence::default();
     #[cfg(target_os = "linux")]
@@ -646,9 +755,13 @@ fn snapshot_adapters(snapshot: &Snapshot) -> Rows {
 fn render(
     snapshot: Snapshot,
     mut native: NativeEvidence,
-    dns: Rows,
-    probes: Rows,
-    controller: Rows,
+    ReportRows {
+        dns,
+        tcp: probes,
+        controller,
+        ipv6: ipv6_rows,
+    }: ReportRows,
+    ipv6: Ipv6Assessment,
     english: bool,
     simulation: bool,
 ) -> Report {
@@ -662,6 +775,13 @@ fn render(
             )
             .into(),
         );
+    }
+    if !simulation {
+        findings.push(format!(
+            "IPv6 · {} · {}",
+            ipv6.outcome.label(english),
+            ipv6.summary
+        ));
     }
     if snapshot.active_binding.is_none() {
         findings.push(
@@ -1030,6 +1150,12 @@ fn render(
             rows: checks,
         },
         Section {
+            id: "ipv6-evidence",
+            title: translate("IPv6 分层诊断证据", "IPv6 diagnostic evidence"),
+            columns: &["Layer", "Adapter / target", "Observation"],
+            rows: ipv6_rows,
+        },
+        Section {
             id: "missing",
             title: translate("无法读取的证据", "Unavailable evidence"),
             columns: &["Source"],
@@ -1145,6 +1271,7 @@ fn render(
     }
     html.push_str("</main></html>");
     Report {
+        ipv6,
         findings,
         text: plain,
         html,
@@ -1192,6 +1319,12 @@ const STYLE: &str = "
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_can_run_on_the_frontend_task_executor() {
+        fn require_send(_: impl Send) {}
+        require_send(collect_with_ipv6(None, true, true, None, None));
+    }
 
     #[tokio::test]
     async fn simulation_report_is_openable_document_and_escapes_inventory() {
