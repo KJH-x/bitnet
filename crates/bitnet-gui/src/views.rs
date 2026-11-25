@@ -2880,9 +2880,20 @@ impl App {
                     },
                 ),
             };
+        let after_reboot = matches!(result, RepairResult::AfterReboot { .. });
         let mut result = column![badge(message, role)].spacing(design::get().space.xs);
         if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
             result = result.push(pair(self.t("本地备份", "Local backup"), path.display()));
+        }
+        if after_reboot && self.ipv6_repair.acknowledged() == Some(false) {
+            result = result.push(
+                text(self.t(
+                    "本次完成状态未能写入；下次打开 BitNet 会再次复测，届时可重新确认。",
+                    "This completion could not be recorded. The next launch rechecks and can acknowledge again.",
+                ))
+                .size(12)
+                .style(design::text_style(design::muted)),
+            );
         }
         result.into()
     }
