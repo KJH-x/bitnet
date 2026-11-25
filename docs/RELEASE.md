@@ -1,12 +1,12 @@
 # 构建、签名与分发
 
-仅在明确要求时打包。每轮从上次实际打包的版本提升补丁号一次；普通版和同轮的 `vello-cpu` 共用该版本。重大变动或重构、用户指定，或用户同意建议时，可调整版本策略。上次打包为 0.1.7，下一轮默认 0.1.8。先更新工作区版本和锁文件，再构建。
+仅在明确要求时打包。每轮从上次实际打包的版本提升一次；重大变动或重构、用户指定，或用户同意建议时，可调整版本策略。上次打包为 0.1.7，本轮 0.2.0（默认渲染后端变更）。先更新工作区版本和锁文件，再构建。
 
-输出目录形如 `dist/BitNet-0.1.8-windows-x64`，Vello CPU 版为 `dist/BitNet-0.1.8-windows-x64-vello-cpu`，安装文件也带版本号。Windows 用 `-Renderer vello-cpu`、Linux 用 `RENDERER=vello-cpu` 标注实际使用该绘制后端的产物。普通推送只触发构建与测试检查；开发包须手动启用工作流的 `package` 选项。
+输出目录形如 `dist/BitNet-0.2.0-windows-x64`，安装文件也带版本号。主线只有 Vello CPU 一种绘制后端，产物目录与文件名不再带渲染后缀，也没有 `-Renderer`/`RENDERER` 变体参数。普通推送只触发构建与测试检查；开发包须手动启用工作流的 `package` 选项。
 
 构建脚本只生成文件，不安装包、不注册服务、不发布到公网。CI 覆盖 Windows x86/x64/ARM64，Ubuntu amd64/arm64、Debian 12 i386，以及 macOS Intel/Apple Silicon。CI 定义已提供，首次远程执行及各系统安装验收仍待完成。
 
-各平台产物均写 `build-info.json`：记录版本、架构、渲染后端（`tiny-skia` 或 `vello-cpu`）、是否包含 iced-mcp 桥接（`mcp_bridge_included`，桥接默认不监听，需显式 `--iced-mcp` 配合模拟模式、独立数据目录与令牌）以及源码指纹。
+各平台产物均写 `build-info.json`：记录版本、架构、渲染后端（固定 `vello-cpu`）、是否包含 iced-mcp 桥接（`mcp_bridge_included`，桥接默认不监听，需显式 `--iced-mcp` 配合模拟模式、独立数据目录与令牌）以及源码指纹。Linux 与 macOS 脚本至少写 `version`/`arch`/`renderer`/`source_sha256`；Windows 另含 `development`、`public_key`、`wix_source`、`static_crt_imports_checked` 与 `installation_tested`。
 
 ## Windows 工具与构建
 

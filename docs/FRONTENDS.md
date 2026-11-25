@@ -27,8 +27,8 @@ TUI 连接现有引擎，也可以按 `s` 启动个人引擎。界面使用 Rata
 
 Web 查看器监听 `127.0.0.1` 的临时端口。查看令牌用于读取记录，控制令牌用于协调启动和停止。页面资源打包在程序中。浏览器可停止服务，服务在十分钟没有用户操作后退出。页面先加载最近一批记录，保持在首页顶部时持续更新。较早的记录按需加载，筛选、复制和 JSON 导出基于当前加载的记录。设置中的「清除诊断日志」移除引擎的 JSONL 诊断文件，登录记录和运行统计仍由活动数据库保留。
 
-## 绘制跟进
+## 绘制后端
 
-TinySkia 在滚动日志弹窗时会对每块局部更新区域重复绘制遮罩和卡片。原有分组的 1120×780 实验中，首帧软件绘制中位数为 154 ms。已将该问题登记为待跟进项，主线暂缓修改渲染后端。
+GUI 的 Iced 渲染器使用 Vello CPU 光栅化，这是主线唯一后端；`crates/bitnet-gui/vendor/iced_renderer` 以 Cargo patch 替换上游 `iced_renderer`，映射 Iced 的 `tiny-skia` 特性槽位但不链接 `iced_tiny_skia`，窗口仍由 Softbuffer 呈现，不使用 wgpu。
 
-实验分支 `experiment/iced-vello-cpu` 保留旧版滚动布局，使用 Iced PR #3306 的 Vello CPU 路径。相同 Windows x64 场景下，同期 TinySkia 路径首帧中位数为 168.15 ms，Vello CPU 路径为 16.85 ms。一次滚轮滚动可见画面由 2–3 次变化增至 11 次。结果涵盖该 PR 的增量重绘和 CPU 光栅化整条路径。[Iced Vello CPU PR](https://github.com/iced-rs/iced/pull/3306)
+Vello CPU 路径来自 [Iced PR #3306](https://github.com/iced-rs/iced/pull/3306)。相同 Windows x64 场景下，同期 TinySkia 路径首帧中位数为 168.15 ms，Vello CPU 路径为 16.85 ms；一次滚轮滚动可见画面由 2–3 次变化增至 11 次。结果涵盖该 PR 的增量重绘和 CPU 光栅化整条路径。原 TinySkia 在滚动日志弹窗时对每块局部更新区域重复绘制遮罩和卡片（1120×780 分组实验首帧中位数 154 ms），该问题随后端更换消失。

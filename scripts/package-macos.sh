@@ -59,6 +59,7 @@ cat > "$app/Contents/Info.plist" <<EOF
 <key>CFBundleShortVersionString</key><string>$version</string><key>CFBundleVersion</key><string>$version</string>
 <key>LSMinimumSystemVersion</key><string>11.0</string><key>NSHighResolutionCapable</key><true/>
 </dict></plist>
+EOF
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
     for binary in "$app"/Contents/MacOS/* "$helpers"/top.nsapi.bitnet.*; do codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$binary"; done
 fi
@@ -95,4 +96,12 @@ for asset in "$client" "$pkg" "$out/BitNet-$version-macos-$arch.dmg" "$app_archi
 done
 (cd "$out" && shasum -a 256 ./*.pkg ./*.dmg ./*.app.tar.gz > SHA256SUMS)
 if [ -f "$bin/bitnet-build-source.json" ]; then cp "$bin/bitnet-build-source.json" "$out/build-source.json"; fi
+python3 - "$out" "$version" "$arch" "$bin/bitnet-build-source.json" <<'PY'
+import json, sys
+from pathlib import Path
+out, version, arch, record = sys.argv[1:5]
+source_sha256 = json.loads(Path(record).read_text(encoding='utf-8'))['source_sha256']
+info = dict(version=version, arch=arch, renderer='vello-cpu', source_sha256=source_sha256)
+Path(out, 'build-info.json').write_text(json.dumps(info, indent=2) + '\n', encoding='utf-8')
+PY
 printf 'Built and project-signature-checked %s. Apple Gatekeeper may require manual approval.\n' "$out"

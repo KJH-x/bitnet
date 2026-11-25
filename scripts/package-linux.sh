@@ -28,10 +28,7 @@ test -n "${BITNET_RELEASE_PUBLIC_KEY:-}"; test -f "$secret"; test -f "$public"
 if [ -n "${BITNET_UPDATE_FEED:-}" ]; then
     grep -aF "$BITNET_RELEASE_PUBLIC_KEY" "$bin/bitmaint" >/dev/null || { echo 'Rebuild bitmaint with this public key' >&2; exit 2; }
 fi
-renderer=${RENDERER:-}
-case "$renderer" in ''|vello-cpu) ;; *) echo 'Unknown renderer variant' >&2; exit 2;; esac
-suffix=${renderer:+-$renderer}
-out=$root/dist/BitNet-$version-linux-$arch$suffix
+out=$root/dist/BitNet-$version-linux-$arch
 test ! -f "$out/SHA256SUMS" || { echo "Packages already exist for $version; increment the version before packaging again" >&2; exit 2; }
 target=$(case "$arch" in amd64) printf x86_64-unknown-linux-gnu;; arm64) printf aarch64-unknown-linux-gnu;; i386) printf i686-unknown-linux-gnu;; esac)
 licenses=$root/build/licenses/linux-$arch
@@ -107,16 +104,6 @@ if [ "${EXTRA_FORMATS:-0}" = 1 ]; then
     case "$arch" in amd64) rpmarch=x86_64;; arm64) rpmarch=aarch64;; esac
     set -- "$@" "$out/BitNet-$version-linux-$arch.AppImage" "$out/bitnet-$version-1.$rpmarch.rpm"
 fi
-if [ -n "$suffix" ]; then
-    for asset do
-        case "$asset" in *.tar.gz) ext=.tar.gz ;; *) ext=.${asset##*.} ;; esac
-        mv -- "$asset" "${asset%"$ext"}$suffix$ext"
-    done
-    set -- "$out"/*"$suffix.deb" "$out"/*"$suffix.tar.gz"
-    if [ "${EXTRA_FORMATS:-0}" = 1 ]; then
-        set -- "$@" "$out"/*"$suffix.AppImage" "$out"/*"$suffix.rpm"
-    fi
-fi
 for asset do
     "$minisign" -S -s "$secret" -m "$asset" -x "$asset.minisig" >/dev/null 2>&1
     "$minisign" -V -p "$public" -m "$asset" -x "$asset.minisig" >/dev/null 2>&1
@@ -124,3 +111,11 @@ done
 for asset do (cd "$out" && sha256sum "${asset##*/}"); done > "$out/SHA256SUMS"
 printf 'Built packages in %s; nothing was installed.\n' "$out"
 if [ -f "$bin/bitnet-build-source.json" ]; then cp "$bin/bitnet-build-source.json" "$out/build-source.json"; fi
+python3 - "$out" "$version" "$arch" "$bin/bitnet-build-source.json" <<'PY'
+import json, sys
+from pathlib import Path
+out, version, arch, record = sys.argv[1:5]
+source_sha256 = json.loads(Path(record).read_text(encoding='utf-8'))['source_sha256']
+info = dict(version=version, arch=arch, renderer='vello-cpu', source_sha256=source_sha256)
+Path(out, 'build-info.json').write_text(json.dumps(info, indent=2) + '\n', encoding='utf-8')
+PY
