@@ -1203,7 +1203,13 @@ impl App {
     }
     #[cfg(windows)]
     fn focus_window(id: window::Id) -> Task<Message> {
-        window::run(id, |window| window_placement::restore(window)).discard()
+        // The native restore shows the window behind winit's back. Walking back
+        // to Windowed first tells winit the window is visible again, otherwise
+        // its next hide request sees an unchanged visibility flag and does
+        // nothing.
+        window::set_mode(id, window::Mode::Windowed)
+            .chain(window::run(id, |window| window_placement::restore(window)).discard())
+            .chain(window::gain_focus(id))
     }
     #[cfg(not(windows))]
     fn focus_window(id: window::Id) -> Task<Message> {
