@@ -1,5 +1,5 @@
 use bitnet_core::AppError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Machine reset status that the current Windows user has yet to acknowledge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,6 +9,28 @@ pub struct Ipv6StackResetStatus {
     pub reboot_required: bool,
     /// The reset started without a recorded successful exit.
     pub interrupted: bool,
+}
+
+/// Reset identifiers name protected directories and a single acknowledgment
+/// slot, so a frontend can never store free text or invent a transaction.
+pub fn is_reset_id(id: &str) -> bool {
+    id.strip_prefix("reset-").is_some_and(|suffix| {
+        let mut fields = suffix.split('-');
+        fields.next().is_some_and(|pid| pid.parse::<u32>().is_ok())
+            && fields
+                .next()
+                .is_some_and(|time| time.parse::<u64>().is_ok())
+            && fields
+                .next()
+                .is_some_and(|sequence| sequence.parse::<u8>().is_ok())
+            && fields.next().is_none()
+    }) && id.len() < 64
+}
+
+/// The transaction identifier recorded in a backup directory name.
+pub fn reset_id_from_backup(directory: &Path) -> Option<&str> {
+    let id = directory.file_name()?.to_str()?;
+    is_reset_id(id).then_some(id)
 }
 
 #[cfg(windows)]
@@ -28,7 +50,7 @@ pub fn acknowledge_ipv6_stack_reset(_id: &str) -> Result<(), AppError> {
 
 #[cfg(windows)]
 mod windows {
-    use super::{AppError, Ipv6StackResetStatus, PathBuf};
+    use super::{is_reset_id, AppError, Ipv6StackResetStatus, PathBuf};
     use crate::maintenance::{
         action_name, err, program_data, reject_links, run_exit_code, run_os_tool,
         secure_windows_directory, system_plan, InterfaceTarget, MaintenanceAction,
@@ -70,22 +92,12 @@ mod windows {
             .join("ipv6-reset-ack"))
     }
 
-    fn valid_id(id: &str) -> bool {
-        id.strip_prefix("reset-").is_some_and(|suffix| {
-            let mut fields = suffix.split('-');
-            fields.next().is_some_and(|pid| pid.parse::<u32>().is_ok())
-                && fields
-                    .next()
-                    .is_some_and(|time| time.parse::<u64>().is_ok())
-                && fields
-                    .next()
-                    .is_some_and(|sequence| sequence.parse::<u8>().is_ok())
-                && fields.next().is_none()
-        }) && id.len() < 64
+    fn read_record() -> Result<Option<ResetRecord>, AppError> {
+        read_record_at(&record_dir()?)
     }
 
-    fn read_record() -> Result<Option<ResetRecord>, AppError> {
-        let path = record_dir()?.join("status.json");
+    fn read_record_at(directory: &Path) -> Result<Option<ResetRecord>, AppError> {
+        let path = directory.join("status.json");
         reject_links(&path)?;
         let mut file = match File::open(path) {
             Ok(file) => file,
@@ -107,7 +119,7 @@ mod windows {
             return Err(invalid());
         }
         let record: ResetRecord = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        if !valid_id(&record.id) || record.boot == 0 {
+        if !is_reset_id(&record.id) || record.boot == 0 {
             return Err(invalid());
         }
         Ok(Some(record))
@@ -167,13 +179,26 @@ mod windows {
     }
 
     pub fn acknowledge_ipv6_stack_reset(id: &str) -> Result<(), AppError> {
-        if !valid_id(id) || read_record()?.is_none_or(|record| record.id != id) {
+        acknowledge_at(&record_dir()?, &acknowledgment_path()?, id)
+    }
+
+    /// Acknowledging is idempotent and writes the marker only for the record
+    /// that is still persisted, so a retry after a failure stays possible.
+    fn acknowledge_at(
+        record_directory: &Path,
+        acknowledgment: &Path,
+        id: &str,
+    ) -> Result<(), AppError> {
+        if !is_reset_id(id)
+            || read_record_at(record_directory)?.is_none_or(|record| record.id != id)
+        {
             return Err(err(ErrorCode::InvalidInput, "IPv6 reset status changed"));
         }
-        let path = acknowledgment_path()?;
-        let directory = path.parent().expect("desktop state has a parent directory");
+        let directory = acknowledgment
+            .parent()
+            .expect("desktop state has a parent directory");
         bitnet_platform::prepare_private_directory(directory)?;
-        bitnet_platform::write_private_file(&path, id.as_bytes())
+        bitnet_platform::write_private_file(acknowledgment, id.as_bytes())
     }
 
     fn powershell(script: &str, seconds: u64) -> Result<Plan, AppError> {
@@ -282,7 +307,7 @@ mod windows {
         }
         record.successful_exit = true;
         publish_record(&status_directory, &record)?;
-        reset_result(backup_directory)
+        reset_result(&record.id)
     }
 
     pub(in crate::maintenance) async fn execute(
@@ -335,10 +360,14 @@ mod windows {
         }
     }
 
-    fn reset_result(backup_directory: PathBuf) -> Result<MaintenanceResult, AppError> {
+    fn reset_result(reset_id: &str) -> Result<MaintenanceResult, AppError> {
         Ok(MaintenanceResult {
             message: "Windows IPv6 stack reset completed; restart required".into(),
-            details: json!({"reboot_required": true, "ipv6_backup_dir": backup_directory}),
+            details: json!({
+                "reboot_required": true,
+                "ipv6_backup_dir": backup_root()?.join(reset_id),
+                "ipv6_reset_id": reset_id,
+            }),
         })
     }
 
@@ -391,7 +420,7 @@ mod windows {
                         "Could not verify IPv6 reset backup status",
                     )
                 })?;
-            return reset_result(backup_root()?.join(record.id));
+            return reset_result(&record.id);
         }
         if code == 0 {
             return operation_result(action);
@@ -419,19 +448,113 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
+        use super::super::reset_id_from_backup;
         use super::*;
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        struct Directory(PathBuf);
+
+        fn directory() -> Directory {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ipv6-reset-tests");
+            fs::create_dir_all(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let path = root.join(format!(
+                "fixture-{}-{}-{}",
+                std::process::id(),
+                bitnet_core::now_ms(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Directory(path)
+        }
+
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let allowed = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/ipv6-reset-tests")
+                    .canonicalize()
+                    .unwrap();
+                if let Ok(resolved) = self.0.canonicalize() {
+                    if resolved.parent() == Some(allowed.as_path())
+                        && resolved.starts_with(&allowed)
+                    {
+                        let _ = fs::remove_dir_all(resolved);
+                    }
+                }
+            }
+        }
+
+        fn record(directory: &Path, id: &str) -> PathBuf {
+            let data = serde_json::to_vec(&ResetRecord {
+                id: id.into(),
+                boot: 7,
+                successful_exit: true,
+            })
+            .unwrap();
+            fs::write(directory.join("status.json"), data).unwrap();
+            directory.join("status.json")
+        }
+
+        fn read_acknowledgment(path: &Path) -> Option<Vec<u8>> {
+            fs::read(path).ok()
+        }
 
         #[test]
         fn reset_ids_cannot_select_arbitrary_paths() {
-            assert!(valid_id("reset-2468-1234567890-0"));
+            assert!(is_reset_id("reset-2468-1234567890-0"));
             for id in [
                 "reset-2468-1234567890-0/..",
                 "reset-1-2-3-4",
                 "reset--1-0",
                 "reset-100-9-256",
+                "",
+                "reset-2468-1234567890-0-1",
             ] {
-                assert!(!valid_id(id));
+                assert!(!is_reset_id(id));
             }
+            assert_eq!(
+                reset_id_from_backup(Path::new("/tmp/ipv6-backups/reset-2468-1234567890-0")),
+                Some("reset-2468-1234567890-0")
+            );
+            assert_eq!(
+                reset_id_from_backup(Path::new("/tmp/ipv6-backups/manual")),
+                None
+            );
+        }
+
+        #[test]
+        fn acknowledgments_require_the_persisted_reset_and_stay_retryable() {
+            let fixture = directory();
+            let record_path = record(&fixture.0, "reset-2468-1234567890-0");
+            let acknowledgment = fixture.0.join("desktop").join("ipv6-reset-ack");
+
+            let mismatch = acknowledge_at(&fixture.0, &acknowledgment, "reset-2468-9999999999-1");
+            assert_eq!(mismatch.unwrap_err().code, ErrorCode::InvalidInput);
+            assert_eq!(read_acknowledgment(&acknowledgment), None);
+            assert!(record_path.exists());
+
+            acknowledge_at(&fixture.0, &acknowledgment, "reset-2468-1234567890-0").unwrap();
+            assert_eq!(
+                read_acknowledgment(&acknowledgment).unwrap(),
+                b"reset-2468-1234567890-0"
+            );
+            acknowledge_at(&fixture.0, &acknowledgment, "reset-2468-1234567890-0").unwrap();
+        }
+
+        #[test]
+        fn a_damaged_record_cannot_be_acknowledged() {
+            let fixture = directory();
+            fs::write(fixture.0.join("status.json"), b"{\"id\":\"reset-24").unwrap();
+            let acknowledgment = fixture.0.join("desktop").join("ipv6-reset-ack");
+            assert!(
+                acknowledge_at(&fixture.0, &acknowledgment, "reset-2468-1234567890-0").is_err()
+            );
+            assert_eq!(read_acknowledgment(&acknowledgment), None);
         }
 
         #[test]
