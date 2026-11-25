@@ -3,7 +3,10 @@ pub(super) fn polling_only(_: &ChangeGuard) -> bool {
     false
 }
 use crate::{error, windows::wide_string};
-use bitnet_core::{DnsConfiguration, DnsMode, ErrorCode, Ipv4Assignment};
+use bitnet_core::{
+    DnsConfiguration, DnsMode, ErrorCode, Ipv4Assignment, Ipv6AddressInfo, Ipv6AddressState,
+    Ipv6Lifetime, Ipv6Origin, Ipv6Scope,
+};
 use std::{
     ffi::{c_void, CStr},
     mem::size_of,
@@ -158,6 +161,88 @@ fn is_virtual_adapter(if_type: u32, description: &str, hardware: Option<bool>) -
         })
 }
 
+#[allow(non_upper_case_globals)]
+fn ipv6_state(state: NL_DAD_STATE) -> Ipv6AddressState {
+    match state {
+        IpDadStatePreferred => Ipv6AddressState::Preferred,
+        IpDadStateDeprecated => Ipv6AddressState::Deprecated,
+        IpDadStateTentative => Ipv6AddressState::Tentative,
+        IpDadStateDuplicate => Ipv6AddressState::Duplicate,
+        IpDadStateInvalid => Ipv6AddressState::Invalid,
+        _ => Ipv6AddressState::Unknown,
+    }
+}
+
+#[allow(non_upper_case_globals)]
+fn prefix_origin(origin: NL_PREFIX_ORIGIN) -> Ipv6Origin {
+    match origin {
+        IpPrefixOriginManual => Ipv6Origin::Manual,
+        IpPrefixOriginWellKnown => Ipv6Origin::WellKnown,
+        IpPrefixOriginDhcp => Ipv6Origin::Dhcp,
+        IpPrefixOriginRouterAdvertisement => Ipv6Origin::RouterAdvertisement,
+        IpPrefixOriginOther => Ipv6Origin::Other,
+        _ => Ipv6Origin::Unknown,
+    }
+}
+
+#[allow(non_upper_case_globals)]
+fn suffix_origin(origin: NL_SUFFIX_ORIGIN) -> Ipv6Origin {
+    match origin {
+        IpSuffixOriginManual => Ipv6Origin::Manual,
+        IpSuffixOriginWellKnown => Ipv6Origin::WellKnown,
+        IpSuffixOriginDhcp => Ipv6Origin::Dhcp,
+        IpSuffixOriginLinkLayerAddress => Ipv6Origin::LinkLayerAddress,
+        IpSuffixOriginRandom => Ipv6Origin::Random,
+        IpSuffixOriginOther => Ipv6Origin::Other,
+        _ => Ipv6Origin::Unknown,
+    }
+}
+
+#[test]
+fn windows_ipv6_address_facts_map_without_guessing() {
+    assert_eq!(ipv6_state(IpDadStatePreferred), Ipv6AddressState::Preferred);
+    assert_eq!(
+        ipv6_state(IpDadStateDeprecated),
+        Ipv6AddressState::Deprecated
+    );
+    assert_eq!(ipv6_state(IpDadStateTentative), Ipv6AddressState::Tentative);
+    assert_eq!(ipv6_state(IpDadStateDuplicate), Ipv6AddressState::Duplicate);
+    assert_eq!(ipv6_state(IpDadStateInvalid), Ipv6AddressState::Invalid);
+    assert_eq!(ipv6_state(-1), Ipv6AddressState::Unknown);
+    assert_eq!(
+        prefix_origin(IpPrefixOriginRouterAdvertisement),
+        Ipv6Origin::RouterAdvertisement
+    );
+    assert_eq!(prefix_origin(IpPrefixOriginDhcp), Ipv6Origin::Dhcp);
+    assert_eq!(prefix_origin(IpPrefixOriginUnchanged), Ipv6Origin::Unknown);
+    assert_eq!(suffix_origin(IpSuffixOriginRandom), Ipv6Origin::Random);
+    assert_eq!(
+        suffix_origin(IpSuffixOriginLinkLayerAddress),
+        Ipv6Origin::LinkLayerAddress
+    );
+    assert_eq!(suffix_origin(IpSuffixOriginUnchanged), Ipv6Origin::Unknown);
+    assert_eq!(
+        Ipv6Lifetime::from_seconds(0xffff_ffff),
+        Ipv6Lifetime::Infinite
+    );
+}
+
+#[test]
+fn every_reported_ipv6_address_has_one_detail_entry() {
+    for adapter in interfaces().unwrap() {
+        assert_eq!(
+            adapter.ipv6_details.len(),
+            adapter.ipv6.len(),
+            "{}",
+            adapter.name
+        );
+        for detail in &adapter.ipv6_details {
+            assert!(adapter.ipv6.contains(&detail.address));
+            assert!(detail.prefix_length.is_some());
+        }
+    }
+}
+
 pub(super) fn interfaces() -> Result<Vec<NetworkInterface>, AppError> {
     Ok(adapter_inventory()?
         .into_iter()
@@ -263,6 +348,7 @@ fn adapter_inventory() -> Result<Vec<AdapterEntry>, AppError> {
             };
             let mut ips = Vec::new();
             let mut ipv6 = Vec::new();
+            let mut ipv6_details = Vec::new();
             let mut dhcp_address = false;
             let mut unicast = a.FirstUnicastAddress;
             while !unicast.is_null() {
@@ -274,13 +360,29 @@ fn adapter_inventory() -> Result<Vec<AdapterEntry>, AppError> {
                             && !ip.is_unspecified()
                             && !ip.is_link_local();
                     }
-                    Some(IpAddr::V6(ip)) => ipv6.push(ip),
+                    Some(IpAddr::V6(ip)) => {
+                        ipv6.push(ip);
+                        ipv6_details.push(Ipv6AddressInfo {
+                            address: ip,
+                            prefix_length: Some(u.OnLinkPrefixLength),
+                            state: ipv6_state(u.DadState),
+                            prefix_origin: prefix_origin(u.PrefixOrigin),
+                            suffix_origin: suffix_origin(u.SuffixOrigin),
+                            preferred_lifetime: Ipv6Lifetime::from_seconds(u.PreferredLifetime),
+                            valid_lifetime: Ipv6Lifetime::from_seconds(u.ValidLifetime),
+                            temporary: u.Anonymous.Anonymous.Flags & IP_ADAPTER_ADDRESS_TRANSIENT
+                                != 0,
+                            scope: Ipv6Scope::of(ip),
+                        });
+                    }
                     None => {}
                 }
                 unicast = u.Next;
             }
             ipv6.sort_unstable();
             ipv6.dedup();
+            ipv6_details.sort_unstable_by_key(|info| info.address);
+            ipv6_details.dedup_by_key(|info| info.address);
             let mut servers = Vec::new();
             let mut server = a.FirstDnsServerAddress;
             while !server.is_null() {
@@ -347,6 +449,7 @@ fn adapter_inventory() -> Result<Vec<AdapterEntry>, AppError> {
                 dns,
                 dns_config: Some(dns_config),
                 ipv6,
+                ipv6_details,
                 ipv4_mode,
                 ipv6_enabled: Some(flags & IP_ADAPTER_IPV6_ENABLED != 0),
             };

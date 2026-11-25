@@ -3213,6 +3213,7 @@ mod tests {
             dns: Vec::new(),
             dns_config: None,
             ipv6: Vec::new(),
+            ipv6_details: Vec::new(),
             ipv4_mode: None,
             ipv6_enabled: None,
         };

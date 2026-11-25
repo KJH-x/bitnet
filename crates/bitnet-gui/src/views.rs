@@ -2,7 +2,10 @@ mod networks;
 mod settings;
 
 use super::*;
-use bitnet_core::{Health, Ipv6Status};
+use bitnet_core::{
+    education_network_ipv6, EducationNetworkV6, Health, Ipv6AddressInfo, Ipv6AddressPresentation,
+    Ipv6AddressState, Ipv6EchoKind, Ipv6Lifetime, Ipv6Origin, Ipv6Scope, Ipv6Status, ProbeOutcome,
+};
 use iced::{
     advanced::{layout, mouse, renderer, widget::Tree, Layout, Widget},
     alignment,
@@ -10,7 +13,7 @@ use iced::{
         button, checkbox, column, container, pick_list, responsive, row, stack, text, text_input,
         Space,
     },
-    Color, Length, Rectangle, Size,
+    Background, Border, Color, Length, Rectangle, Size,
 };
 
 pub(super) fn action_style(theme: &Theme, status: button::Status) -> button::Style {
@@ -247,6 +250,150 @@ fn ipv6_role(state: Ipv6Status) -> fn(&Theme) -> Color {
         Ipv6Status::LinkLocalOnly | Ipv6Status::GlobalUnreachable => design::danger,
         Ipv6Status::GlobalNotPreferred => design::physical,
         Ipv6Status::Normal => design::success,
+    }
+}
+
+/// Role used for an address chip. `None` keeps the neutral monospaced chip.
+fn ipv6_presentation_role(presentation: Ipv6AddressPresentation) -> Option<fn(&Theme) -> Color> {
+    match presentation {
+        Ipv6AddressPresentation::Preferred => None,
+        Ipv6AddressPresentation::TemporaryPreferred => Some(design::success),
+        Ipv6AddressPresentation::Deprecated => Some(design::physical),
+        Ipv6AddressPresentation::Tentative => Some(design::accent),
+        Ipv6AddressPresentation::Duplicate | Ipv6AddressPresentation::Invalid => {
+            Some(design::danger)
+        }
+        Ipv6AddressPresentation::Unknown => Some(design::muted),
+    }
+}
+
+fn ipv6_chip<'a>(
+    value: &str,
+    revealed: bool,
+    presentation: Ipv6AddressPresentation,
+    width: Length,
+) -> Element<'a, Message> {
+    let d = design::get();
+    let shown = if revealed || value == "—" {
+        value.to_string()
+    } else {
+        "•".repeat(value.chars().count())
+    };
+    let role = ipv6_presentation_role(presentation);
+    container(
+        text(shown)
+            .size(d.typography.meta)
+            .wrapping(text::Wrapping::None)
+            .ellipsis(text::Ellipsis::End)
+            .font(Font::MONOSPACE)
+            .width(Length::Fill)
+            .style(move |theme: &Theme| iced::widget::text::Style {
+                color: Some(match role {
+                    Some(role) => role(theme),
+                    None => design::code_text(theme),
+                }),
+            }),
+    )
+    .padding([1.0, 6.0])
+    .width(width)
+    .clip(true)
+    .style(move |theme: &Theme| match role {
+        Some(role) => container::Style {
+            background: Some(Background::Color(role(theme).scale_alpha(0.16))),
+            border: Border {
+                color: role(theme).scale_alpha(0.4),
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        },
+        None => design::code(theme),
+    })
+    .into()
+}
+
+fn ipv6_address_info(snapshot: &Snapshot, address: std::net::Ipv6Addr) -> Option<&Ipv6AddressInfo> {
+    snapshot
+        .interfaces
+        .iter()
+        .flat_map(|interface| interface.ipv6_details.iter())
+        .find(|info| info.address == address)
+}
+
+/// Presentation class of a shown address: its own reported state when the OS
+/// listed it, otherwise whether the address block is global unicast.
+fn ipv6_address_presentation(
+    snapshot: &Snapshot,
+    address: std::net::Ipv6Addr,
+) -> Ipv6AddressPresentation {
+    ipv6_address_info(snapshot, address).map_or_else(
+        || match Ipv6Scope::of(address) {
+            Ipv6Scope::Global => Ipv6AddressPresentation::Preferred,
+            _ => Ipv6AddressPresentation::Unknown,
+        },
+        Ipv6AddressInfo::presentation,
+    )
+}
+
+fn education_network_label(address: std::net::Ipv6Addr) -> &'static str {
+    match education_network_ipv6(address) {
+        Some(EducationNetworkV6::Cernet) => "CERNET",
+        Some(EducationNetworkV6::Cernet2) => "CERNET2",
+        Some(EducationNetworkV6::Fiti) => "FITI",
+        None => "",
+    }
+}
+
+fn ipv6_address_state_label(english: bool, state: Ipv6AddressState) -> &'static str {
+    match (state, english) {
+        (Ipv6AddressState::Unknown, false) => "状态未知",
+        (Ipv6AddressState::Unknown, true) => "Unknown",
+        (Ipv6AddressState::Preferred, false) => "首选",
+        (Ipv6AddressState::Preferred, true) => "Preferred",
+        (Ipv6AddressState::Deprecated, false) => "已弃用",
+        (Ipv6AddressState::Deprecated, true) => "Deprecated",
+        (Ipv6AddressState::Tentative, false) => "初始化",
+        (Ipv6AddressState::Tentative, true) => "Tentative",
+        (Ipv6AddressState::Duplicate, false) => "地址冲突",
+        (Ipv6AddressState::Duplicate, true) => "Duplicate",
+        (Ipv6AddressState::Invalid, false) => "无效",
+        (Ipv6AddressState::Invalid, true) => "Invalid",
+    }
+}
+
+fn ipv6_scope_label(english: bool, scope: Ipv6Scope) -> &'static str {
+    match (scope, english) {
+        (Ipv6Scope::Unknown, false) => "作用域未知",
+        (Ipv6Scope::Unknown, true) => "Unknown scope",
+        (Ipv6Scope::Loopback, false) => "环回",
+        (Ipv6Scope::Loopback, true) => "Loopback",
+        (Ipv6Scope::LinkLocal, false) => "链路本地",
+        (Ipv6Scope::LinkLocal, true) => "Link-local",
+        (Ipv6Scope::UniqueLocal, false) => "唯一本地",
+        (Ipv6Scope::UniqueLocal, true) => "Unique local",
+        (Ipv6Scope::Global, false) => "全局",
+        (Ipv6Scope::Global, true) => "Global",
+    }
+}
+
+fn ipv6_origin_label(english: bool, origin: Ipv6Origin) -> &'static str {
+    match (origin, english) {
+        (Ipv6Origin::Unknown, false) => "未知",
+        (Ipv6Origin::Unknown, true) => "Unknown",
+        (Ipv6Origin::Other, false) => "其他",
+        (Ipv6Origin::Other, true) => "Other",
+        (Ipv6Origin::Manual, false) => "手动",
+        (Ipv6Origin::Manual, true) => "Manual",
+        (Ipv6Origin::WellKnown, false) => "内建",
+        (Ipv6Origin::WellKnown, true) => "Well known",
+        (Ipv6Origin::Dhcp, false) => "DHCP",
+        (Ipv6Origin::Dhcp, true) => "DHCP",
+        (Ipv6Origin::RouterAdvertisement, false) => "路由公告",
+        (Ipv6Origin::RouterAdvertisement, true) => "Router advertisement",
+        (Ipv6Origin::LinkLayerAddress, false) => "链路层地址",
+        (Ipv6Origin::LinkLayerAddress, true) => "Link-layer address",
+        (Ipv6Origin::Random, false) => "随机",
+        (Ipv6Origin::Random, true) => "Random",
     }
 }
 
@@ -1149,27 +1296,40 @@ impl App {
 
         let ipv6_health = self.ipv6_health_for_view(snapshot);
         let ipv6 = ipv6_health.observed_ipv6_status();
-        let ipv6_address = ipv6_health
-            .local_ipv6
-            .or_else(|| ipv6_health.confirmed_ipv6())
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "—".into());
+        let local_ipv6 = ipv6_health.local_ipv6;
+        let local_ipv6_text = local_ipv6.map_or_else(|| "—".to_string(), |ip| ip.to_string());
+        let local_presentation = local_ipv6.map_or(Ipv6AddressPresentation::Unknown, |ip| {
+            ipv6_address_presentation(snapshot, ip)
+        });
+        let network_label = local_ipv6.map_or("", education_network_label);
 
         let right = column![
-            labelled_row(
-                self.t("互联网", "Internet"),
+            row![
+                text(self.t("互联网", "Internet"))
+                    .size(d.typography.meta)
+                    .style(design::text_style(design::muted))
+                    .width(Length::Fixed(health_label_width)),
+                Space::new().width(Length::Fill),
                 self.health_badge(
                     &snapshot.health.internet,
                     HealthDetail::Internet,
                     badge_width
                 ),
-                health_label_width
-            ),
-            labelled_row(
-                "DNS",
+            ]
+            .spacing(d.space.sm)
+            .width(Length::Fill)
+            .align_y(alignment::Vertical::Center),
+            row![
+                text("DNS")
+                    .size(d.typography.meta)
+                    .style(design::text_style(design::muted))
+                    .width(Length::Fixed(health_label_width)),
+                Space::new().width(Length::Fill),
                 self.health_badge(&snapshot.health.dns, HealthDetail::Dns, badge_width),
-                health_label_width
-            ),
+            ]
+            .spacing(d.space.sm)
+            .width(Length::Fill)
+            .align_y(alignment::Vertical::Center),
         ]
         .spacing(d.card.gap)
         .width(Length::Fill);
@@ -1197,24 +1357,32 @@ impl App {
         } else {
             ipv6_label(ipv6, english)
         };
+        // The address column shrinks first; the status column keeps its width
+        // and its right edge lines up with the Internet and DNS badges.
         let ip_width =
             (size.width - 2.0 * d.card.pad - label_width - badge_width - 4.0 * d.space.sm)
-                .clamp(60.0, 300.0);
+                .clamp(60.0, 320.0);
         let ipv6_row = row![
             text("IPv6")
                 .size(d.typography.meta)
                 .style(design::text_style(design::muted))
                 .width(Length::Fixed(label_width)),
-            container(ip_chip(&ipv6_address, revealed))
-                .width(Length::Shrink.max(ip_width))
-                .clip(true),
+            ipv6_chip(
+                &local_ipv6_text,
+                revealed,
+                local_presentation,
+                Length::Shrink.max(ip_width)
+            ),
+            text(network_label)
+                .size(d.typography.meta)
+                .style(design::text_style(design::muted)),
+            Space::new().width(Length::Fill),
             self.detail_badge(
                 ipv6_caption,
                 ipv6_role(ipv6),
                 HealthDetail::Ipv6,
                 badge_width
             ),
-            Space::new().width(Length::Fill),
         ]
         .spacing(d.space.sm)
         .align_y(alignment::Vertical::Center);
@@ -1350,6 +1518,67 @@ impl App {
             Timeout => self.t("超时", "Timed out"),
             RequestFailed => self.t("连接失败", "Connection failed"),
             BodyLimit => self.t("响应内容过大", "Response too large"),
+        }
+    }
+
+    fn ipv6_address_facts(&self, info: &Ipv6AddressInfo) -> String {
+        let english = self.english();
+        let mut parts = vec![
+            ipv6_address_state_label(english, info.state).to_owned(),
+            ipv6_scope_label(english, info.scope).to_owned(),
+        ];
+        if let Some(prefix) = info.prefix_length {
+            parts.push(format!("/{prefix}"));
+        }
+        if info.prefix_origin != Ipv6Origin::Unknown {
+            parts.push(format!(
+                "{} {}",
+                self.t("前缀", "Prefix"),
+                ipv6_origin_label(english, info.prefix_origin)
+            ));
+        }
+        if info.suffix_origin != Ipv6Origin::Unknown {
+            parts.push(format!(
+                "{} {}",
+                self.t("后缀", "Suffix"),
+                ipv6_origin_label(english, info.suffix_origin)
+            ));
+        }
+        if info.temporary {
+            parts.push(self.t("临时地址", "Temporary").to_owned());
+        }
+        if info.valid_lifetime != Ipv6Lifetime::Unknown {
+            parts.push(format!(
+                "{} {}",
+                self.t("有效", "Valid"),
+                self.ipv6_lifetime(info.valid_lifetime)
+            ));
+        }
+        if info.preferred_lifetime != Ipv6Lifetime::Unknown {
+            parts.push(format!(
+                "{} {}",
+                self.t("首选", "Preferred"),
+                self.ipv6_lifetime(info.preferred_lifetime)
+            ));
+        }
+        parts.join(" · ")
+    }
+
+    fn ipv6_lifetime(&self, lifetime: Ipv6Lifetime) -> String {
+        match lifetime {
+            Ipv6Lifetime::Unknown => self.t("未知", "Unknown").to_owned(),
+            Ipv6Lifetime::Infinite => self.t("永久", "Never expires").to_owned(),
+            Ipv6Lifetime::Seconds(0) => self.t("已到期", "Expired").to_owned(),
+            Ipv6Lifetime::Seconds(seconds) if seconds < 60 => format!("{seconds} s"),
+            Ipv6Lifetime::Seconds(seconds) if seconds < 3600 => {
+                format!("{} min", seconds / 60)
+            }
+            Ipv6Lifetime::Seconds(seconds) if seconds < 86_400 => {
+                format!("{} h {} min", seconds / 3600, seconds % 3600 / 60)
+            }
+            Ipv6Lifetime::Seconds(seconds) => {
+                format!("{} d {} h", seconds / 86_400, seconds % 86_400 / 3600)
+            }
         }
     }
 
@@ -1496,7 +1725,6 @@ impl App {
                         Some(_) => self.t("已隐藏", "Hidden").into(),
                         None => "—".into(),
                     };
-                    use bitnet_core::{education_network_ipv6, EducationNetworkV6};
                     let mut local = show_ip(health.local_ipv6);
                     if let Some(network) = health.local_ipv6.and_then(education_network_ipv6) {
                         local.push_str(match network {
@@ -1505,12 +1733,62 @@ impl App {
                             EducationNetworkV6::Fiti => " · FITI",
                         });
                     }
-                    evidence = evidence
-                        .push(pair(self.t("本机 IPv6", "Local IPv6"), local))
-                        .push(pair(
-                            self.t("站点所见出口 IPv6", "IPv6 seen by site"),
-                            show_ip(health.confirmed_ipv6()),
+                    // The detected route address and the address a site echoes
+                    // are different facts; keep them on separate lines.
+                    evidence = evidence.push(pair(self.t("本机 IPv6", "Local IPv6"), local));
+                    let mut listed = 0_usize;
+                    let mut seen = std::collections::BTreeSet::new();
+                    let mut local_rows = column![].spacing(d.space.xs);
+                    for info in snapshot
+                        .interfaces
+                        .iter()
+                        .flat_map(|interface| interface.ipv6_details.iter())
+                        .filter(|info| seen.insert(info.address))
+                    {
+                        listed += 1;
+                        let network = education_network_label(info.address);
+                        local_rows = local_rows.push(
+                            column![
+                                row![
+                                    ipv6_chip(
+                                        &info.address.to_string(),
+                                        self.ips_revealed,
+                                        info.presentation(),
+                                        Length::FillPortion(3),
+                                    ),
+                                    text(network)
+                                        .size(d.typography.meta)
+                                        .style(design::text_style(design::muted)),
+                                ]
+                                .spacing(d.space.sm)
+                                .width(Length::Fill)
+                                .align_y(alignment::Vertical::Center),
+                                text(self.ipv6_address_facts(info))
+                                    .size(d.typography.meta)
+                                    .style(design::text_style(design::muted)),
+                            ]
+                            .spacing(2.0)
+                            .width(Length::Fill),
+                        );
+                    }
+                    if listed > 0 {
+                        evidence = evidence.push(pair(
+                            self.t("网卡 IPv6 地址", "Adapter IPv6 addresses"),
+                            format!("{listed}"),
                         ));
+                        evidence = evidence.push(local_rows);
+                    }
+                    let mut site = show_ip(health.confirmed_ipv6());
+                    if let Some(network) = health.confirmed_ipv6().and_then(education_network_ipv6)
+                    {
+                        site.push_str(match network {
+                            EducationNetworkV6::Cernet => " · CERNET",
+                            EducationNetworkV6::Cernet2 => " · CERNET2",
+                            EducationNetworkV6::Fiti => " · FITI",
+                        });
+                    }
+                    evidence =
+                        evidence.push(pair(self.t("站点所见出口 IPv6", "IPv6 seen by site"), site));
                     if let Some(reason) = health
                         .ipv6_detail
                         .as_ref()
@@ -1526,12 +1804,24 @@ impl App {
                                 self.t("双栈连接", "Dual-stack connectivity")
                             }
                             Ipv6ProbeKind::LargePacket => self.t("大包测试", "Large packet check"),
+                            Ipv6ProbeKind::Education => self.t("教育网测点", "Education check"),
                         };
-                        let provider = snapshot
-                            .settings
-                            .ipv6_targets
-                            .get(probe.target.saturating_sub(1))
-                            .map_or("—", String::as_str);
+                        // Results of a configured education point are joined to
+                        // its settings entry by the stable identifier.
+                        let configured = probe
+                            .probe_id
+                            .as_deref()
+                            .and_then(|id| snapshot.settings.education_probe(id));
+                        let provider = configured.map_or_else(
+                            || {
+                                snapshot
+                                    .settings
+                                    .ipv6_targets
+                                    .get(probe.target.saturating_sub(1))
+                                    .map_or("—", String::as_str)
+                            },
+                            |probe| probe.name.as_str(),
+                        );
                         let direct_https = provider == bitnet_core::DNS_FREE_IPV6_TARGET;
                         let target = match probe.kind {
                             Ipv6ProbeKind::DualStack => "ds.test-ipv6.com".to_owned(),
@@ -1550,10 +1840,21 @@ impl App {
                             self.t("直连成功", "Direct connection succeeded")
                         } else if probe.non_public_target {
                             self.t("检测地址不可用", "Probe address unavailable")
+                        } else if probe.echo == Some(Ipv6EchoKind::Challenge) {
+                            if configured.is_some_and(|probe| probe.needs_challenge) {
+                                self.t("挑战页（该测点需要挑战）", "Challenge page (expected)")
+                            } else {
+                                self.t("挑战页（未验证内容）", "Challenge page (unverified)")
+                            }
                         } else if probe.reported_ipv4 || probe.dual_stack_reported_ipv4() {
                             self.t("站点回显 IPv4", "Site reported IPv4")
                         } else if probe.confirmed_address().is_some() {
                             self.t("站点回显公网 IPv6", "Site reported a public IPv6 address")
+                        } else if probe.is_education() && probe.outcome == Some(ProbeOutcome::Match)
+                        {
+                            self.t("站点可达", "Reachable")
+                        } else if probe.echo == Some(Ipv6EchoKind::Truncated) {
+                            self.t("回显被截断", "Echo truncated")
                         } else {
                             probe
                                 .outcome
